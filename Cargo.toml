@@ -1,0 +1,53 @@
+[workspace]
+members = [
+  "crates/dd_ftp_cli",
+  "crates/dd_ftp_app",
+  "crates/dd_ftp_ui",
+  "crates/dd_ftp_core",
+  "crates/dd_ftp_protocols",
+  "crates/dd_ftp_transfer",
+  "crates/dd_ftp_storage",
+  "crates/dd_ftp_utils",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ldnddev"]
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# protocol backends (reserved for implementation)
+ssh2 = "0.9"
+async-ftp = "6"
+rustls = "0.23"
+
+# utility
+parking_lot = "0.12"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+debug = true
+incremental = true
+
+# TODO (phase 1): add a runner binary crate (dd_ftp_cli) to wire app + ui + side effects.
+# For now, this is scaffold-only architecture groundwork.

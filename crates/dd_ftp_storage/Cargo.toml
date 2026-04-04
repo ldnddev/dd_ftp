@@ -1,0 +1,12 @@
+[package]
+name = "dd_ftp_storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dd_ftp_core = { path = "../dd_ftp_core" }
+serde.workspace = true
+toml.workspace = true

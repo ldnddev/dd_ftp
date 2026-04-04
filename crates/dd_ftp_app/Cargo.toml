@@ -1,0 +1,13 @@
+[package]
+name = "dd_ftp_app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+dd_ftp_core = { path = "../dd_ftp_core" }
+dd_ftp_transfer = { path = "../dd_ftp_transfer" }
+serde.workspace = true
+tokio.workspace = true

@@ -9,3 +9,4 @@ license.workspace = true
 chrono.workspace = true
 dd_ftp_core = { path = "../dd_ftp_core" }
 serde.workspace = true
+uuid.workspace = true

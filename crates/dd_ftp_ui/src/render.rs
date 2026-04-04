@@ -1,4 +1,5 @@
-use dd_ftp_app::{AppState, FocusPane};
+use dd_ftp_app::{AppState, FocusPane, QuickConnectField};
+use dd_ftp_core::{Protocol, TransferJob};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -18,8 +19,25 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         ])
         .split(frame.area());
 
-    let title = Paragraph::new("dd_ftp  |  F1: controls")
-        .style(Style::default().fg(Color::Cyan));
+    let bookmark_label = app
+        .bookmarks
+        .get(app.selected_bookmark)
+        .map(|b| {
+            if b.name.trim().is_empty() {
+                format!("Bookmark: {}", b.host)
+            } else {
+                format!("Bookmark: {}", b.name)
+            }
+        })
+        .unwrap_or_else(|| "Bookmark: none".to_string());
+
+    let connect_label = if app.connected { "disconnect" } else { "connect" };
+
+    let title = Paragraph::new(format!(
+        "dd_ftp  |  F1: controls  |  [b] cycle bookmarks  [c] {}  |  {}",
+        connect_label, bookmark_label
+    ))
+    .style(Style::default().fg(Color::Cyan));
     frame.render_widget(title, vertical[0]);
 
     let panes = Layout::default()
@@ -75,19 +93,52 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         Style::default()
     };
 
-    let queue = Paragraph::new(format!(
-        "Pending: {} | Active: {} | Complete: {} | Failed: {}",
-        app.queue.pending.len(),
-        app.queue.active.len(),
-        app.queue.completed.len(),
-        app.queue.failed.len()
-    ))
-    .block(
-        Block::default()
-            .title(" [3] Queue ")
-            .borders(Borders::ALL)
-            .border_style(queue_style),
-    );
+    let active_label = app
+        .queue
+        .active
+        .first()
+        .map(format_job_summary)
+        .unwrap_or_else(|| "none".to_string());
+
+    let pending_label = app
+        .queue
+        .pending
+        .first()
+        .map(format_job_summary)
+        .unwrap_or_else(|| "none".to_string());
+
+    let failed_label = app
+        .queue
+        .failed
+        .last()
+        .map(format_job_summary)
+        .unwrap_or_else(|| "none".to_string());
+
+    let worker_state = if app.worker_running { "running" } else { "idle" };
+
+    let queue_text = vec![
+        Line::from(format!(
+            "Worker: {} | Pending: {} | Active: {} | Complete: {} | Failed: {} | Cancelled: {}",
+            worker_state,
+            app.queue.pending.len(),
+            app.queue.active.len(),
+            app.queue.completed.len(),
+            app.queue.failed.len(),
+            app.queue.cancelled.len()
+        )),
+        Line::from(format!("Active:  {}", active_label)),
+        Line::from(format!("Next:    {}", pending_label)),
+        Line::from(format!("Failed:  {}", failed_label)),
+    ];
+
+    let queue = Paragraph::new(queue_text)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(" [3] Queue ")
+                .borders(Borders::ALL)
+                .border_style(queue_style),
+        );
     frame.render_widget(queue, vertical[2]);
 
     let status = Paragraph::new(app.status.clone())
@@ -116,11 +167,18 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             Line::from("  h -> go to parent directory"),
             Line::from(""),
             Line::from("Actions"),
-            Line::from("  c -> connect SFTP"),
+            Line::from("  b -> cycle bookmarks"),
+            Line::from("  m -> open bookmarks modal"),
+            Line::from("  o -> open quick connect"),
+            Line::from("  c -> connect (or disconnect when connected)"),
             Line::from("  r -> refresh listing(s)"),
             Line::from("  u -> queue upload"),
             Line::from("  d -> queue download"),
-            Line::from("  x -> force process one queued transfer"),
+            Line::from("  x -> worker status hint"),
+            Line::from("  X -> clear pending queue"),
+            Line::from("  R -> retry last failed transfer"),
+            Line::from("  C -> cancel active transfer"),
+            Line::from("  B -> save current quick-connect as bookmark"),
             Line::from(""),
             Line::from("Global"),
             Line::from("  F1 -> toggle this help"),
@@ -136,6 +194,175 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
         frame.render_widget(help, area);
     }
+
+    if app.show_quick_connect {
+        let area = centered_rect(70, 65, frame.area());
+        frame.render_widget(Clear, area);
+
+        let protocol = match app.quick_connect.protocol {
+            Protocol::Sftp => "SFTP",
+            Protocol::Ftp => "FTP",
+            Protocol::Ftps => "FTPS",
+        };
+
+        let password_mask = app
+            .quick_connect
+            .password
+            .as_ref()
+            .map(|p| "*".repeat(p.len()))
+            .unwrap_or_default();
+
+        let rows = vec![
+            (QuickConnectField::Name, format!("Name: {}", app.quick_connect.name)),
+            (QuickConnectField::Host, format!("Host: {}", app.quick_connect.host)),
+            (QuickConnectField::Port, format!("Port: {}", app.quick_connect.port)),
+            (
+                QuickConnectField::Username,
+                format!("User: {}", app.quick_connect.username),
+            ),
+            (
+                QuickConnectField::Password,
+                format!("Pass: {}", password_mask),
+            ),
+            (
+                QuickConnectField::Protocol,
+                format!("Protocol: {}", protocol),
+            ),
+            (
+                QuickConnectField::Path,
+                format!("Path: {}", app.quick_connect.initial_path),
+            ),
+        ];
+
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                "Quick Connect",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+        ];
+
+        for (field, value) in rows {
+            if field == app.quick_connect_field {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("> {}", value),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )]));
+            } else {
+                lines.push(Line::from(format!("  {}", value)));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from("Tab/Shift+Tab move field | ←/→ protocol | Enter connect"));
+        lines.push(Line::from("Ctrl+S save bookmark | Esc close"));
+
+        let modal = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" Connection ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+
+        frame.render_widget(modal, area);
+    }
+
+    if app.show_bookmarks {
+        let area = centered_rect(70, 65, frame.area());
+        frame.render_widget(Clear, area);
+
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                "Bookmarks",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+        ];
+
+        if app.bookmarks.is_empty() {
+            lines.push(Line::from("No bookmarks saved."));
+        } else {
+            for (i, b) in app.bookmarks.iter().enumerate() {
+                let prefix = if i == app.selected_bookmark { ">" } else { " " };
+                let default_mark = if i == 0 { "*" } else { " " };
+                let display_name = if b.name.trim().is_empty() {
+                    b.host.clone()
+                } else {
+                    b.name.clone()
+                };
+                lines.push(Line::from(format!(
+                    "{}{} {} [{}:{}] ({:?})",
+                    prefix, default_mark, display_name, b.host, b.port, b.protocol
+                )));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from("j/k move | Enter load into quick connect | c connect"));
+        lines.push(Line::from("e edit | d delete | D set default | Esc close"));
+
+        let modal = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" Bookmarks ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+
+        frame.render_widget(modal, area);
+    }
+}
+
+fn format_job_summary(job: &TransferJob) -> String {
+    let direction = match job.direction {
+        dd_ftp_core::TransferDirection::Upload => "up",
+        dd_ftp_core::TransferDirection::Download => "down",
+    };
+
+    let progress = if let Some(size) = job.size_bytes {
+        if size > 0 {
+            let pct = (job.transferred_bytes as f64 / size as f64) * 100.0;
+            format!("{:.0}%", pct)
+        } else {
+            "0%".to_string()
+        }
+    } else {
+        format!("{}B", job.transferred_bytes)
+    };
+
+    let local = shorten_middle(&job.local_path, 28);
+    let remote = shorten_middle(&job.remote_path, 28);
+
+    format!(
+        "{} {} -> {} ({}, retry {})",
+        direction, local, remote, progress, job.retries
+    )
+}
+
+fn shorten_middle(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+
+    if max_chars < 8 {
+        return "...".to_string();
+    }
+
+    let keep = (max_chars - 3) / 2;
+    let start: String = input.chars().take(keep).collect();
+    let end: String = input
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    format!("{}...{}", start, end)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

@@ -12,3 +12,4 @@ chrono.workspace = true
 dd_ftp_core = { path = "../dd_ftp_core" }
 ssh2.workspace = true
 tokio.workspace = true
+uuid.workspace = true

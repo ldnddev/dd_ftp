@@ -1,14 +1,26 @@
-use std::{io, path::Path, time::Duration};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    path::Path,
+    time::Duration,
+};
+
+use tokio::sync::mpsc;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dd_ftp_app::{reduce, Action, AppState, FocusPane};
 use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob};
+use uuid::Uuid;
 use dd_ftp_protocols::SftpSession;
+use dd_ftp_storage::SiteManager;
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 #[tokio::main]
@@ -22,6 +34,20 @@ async fn main() -> Result<()> {
 
     let mut app = AppState::default();
     app.local_entries = local_list(".");
+
+    // Seed quick-connect from env for first run, then load bookmarks.
+    app.quick_connect = connection_info_from_env();
+
+    if let Ok(cfg) = SiteManager::load_or_default() {
+        if !cfg.sites.is_empty() {
+            reduce(&mut app, Action::SetBookmarks(cfg.sites.clone()));
+            let selected_idx = cfg.default_site.unwrap_or(0).min(cfg.sites.len().saturating_sub(1));
+            if let Some(selected) = cfg.sites.get(selected_idx) {
+                reduce(&mut app, Action::QuickConnectSetFromBookmark(selected.clone()));
+                app.selected_bookmark = selected_idx;
+            }
+        }
+    }
 
     let mut session = SftpSession::default();
 
@@ -39,12 +65,82 @@ async fn run(
     app: &mut AppState,
     session: &mut SftpSession,
 ) -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
+    let mut cancel_flag: Option<Arc<AtomicBool>> = None;
+
     loop {
         terminal.draw(|f| dd_ftp_ui::render(f, app))?;
 
-        // Auto-process one queued transfer per tick when connected.
-        if app.connected && !app.queue.pending.is_empty() && app.queue.active.is_empty() {
-            process_next_transfer(app, session).await;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                WorkerMessage::Progress {
+                    job_id,
+                    transferred_bytes,
+                    size_bytes,
+                } => {
+                    reduce(
+                        app,
+                        Action::UpdateTransferProgress {
+                            job_id,
+                            transferred_bytes,
+                            size_bytes,
+                        },
+                    );
+                }
+                WorkerMessage::Done(result) => {
+                    cancel_flag = None;
+                    handle_worker_result(app, session, result).await;
+                }
+            }
+        }
+
+        // Start background worker for one queued transfer.
+        if app.connected && !app.worker_running && !app.queue.pending.is_empty() {
+            if let Some(job) = app.queue.start_next() {
+                app.worker_running = true;
+                app.worker_cancel_requested = false;
+                reduce(app, Action::SetStatus(format!("Processing {:?}: {}", job.direction, job.remote_path)));
+
+                let info = connection_info_from_env();
+                let tx_clone = tx.clone();
+                let cancel = Arc::new(AtomicBool::new(false));
+                cancel_flag = Some(cancel.clone());
+
+                tokio::spawn(async move {
+                    let mut worker_session = SftpSession::default();
+                    let connect_result = worker_session.connect(info).await;
+                    let outcome = match connect_result {
+                        Ok(_) => {
+                            let progress_tx = {
+                                let tx_progress = tx_clone.clone();
+                                move |job_id: Uuid, transferred, size| {
+                                    let _ = tx_progress.send(WorkerMessage::Progress {
+                                        job_id,
+                                        transferred_bytes: transferred,
+                                        size_bytes: size,
+                                    });
+                                }
+                            };
+
+                            match job.direction {
+                                TransferDirection::Upload => worker_session
+                                    .upload_with_progress(&job, cancel.clone(), progress_tx)
+                                    .await,
+                                TransferDirection::Download => worker_session
+                                    .download_with_progress(&job, cancel.clone(), progress_tx)
+                                    .await,
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+
+                    let _ = tx_clone.send(WorkerMessage::Done(WorkerResult {
+                        job,
+                        outcome,
+                        was_cancelled: cancel.load(Ordering::Relaxed),
+                    }));
+                });
+            }
         }
 
         if event::poll(Duration::from_millis(150))? {
@@ -55,9 +151,70 @@ async fn run(
                 }
 
                 if app.show_help {
-                    // While help modal is open, allow Esc to close it.
                     if key.code == KeyCode::Esc {
                         reduce(app, Action::ToggleHelp);
+                    }
+                    continue;
+                }
+
+                if app.show_quick_connect {
+                    match key.code {
+                        KeyCode::Esc => reduce(app, Action::ToggleQuickConnect),
+                        KeyCode::Tab => reduce(app, Action::QuickConnectNextField),
+                        KeyCode::BackTab => reduce(app, Action::QuickConnectPrevField),
+                        KeyCode::Left => reduce(app, Action::QuickConnectSetProtocolPrev),
+                        KeyCode::Right => reduce(app, Action::QuickConnectSetProtocolNext),
+                        KeyCode::Backspace => reduce(app, Action::QuickConnectBackspace),
+                        KeyCode::Enter => {
+                            let info = app.quick_connect.clone();
+                            connect_with_info(app, session, info).await;
+                            reduce(app, Action::ToggleQuickConnect);
+                        }
+                        KeyCode::Char('s')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            save_quick_connect_bookmark(app);
+                        }
+                        KeyCode::Char(ch) => {
+                            reduce(app, Action::QuickConnectInput(ch));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if app.show_bookmarks {
+                    match key.code {
+                        KeyCode::Esc => reduce(app, Action::ToggleBookmarks),
+                        KeyCode::Char('j') | KeyCode::Down => reduce(app, Action::SelectNextBookmark),
+                        KeyCode::Char('k') | KeyCode::Up => reduce(app, Action::SelectPrevBookmark),
+                        KeyCode::Enter => {
+                            if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                                reduce(app, Action::QuickConnectSetFromBookmark(bm));
+                                reduce(app, Action::ToggleBookmarks);
+                                reduce(app, Action::ToggleQuickConnect);
+                            }
+                        }
+                        KeyCode::Char('c') => {
+                            if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                                connect_with_info(app, session, bm).await;
+                                reduce(app, Action::ToggleBookmarks);
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            delete_selected_bookmark(app);
+                        }
+                        KeyCode::Char('e') => {
+                            if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                                reduce(app, Action::QuickConnectSetFromBookmark(bm));
+                                reduce(app, Action::ToggleBookmarks);
+                                reduce(app, Action::ToggleQuickConnect);
+                            }
+                        }
+                        KeyCode::Char('D') => {
+                            set_default_bookmark(app);
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -102,35 +259,24 @@ async fn run(
                             reduce(app, Action::SetStatus("Refreshed local listing".to_string()));
                         }
                     }
+                    KeyCode::Char('b') => {
+                        reduce(app, Action::SelectNextBookmark);
+                    }
+                    KeyCode::Char('B') => {
+                        save_quick_connect_bookmark(app);
+                    }
+                    KeyCode::Char('o') => {
+                        reduce(app, Action::ToggleQuickConnect);
+                    }
+                    KeyCode::Char('m') => {
+                        reduce(app, Action::ToggleBookmarks);
+                    }
                     KeyCode::Char('c') => {
-                        let info = connection_info_from_env();
-
-                        app.remote_cwd = info.initial_path.clone();
-                        reduce(app, Action::Connect(info.clone()));
-
-                        match session.connect(info).await {
-                            Ok(_) => {
-                                reduce(app, Action::SetConnected(true));
-
-                                match session.list_dir(&app.remote_cwd).await {
-                                    Ok(entries) => {
-                                        reduce(app, Action::SetRemoteEntries(entries));
-                                        reduce(app, Action::SetStatus(format!(
-                                            "Connected via SFTP. Remote cwd: {}",
-                                            app.remote_cwd
-                                        )));
-                                    }
-                                    Err(err) => {
-                                        reduce(app, Action::SetStatus(format!(
-                                            "Connected but list_dir failed: {err}"
-                                        )));
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                reduce(app, Action::SetConnected(false));
-                                reduce(app, Action::SetStatus(format!("Connect failed: {err}")));
-                            }
+                        if app.connected {
+                            disconnect_session(app, session).await;
+                        } else {
+                            let info = selected_or_quick_connect(app);
+                            connect_with_info(app, session, info).await;
                         }
                     }
                     KeyCode::Char('u') => {
@@ -170,8 +316,24 @@ async fn run(
                         }
                     }
                     KeyCode::Char('x') => {
-                        // Manual trigger remains available.
-                        process_next_transfer(app, session).await;
+                        reduce(app, Action::SetStatus("Worker auto-processes queue".to_string()));
+                    }
+                    KeyCode::Char('X') => {
+                        reduce(app, Action::ClearPendingTransfers);
+                    }
+                    KeyCode::Char('R') => {
+                        reduce(app, Action::RetryLastFailed);
+                    }
+                    KeyCode::Char('C') => {
+                        if app.worker_running {
+                            app.worker_cancel_requested = true;
+                            if let Some(flag) = &cancel_flag {
+                                flag.store(true, Ordering::Relaxed);
+                            }
+                            reduce(app, Action::SetStatus("Cancel requested".to_string()));
+                        } else {
+                            reduce(app, Action::SetStatus("No active transfer to cancel".to_string()));
+                        }
                     }
                     _ => {}
                 }
@@ -256,47 +418,255 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
     }
 }
 
-async fn process_next_transfer(app: &mut AppState, session: &mut SftpSession) {
-    if !app.connected {
-        reduce(app, Action::SetStatus("Not connected".to_string()));
+#[derive(Debug)]
+struct WorkerResult {
+    job: TransferJob,
+    outcome: anyhow::Result<()>,
+    was_cancelled: bool,
+}
+
+#[derive(Debug)]
+enum WorkerMessage {
+    Progress {
+        job_id: Uuid,
+        transferred_bytes: u64,
+        size_bytes: Option<u64>,
+    },
+    Done(WorkerResult),
+}
+
+async fn handle_worker_result(app: &mut AppState, session: &mut SftpSession, mut msg: WorkerResult) {
+    app.worker_running = false;
+
+    if app.worker_cancel_requested || msg.was_cancelled {
+        app.worker_cancel_requested = false;
+        msg.job.last_error = Some("Cancelled by user".to_string());
+        reduce(app, Action::MarkTransferCancelled(msg.job));
         return;
     }
 
-    if let Some(mut job) = app.queue.start_next() {
-        let result = match job.direction {
-            TransferDirection::Upload => session.upload(&job).await,
-            TransferDirection::Download => session.download(&job).await,
-        };
+    match msg.outcome {
+        Ok(_) => {
+            let name = match msg.job.direction {
+                TransferDirection::Upload => "upload",
+                TransferDirection::Download => "download",
+            };
+            msg.job.last_error = None;
+            reduce(app, Action::MarkTransferCompleted(msg.job));
+            reduce(app, Action::SetStatus(format!("{name} complete")));
 
-        match result {
-            Ok(_) => {
-                let name = match job.direction {
-                    TransferDirection::Upload => "upload",
-                    TransferDirection::Download => "download",
-                };
-                job.last_error = None;
-                reduce(app, Action::MarkTransferCompleted(job));
-                reduce(app, Action::SetStatus(format!("{name} complete")));
-
-                // refresh views after transfer
-                app.local_entries = local_list(&app.local_cwd);
+            app.local_entries = local_list(&app.local_cwd);
+            if app.connected {
                 if let Ok(entries) = session.list_dir(&app.remote_cwd).await {
                     reduce(app, Action::SetRemoteEntries(entries));
                 }
             }
+        }
+        Err(err) => {
+            msg.job.last_error = Some(err.to_string());
+            reduce(app, Action::MarkTransferFailed(msg.job));
+            reduce(app, Action::SetStatus(format!("Transfer failed: {err}")));
+        }
+    }
+}
+
+async fn disconnect_session(app: &mut AppState, session: &mut SftpSession) {
+    match session.disconnect().await {
+        Ok(_) => {
+            reduce(app, Action::Disconnect);
+            app.remote_entries.clear();
+            app.queue.active.clear();
+            app.worker_running = false;
+            app.worker_cancel_requested = false;
+            app.active_connection = None;
+            reduce(app, Action::SetStatus("Disconnected".to_string()));
+        }
+        Err(err) => {
+            reduce(app, Action::SetStatus(format!("Disconnect failed: {err}")));
+        }
+    }
+}
+
+async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: ConnectionInfo) {
+    // field validation for quick connect / bookmarks
+    if info.name.trim().is_empty() {
+        reduce(app, Action::SetStatus("Connect failed: label/name is required".to_string()));
+        return;
+    }
+    if info.host.trim().is_empty() {
+        reduce(app, Action::SetStatus("Connect failed: host is required".to_string()));
+        return;
+    }
+    if info.username.trim().is_empty() {
+        reduce(app, Action::SetStatus("Connect failed: username is required".to_string()));
+        return;
+    }
+    if info.port == 0 {
+        reduce(app, Action::SetStatus("Connect failed: port must be > 0".to_string()));
+        return;
+    }
+
+    app.remote_cwd = if info.initial_path.trim().is_empty() {
+        "/".to_string()
+    } else {
+        info.initial_path.clone()
+    };
+    reduce(app, Action::Connect(info.clone()));
+
+    match session.connect(info.clone()).await {
+        Ok(_) => {
+            reduce(app, Action::SetConnected(true));
+
+            match session.list_dir(&app.remote_cwd).await {
+                Ok(entries) => {
+                    reduce(app, Action::SetRemoteEntries(entries));
+                    app.active_connection = Some(info.clone());
+                    reduce(app, Action::SetStatus(format!(
+                        "Connected via {:?} to {} as {} (cwd: {})",
+                        info.protocol,
+                        info.host,
+                        info.username,
+                        app.remote_cwd
+                    )));
+                }
+                Err(err) => {
+                    reduce(app, Action::SetStatus(format!(
+                        "Connected, but initial list_dir failed at '{}': {err}",
+                        app.remote_cwd
+                    )));
+                }
+            }
+        }
+        Err(err) => {
+            reduce(app, Action::SetConnected(false));
+            reduce(app, Action::SetStatus(format!(
+                "Connect failed for {}@{}:{} -> {err}",
+                info.username,
+                info.host,
+                info.port
+            )));
+        }
+    }
+}
+
+fn selected_or_quick_connect(app: &AppState) -> ConnectionInfo {
+    if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+        bm
+    } else {
+        app.quick_connect.clone()
+    }
+}
+
+fn save_quick_connect_bookmark(app: &mut AppState) {
+    let mut cfg = SiteManager::load_or_default().unwrap_or_default();
+    let info = app.quick_connect.clone();
+
+    if info.name.trim().is_empty()
+        || info.host.trim().is_empty()
+        || info.username.trim().is_empty()
+        || info.port == 0
+    {
+        reduce(
+            app,
+            Action::SetStatus("Cannot save bookmark: host/user/port required".to_string()),
+        );
+        return;
+    }
+
+    let exists = cfg
+        .sites
+        .iter()
+        .any(|s| s.host == info.host && s.username == info.username && s.port == info.port);
+
+    if !exists {
+        cfg.sites.push(info);
+        if cfg.default_site.is_none() {
+            cfg.default_site = Some(0);
+        }
+
+        match SiteManager::save_to_default_path(&cfg) {
+            Ok(_) => {
+                reduce(app, Action::SetBookmarks(cfg.sites));
+                reduce(app, Action::SetStatus("Saved bookmark".to_string()));
+            }
             Err(err) => {
-                job.last_error = Some(err.to_string());
-                reduce(app, Action::MarkTransferFailed(job));
-                reduce(app, Action::SetStatus(format!("Transfer failed: {err}")));
+                reduce(app, Action::SetStatus(format!("Save bookmark failed: {err}")));
             }
         }
     } else {
-        reduce(app, Action::SetStatus("Queue is empty".to_string()));
+        reduce(app, Action::SetStatus("Bookmark already exists".to_string()));
+    }
+}
+
+fn delete_selected_bookmark(app: &mut AppState) {
+    let mut cfg = SiteManager::load_or_default().unwrap_or_default();
+    if cfg.sites.is_empty() {
+        reduce(app, Action::SetStatus("No bookmarks to delete".to_string()));
+        return;
+    }
+
+    if app.selected_bookmark >= cfg.sites.len() {
+        reduce(app, Action::SetStatus("Invalid bookmark selection".to_string()));
+        return;
+    }
+
+    let removed = cfg.sites.remove(app.selected_bookmark);
+
+    if let Some(default_idx) = cfg.default_site {
+        cfg.default_site = if cfg.sites.is_empty() {
+            None
+        } else if default_idx == app.selected_bookmark {
+            Some(0)
+        } else if default_idx > app.selected_bookmark {
+            Some(default_idx - 1)
+        } else {
+            Some(default_idx)
+        };
+    }
+
+    match SiteManager::save_to_default_path(&cfg) {
+        Ok(_) => {
+            reduce(app, Action::SetBookmarks(cfg.sites));
+            reduce(app, Action::SetStatus(format!("Deleted bookmark: {}", removed.name)));
+        }
+        Err(err) => {
+            reduce(app, Action::SetStatus(format!("Delete bookmark failed: {err}")));
+        }
+    }
+}
+
+fn set_default_bookmark(app: &mut AppState) {
+    let mut cfg = SiteManager::load_or_default().unwrap_or_default();
+    if cfg.sites.is_empty() {
+        reduce(app, Action::SetStatus("No bookmarks to set as default".to_string()));
+        return;
+    }
+
+    if app.selected_bookmark >= cfg.sites.len() {
+        reduce(app, Action::SetStatus("Invalid bookmark selection".to_string()));
+        return;
+    }
+
+    let selected = app.selected_bookmark;
+    if selected != 0 {
+        cfg.sites.swap(0, selected);
+    }
+    cfg.default_site = Some(0);
+
+    match SiteManager::save_to_default_path(&cfg) {
+        Ok(_) => {
+            reduce(app, Action::SetBookmarks(cfg.sites));
+            reduce(app, Action::SetStatus("Default bookmark updated".to_string()));
+        }
+        Err(err) => {
+            reduce(app, Action::SetStatus(format!("Set default failed: {err}")));
+        }
     }
 }
 
 fn connection_info_from_env() -> ConnectionInfo {
     let host = std::env::var("DD_FTP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let name = std::env::var("DD_FTP_NAME").unwrap_or_else(|_| host.clone());
     let port = std::env::var("DD_FTP_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
@@ -307,7 +677,7 @@ fn connection_info_from_env() -> ConnectionInfo {
     let initial_path = std::env::var("DD_FTP_PATH").unwrap_or_else(|_| "/".to_string());
 
     ConnectionInfo {
-        name: "Env SFTP".to_string(),
+        name,
         host,
         port,
         protocol: Protocol::Sftp,

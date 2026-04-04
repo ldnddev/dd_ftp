@@ -11,6 +11,8 @@ crossterm.workspace = true
 dd_ftp_app = { path = "../dd_ftp_app" }
 dd_ftp_core = { path = "../dd_ftp_core" }
 dd_ftp_protocols = { path = "../dd_ftp_protocols" }
+dd_ftp_storage = { path = "../dd_ftp_storage" }
 dd_ftp_ui = { path = "../dd_ftp_ui" }
 ratatui.workspace = true
 tokio.workspace = true
+uuid.workspace = true

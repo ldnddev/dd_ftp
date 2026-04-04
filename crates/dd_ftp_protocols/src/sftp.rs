@@ -1,8 +1,12 @@
 use std::{
     fs::File,
-    io,
+    io::{Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,6 +14,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, RemoteSession, TransferJob};
 use ssh2::Session;
+use uuid::Uuid;
 
 #[derive(Default)]
 pub struct SftpSession {
@@ -111,7 +116,6 @@ impl SftpSession {
         }
 
         out.sort_by(|a, b| {
-            // Directories first, then name.
             b.is_dir()
                 .cmp(&a.is_dir())
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
@@ -120,25 +124,56 @@ impl SftpSession {
         Ok(out)
     }
 
-    fn upload_sync(info: &ConnectionInfo, job: &TransferJob) -> Result<()> {
+    fn upload_sync<F>(
+        info: &ConnectionInfo,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64, Option<u64>) + Send + 'static,
+    {
         let session = Self::open_authenticated_session(info)?;
         let sftp = session.sftp().context("failed to initialize sftp subsystem")?;
 
         let mut local_file = File::open(&job.local_path)
             .with_context(|| format!("cannot open local file: {}", job.local_path))?;
+        let size = local_file.metadata().ok().map(|m| m.len());
 
         let remote_path = Path::new(&job.remote_path);
         let mut remote_file = sftp
             .create(remote_path)
             .with_context(|| format!("cannot create remote file: {}", job.remote_path))?;
 
-        io::copy(&mut local_file, &mut remote_file)
-            .with_context(|| format!("upload failed to {}", job.remote_path))?;
+        let mut transferred = 0_u64;
+        let mut buf = [0_u8; 64 * 1024];
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("cancelled");
+            }
+
+            let read = local_file.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            remote_file.write_all(&buf[..read])?;
+            transferred = transferred.saturating_add(read as u64);
+            on_progress(transferred, size);
+        }
 
         Ok(())
     }
 
-    fn download_sync(info: &ConnectionInfo, job: &TransferJob) -> Result<()> {
+    fn download_sync<F>(
+        info: &ConnectionInfo,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64, Option<u64>) + Send + 'static,
+    {
         let session = Self::open_authenticated_session(info)?;
         let sftp = session.sftp().context("failed to initialize sftp subsystem")?;
 
@@ -146,6 +181,7 @@ impl SftpSession {
         let mut remote_file = sftp
             .open(remote_path)
             .with_context(|| format!("cannot open remote file: {}", job.remote_path))?;
+        let size = sftp.stat(remote_path).ok().and_then(|s| s.size);
 
         let local_path = PathBuf::from(&job.local_path);
         if let Some(parent) = local_path.parent() {
@@ -156,10 +192,78 @@ impl SftpSession {
         let mut local_file = File::create(&local_path)
             .with_context(|| format!("cannot create local file: {}", local_path.display()))?;
 
-        io::copy(&mut remote_file, &mut local_file)
-            .with_context(|| format!("download failed from {}", job.remote_path))?;
+        let mut transferred = 0_u64;
+        let mut buf = [0_u8; 64 * 1024];
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("cancelled");
+            }
+
+            let read = remote_file.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            local_file.write_all(&buf[..read])?;
+            transferred = transferred.saturating_add(read as u64);
+            on_progress(transferred, size);
+        }
 
         Ok(())
+    }
+
+    pub async fn upload_with_progress<F>(
+        &self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: Fn(Uuid, u64, Option<u64>) + Send + Sync + 'static,
+    {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let job = job.clone();
+        let on_progress = Arc::new(on_progress);
+
+        tokio::task::spawn_blocking(move || {
+            let on_progress_closure = {
+                let on_progress = Arc::clone(&on_progress);
+                let job_id = job.id;
+                move |transferred: u64, size: Option<u64>| {
+                    on_progress(job_id, transferred, size);
+                }
+            };
+            Self::upload_sync(&info, &job, cancel, on_progress_closure)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during upload_with_progress: {e}"))?
+    }
+
+    pub async fn download_with_progress<F>(
+        &self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: Fn(Uuid, u64, Option<u64>) + Send + Sync + 'static,
+    {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let job = job.clone();
+        let on_progress = Arc::new(on_progress);
+
+        tokio::task::spawn_blocking(move || {
+            let on_progress_closure = {
+                let on_progress = Arc::clone(&on_progress);
+                let job_id = job.id;
+                move |transferred: u64, size: Option<u64>| {
+                    on_progress(job_id, transferred, size);
+                }
+            };
+            Self::download_sync(&info, &job, cancel, on_progress_closure)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during download_with_progress: {e}"))?
     }
 }
 
@@ -194,21 +298,12 @@ impl RemoteSession for SftpSession {
     }
 
     async fn upload(&self, job: &TransferJob) -> Result<()> {
-        let info = self.info.as_ref().context("not connected")?.clone();
-        let job = job.clone();
-
-        tokio::task::spawn_blocking(move || Self::upload_sync(&info, &job))
+        self.upload_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
             .await
-            .map_err(|e| anyhow!("join error during upload: {e}"))?
     }
 
     async fn download(&self, job: &TransferJob) -> Result<()> {
-        let info = self.info.as_ref().context("not connected")?.clone();
-        let job = job.clone();
-
-        tokio::task::spawn_blocking(move || Self::download_sync(&info, &job))
+        self.download_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
             .await
-            .map_err(|e| anyhow!("join error during download: {e}"))?
     }
 }
-

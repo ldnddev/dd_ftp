@@ -4,4 +4,4 @@ pub mod state;
 
 pub use actions::{Action, AppEvent};
 pub use reducer::reduce;
-pub use state::{AppState, FocusPane};
+pub use state::{AppState, FocusPane, QuickConnectField};

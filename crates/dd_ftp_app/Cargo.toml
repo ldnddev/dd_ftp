@@ -11,3 +11,4 @@ dd_ftp_core = { path = "../dd_ftp_core" }
 dd_ftp_transfer = { path = "../dd_ftp_transfer" }
 serde.workspace = true
 tokio.workspace = true
+uuid.workspace = true

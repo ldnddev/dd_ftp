@@ -8,4 +8,5 @@ license.workspace = true
 [dependencies]
 crossterm.workspace = true
 dd_ftp_app = { path = "../dd_ftp_app" }
+dd_ftp_core = { path = "../dd_ftp_core" }
 ratatui.workspace = true

@@ -1,4 +1,4 @@
-use dd_ftp_core::FileEntry;
+use dd_ftp_core::{ConnectionInfo, FileEntry};
 use dd_ftp_transfer::TransferQueue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6,6 +6,43 @@ pub enum FocusPane {
     Local,
     Remote,
     Queue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickConnectField {
+    Name,
+    Host,
+    Port,
+    Username,
+    Password,
+    Protocol,
+    Path,
+}
+
+impl QuickConnectField {
+    pub fn next(self) -> Self {
+        match self {
+            QuickConnectField::Name => QuickConnectField::Host,
+            QuickConnectField::Host => QuickConnectField::Port,
+            QuickConnectField::Port => QuickConnectField::Username,
+            QuickConnectField::Username => QuickConnectField::Password,
+            QuickConnectField::Password => QuickConnectField::Protocol,
+            QuickConnectField::Protocol => QuickConnectField::Path,
+            QuickConnectField::Path => QuickConnectField::Name,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            QuickConnectField::Name => QuickConnectField::Path,
+            QuickConnectField::Host => QuickConnectField::Name,
+            QuickConnectField::Port => QuickConnectField::Host,
+            QuickConnectField::Username => QuickConnectField::Port,
+            QuickConnectField::Password => QuickConnectField::Username,
+            QuickConnectField::Protocol => QuickConnectField::Password,
+            QuickConnectField::Path => QuickConnectField::Protocol,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -19,6 +56,15 @@ pub struct AppState {
     pub selected_remote: usize,
     pub focus: FocusPane,
     pub show_help: bool,
+    pub show_quick_connect: bool,
+    pub show_bookmarks: bool,
+    pub quick_connect: ConnectionInfo,
+    pub quick_connect_field: QuickConnectField,
+    pub worker_running: bool,
+    pub worker_cancel_requested: bool,
+    pub bookmarks: Vec<ConnectionInfo>,
+    pub selected_bookmark: usize,
+    pub active_connection: Option<ConnectionInfo>,
     pub status: String,
     pub queue: TransferQueue,
 }
@@ -35,6 +81,15 @@ impl Default for AppState {
             selected_remote: 0,
             focus: FocusPane::Local,
             show_help: false,
+            show_quick_connect: false,
+            show_bookmarks: false,
+            quick_connect: ConnectionInfo::default(),
+            quick_connect_field: QuickConnectField::Name,
+            worker_running: false,
+            worker_cancel_requested: false,
+            bookmarks: vec![],
+            selected_bookmark: 0,
+            active_connection: None,
             status: "Ready".to_string(),
             queue: TransferQueue::default(),
         }

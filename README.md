@@ -16,7 +16,7 @@ Scaffold complete (architecture + crate layout).
 - Storage scaffold for site manager (`serde` + `toml`)
 - `dd_ftp_cli` runner crate with working terminal loop + key handling
 
-### Current Phase 1 progress
+### Current Phase 1 progress (Phase 1.3 complete)
 - ✅ Added runner binary crate (`dd_ftp_cli`) and wired tokio + ratatui event loop
 - ✅ Connected keyboard actions to reducer (`Tab`, `j/k`, `h/l`, `r`, `c`, `q`)
 - ✅ Added selectable local/remote panes with highlighted cursor row
@@ -24,13 +24,19 @@ Scaffold complete (architecture + crate layout).
 - ✅ Implemented real SFTP connect + remote `list_dir` using `ssh2`
 - ✅ Wired `c` to connect and immediately populate remote pane
 - ✅ Wired `r` to refresh both local + remote (when connected)
-- ✅ Added transfer queue lifecycle (pending -> active -> completed/failed)
+- ✅ Added transfer queue lifecycle (pending -> active -> completed/failed/cancelled)
 - ✅ Added `u` (queue upload), `d` (queue download)
-- ✅ Implemented auto queue processing loop (one transfer per tick)
-- ✅ Kept `x` manual process trigger for debugging/forced run
-- ✅ Implemented SFTP file upload/download for single file jobs
-- ⏳ Persist site manager config to disk
-- ⏳ Add async worker loop for continuous parallel transfer processing
+- ✅ Implemented async background queue worker (continuous processing)
+- ✅ Added queue controls: `X` clear pending, `R` retry last failed, `C` cancel active
+- ✅ Added progress events (bytes + optional percent) into active queue job state
+- ✅ Added true cancellation token checks in transfer loops
+- ✅ Enhanced queue panel with worker state + active/next/failed transfer summaries
+- ✅ Added F1 help modal with dim backdrop and Esc close
+- ✅ Added bookmark/site manager persistence (`~/.config/dd_ftp/sites.toml`)
+- ✅ Added bookmark controls: `b` cycle saved sites, `B` save current quick-connect as bookmark
+- ✅ Added Quick Connect modal (`o`) and Bookmarks modal (`m`)
+- ✅ Added bookmark modal actions: edit (`e`), delete (`d`), set default (`D`)
+- ⏳ Multi-worker parallel transfer processing
 
 ### Run
 ```bash
@@ -64,10 +70,42 @@ Controls:
 - `l` enter selected directory in focused pane
 - `h` move to parent directory in focused pane
 - `r` refresh local listing (and remote when connected)
-- `c` connect via SFTP using env vars
+- `b` cycle bookmarks
+- `B` save current quick-connect as bookmark
+- `o` open Quick Connect modal (includes Name/Label field)
+- `m` open Bookmarks modal
+- `c` connect selected bookmark (falls back to quick-connect), or disconnect when connected
+- in Bookmarks modal: `e` edit in quick connect, `d` delete, `D` set default
+
+Quick Connect modal:
+- `Ctrl+S` save bookmark
+- first field is **Name/Label** (used in bookmark list and title bar)
 - `u` queue upload (selected local file -> remote cwd)
 - `d` queue download (selected remote file -> local cwd)
-- `x` force process one queued transfer now (optional)
+- `x` show worker status hint
+- `X` clear pending queue
+- `R` retry last failed transfer
+- `C` cancel active transfer
+
+## Local validation checklist
+Run these locally to verify cleanup before Phase 2:
+
+```bash
+cd ~/projects/dd_ftp
+cargo check -p dd_ftp_cli
+cargo run -p dd_ftp_cli
+```
+
+Quick smoke test:
+1. open quick connect with `o`, fill fields, `Ctrl+S` to save bookmark
+2. open bookmark modal with `m`
+3. test `e` (edit/load), `d` (delete), `D` (set default)
+4. `c` connect selected bookmark
+5. queue upload with `u`
+6. confirm auto worker starts and queue updates
+7. press `C` during transfer to test cancellation
+8. press `R` to retry last failed
+9. press `X` to clear pending
 
 ## Architecture
 See [ARCHITECTURE.md](./ARCHITECTURE.md).

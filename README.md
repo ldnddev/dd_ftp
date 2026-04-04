@@ -18,14 +18,19 @@ Scaffold complete (architecture + crate layout).
 
 ### Current Phase 1 progress
 - ✅ Added runner binary crate (`dd_ftp_cli`) and wired tokio + ratatui event loop
-- ✅ Connected keyboard actions to reducer (`Tab`, `↑/↓`, `r`, `c`, `q`)
+- ✅ Connected keyboard actions to reducer (`Tab`, `j/k`, `h/l`, `r`, `c`, `q`)
 - ✅ Added selectable local/remote panes with highlighted cursor row
 - ✅ Added local filesystem listing refresh
 - ✅ Implemented real SFTP connect + remote `list_dir` using `ssh2`
 - ✅ Wired `c` to connect and immediately populate remote pane
 - ✅ Wired `r` to refresh both local + remote (when connected)
-- ⏳ Wire upload/download actions into transfer queue + side effects
+- ✅ Added transfer queue lifecycle (pending -> active -> completed/failed)
+- ✅ Added `u` (queue upload), `d` (queue download)
+- ✅ Implemented auto queue processing loop (one transfer per tick)
+- ✅ Kept `x` manual process trigger for debugging/forced run
+- ✅ Implemented SFTP file upload/download for single file jobs
 - ⏳ Persist site manager config to disk
+- ⏳ Add async worker loop for continuous parallel transfer processing
 
 ### Run
 ```bash
@@ -49,11 +54,20 @@ export DD_FTP_PATH=/
 ```
 
 Controls:
+- `F1` toggle controls/help modal (`Esc` closes modal too)
 - `q` quit
-- `Tab` switch pane focus
-- `↑/↓` move selection in focused pane
+- `1` focus Local pane
+- `2` focus Remote pane
+- `3` focus Queue pane
+- `Tab` cycle pane focus
+- `j/k` move selection in focused pane (↓/↑ also supported)
+- `l` enter selected directory in focused pane
+- `h` move to parent directory in focused pane
 - `r` refresh local listing (and remote when connected)
 - `c` connect via SFTP using env vars
+- `u` queue upload (selected local file -> remote cwd)
+- `d` queue download (selected remote file -> local cwd)
+- `x` force process one queued transfer now (optional)
 
 ## Architecture
 See [ARCHITECTURE.md](./ARCHITECTURE.md).

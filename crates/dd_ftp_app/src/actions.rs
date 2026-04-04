@@ -8,8 +8,12 @@ pub enum Action {
     SetLocalEntries(Vec<FileEntry>),
     SetRemoteEntries(Vec<FileEntry>),
     QueueTransfer(TransferJob),
+    StartNextTransfer,
+    MarkTransferCompleted(TransferJob),
+    MarkTransferFailed(TransferJob),
     SetStatus(String),
     FocusNextPane,
+    ToggleHelp,
     SelectUp,
     SelectDown,
 }

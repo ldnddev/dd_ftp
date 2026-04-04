@@ -1,4 +1,9 @@
-use std::{net::TcpStream, path::Path};
+use std::{
+    fs::File,
+    io,
+    net::TcpStream,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -114,6 +119,48 @@ impl SftpSession {
 
         Ok(out)
     }
+
+    fn upload_sync(info: &ConnectionInfo, job: &TransferJob) -> Result<()> {
+        let session = Self::open_authenticated_session(info)?;
+        let sftp = session.sftp().context("failed to initialize sftp subsystem")?;
+
+        let mut local_file = File::open(&job.local_path)
+            .with_context(|| format!("cannot open local file: {}", job.local_path))?;
+
+        let remote_path = Path::new(&job.remote_path);
+        let mut remote_file = sftp
+            .create(remote_path)
+            .with_context(|| format!("cannot create remote file: {}", job.remote_path))?;
+
+        io::copy(&mut local_file, &mut remote_file)
+            .with_context(|| format!("upload failed to {}", job.remote_path))?;
+
+        Ok(())
+    }
+
+    fn download_sync(info: &ConnectionInfo, job: &TransferJob) -> Result<()> {
+        let session = Self::open_authenticated_session(info)?;
+        let sftp = session.sftp().context("failed to initialize sftp subsystem")?;
+
+        let remote_path = Path::new(&job.remote_path);
+        let mut remote_file = sftp
+            .open(remote_path)
+            .with_context(|| format!("cannot open remote file: {}", job.remote_path))?;
+
+        let local_path = PathBuf::from(&job.local_path);
+        if let Some(parent) = local_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create local parent dir: {}", parent.display()))?;
+        }
+
+        let mut local_file = File::create(&local_path)
+            .with_context(|| format!("cannot create local file: {}", local_path.display()))?;
+
+        io::copy(&mut remote_file, &mut local_file)
+            .with_context(|| format!("download failed from {}", job.remote_path))?;
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -146,12 +193,22 @@ impl RemoteSession for SftpSession {
             .map_err(|e| anyhow!("join error during list_dir: {e}"))?
     }
 
-    async fn upload(&self, _job: &TransferJob) -> Result<()> {
-        bail!("SFTP upload not implemented yet")
+    async fn upload(&self, job: &TransferJob) -> Result<()> {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let job = job.clone();
+
+        tokio::task::spawn_blocking(move || Self::upload_sync(&info, &job))
+            .await
+            .map_err(|e| anyhow!("join error during upload: {e}"))?
     }
 
-    async fn download(&self, _job: &TransferJob) -> Result<()> {
-        bail!("SFTP download not implemented yet")
+    async fn download(&self, job: &TransferJob) -> Result<()> {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let job = job.clone();
+
+        tokio::task::spawn_blocking(move || Self::download_sync(&info, &job))
+            .await
+            .map_err(|e| anyhow!("join error during download: {e}"))?
     }
 }
 

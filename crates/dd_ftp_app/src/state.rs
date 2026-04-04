@@ -18,6 +18,7 @@ pub struct AppState {
     pub selected_local: usize,
     pub selected_remote: usize,
     pub focus: FocusPane,
+    pub show_help: bool,
     pub status: String,
     pub queue: TransferQueue,
 }
@@ -33,6 +34,7 @@ impl Default for AppState {
             selected_local: 0,
             selected_remote: 0,
             focus: FocusPane::Local,
+            show_help: false,
             status: "Ready".to_string(),
             queue: TransferQueue::default(),
         }

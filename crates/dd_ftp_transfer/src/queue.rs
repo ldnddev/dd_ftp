@@ -1,4 +1,4 @@
-use dd_ftp_core::TransferJob;
+use dd_ftp_core::{TransferJob, TransferStatus};
 
 #[derive(Debug, Default)]
 pub struct TransferQueue {
@@ -9,23 +9,31 @@ pub struct TransferQueue {
 }
 
 impl TransferQueue {
-    pub fn enqueue(&mut self, job: TransferJob) {
+    pub fn enqueue(&mut self, mut job: TransferJob) {
+        job.status = TransferStatus::Pending;
         self.pending.push(job);
     }
 
-    pub fn next_pending(&mut self) -> Option<TransferJob> {
+    pub fn start_next(&mut self) -> Option<TransferJob> {
         if self.pending.is_empty() {
-            None
-        } else {
-            Some(self.pending.remove(0))
+            return None;
         }
+
+        let mut job = self.pending.remove(0);
+        job.status = TransferStatus::Active;
+        self.active.push(job.clone());
+        Some(job)
     }
 
-    pub fn mark_completed(&mut self, job: TransferJob) {
+    pub fn mark_completed(&mut self, mut job: TransferJob) {
+        job.status = TransferStatus::Completed;
+        self.active.retain(|j| j.id != job.id);
         self.completed.push(job);
     }
 
-    pub fn mark_failed(&mut self, job: TransferJob) {
+    pub fn mark_failed(&mut self, mut job: TransferJob) {
+        job.status = TransferStatus::Failed;
+        self.active.retain(|j| j.id != job.id);
         self.failed.push(job);
     }
 }

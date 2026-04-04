@@ -29,6 +29,29 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.queue.enqueue(job);
             state.status = format!("Queue: {} pending", state.queue.pending.len());
         }
+        Action::StartNextTransfer => {
+            if let Some(job) = state.queue.start_next() {
+                state.status = format!("Transfer active: {}", job.id);
+            } else {
+                state.status = "Queue is empty".to_string();
+            }
+        }
+        Action::MarkTransferCompleted(job) => {
+            state.queue.mark_completed(job);
+            state.status = format!(
+                "Transfer complete. Pending: {} Active: {}",
+                state.queue.pending.len(),
+                state.queue.active.len()
+            );
+        }
+        Action::MarkTransferFailed(job) => {
+            state.queue.mark_failed(job);
+            state.status = format!(
+                "Transfer failed. Pending: {} Active: {}",
+                state.queue.pending.len(),
+                state.queue.active.len()
+            );
+        }
         Action::SetStatus(msg) => {
             state.status = msg;
         }
@@ -38,6 +61,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 FocusPane::Remote => FocusPane::Queue,
                 FocusPane::Queue => FocusPane::Local,
             };
+        }
+        Action::ToggleHelp => {
+            state.show_help = !state.show_help;
         }
         Action::SelectUp => match state.focus {
             FocusPane::Local => {

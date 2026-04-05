@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.4.0-phase4] - 2026-04-04
+
+### Added
+- FTPS explicit TLS support in unified crate `dd_ftp_ftp` using `async_ftp` secure mode (`AUTH TLS` upgrade before auth)
+- FTPS transfer path now supports:
+  - connect
+  - list (`NLST`)
+  - upload
+  - download
+- FTPS root trust setup with compatible rustls stack (`tokio-rustls 0.23`, `webpki-roots 0.22`)
+
+### Changed
+- Unified FTP/FTPS crate is now the primary runtime path for FTP-family transfers
+- Removed active FTP/FTPS implementations from `dd_ftp_protocols` exports (SFTP-only exports remain)
+- Dependency alignment for FTPS compatibility:
+  - `async_ftp` now uses `secure` feature
+  - `tokio-rustls` pinned to `0.23` to match `async_ftp` secure API
+  - `webpki-roots` pinned to `0.22`
+
+### Fixed
+- FTPS compile/runtime blockers from mixed rustls API generations (0.20 vs 0.23+ styles)
+- Type inference issue in `retr(...)` callback return type for FTPS downloads
+
 ## [v0.3.0-phase3] - 2026-04-04
 
 ### Added

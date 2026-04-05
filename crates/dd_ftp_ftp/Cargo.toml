@@ -1,5 +1,5 @@
 [package]
-name = "dd_ftp_storage"
+name = "dd_ftp_ftp"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,7 +7,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async_ftp.workspace = true
 dd_ftp_core = { path = "../dd_ftp_core" }
-keyring.workspace = true
-serde.workspace = true
-toml.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true

@@ -15,6 +15,7 @@ pub enum QuickConnectField {
     Port,
     Username,
     Password,
+    PrivateKey,
     Protocol,
     Path,
 }
@@ -26,7 +27,8 @@ impl QuickConnectField {
             QuickConnectField::Host => QuickConnectField::Port,
             QuickConnectField::Port => QuickConnectField::Username,
             QuickConnectField::Username => QuickConnectField::Password,
-            QuickConnectField::Password => QuickConnectField::Protocol,
+            QuickConnectField::Password => QuickConnectField::PrivateKey,
+            QuickConnectField::PrivateKey => QuickConnectField::Protocol,
             QuickConnectField::Protocol => QuickConnectField::Path,
             QuickConnectField::Path => QuickConnectField::Name,
         }
@@ -39,7 +41,8 @@ impl QuickConnectField {
             QuickConnectField::Port => QuickConnectField::Host,
             QuickConnectField::Username => QuickConnectField::Port,
             QuickConnectField::Password => QuickConnectField::Username,
-            QuickConnectField::Protocol => QuickConnectField::Password,
+            QuickConnectField::PrivateKey => QuickConnectField::Password,
+            QuickConnectField::Protocol => QuickConnectField::PrivateKey,
             QuickConnectField::Path => QuickConnectField::Protocol,
         }
     }

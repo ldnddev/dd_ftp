@@ -33,7 +33,14 @@ impl SiteManager {
         }
 
         let content = fs::read_to_string(&path)?;
-        Self::load_from_toml(&content)
+        let mut cfg = Self::load_from_toml(&content)?;
+
+        // Strip plaintext passwords from config load path.
+        for site in cfg.sites.iter_mut() {
+            site.password = None;
+        }
+
+        Ok(cfg)
     }
 
     pub fn save_to_default_path(config: &SiteConfig) -> Result<()> {
@@ -42,7 +49,13 @@ impl SiteManager {
             fs::create_dir_all(parent)?;
         }
 
-        let content = Self::save_to_toml(config)?;
+        // Never persist plaintext passwords in sites.toml.
+        let mut sanitized = config.clone();
+        for site in sanitized.sites.iter_mut() {
+            site.password = None;
+        }
+
+        let content = Self::save_to_toml(&sanitized)?;
         fs::write(path, content)?;
         Ok(())
     }

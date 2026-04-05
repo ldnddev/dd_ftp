@@ -92,6 +92,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 pw.push(ch);
                 state.quick_connect.password = Some(pw);
             }
+            QuickConnectField::PrivateKey => {
+                let mut key = state.quick_connect.private_key.clone().unwrap_or_default();
+                key.push(ch);
+                state.quick_connect.private_key = Some(key);
+            }
             QuickConnectField::Protocol => {}
             QuickConnectField::Path => state.quick_connect.initial_path.push(ch),
         },
@@ -118,6 +123,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 let mut pw = state.quick_connect.password.clone().unwrap_or_default();
                 pw.pop();
                 state.quick_connect.password = Some(pw);
+            }
+            QuickConnectField::PrivateKey => {
+                let mut key = state.quick_connect.private_key.clone().unwrap_or_default();
+                key.pop();
+                state.quick_connect.private_key = Some(key);
             }
             QuickConnectField::Protocol => {}
             QuickConnectField::Path => {

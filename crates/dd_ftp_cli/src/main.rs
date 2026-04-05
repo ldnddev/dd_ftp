@@ -19,8 +19,9 @@ use crossterm::{
 use dd_ftp_app::{reduce, Action, AppState, FocusPane};
 use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob};
 use uuid::Uuid;
+use dd_ftp_ftp::{FtpVariant, UnifiedFtpSession};
 use dd_ftp_protocols::SftpSession;
-use dd_ftp_storage::SiteManager;
+use dd_ftp_storage::{SecretStore, SiteManager};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 #[tokio::main]
@@ -101,37 +102,82 @@ async fn run(
                 app.worker_cancel_requested = false;
                 reduce(app, Action::SetStatus(format!("Processing {:?}: {}", job.direction, job.remote_path)));
 
-                let info = connection_info_from_env();
+                let mut info = app
+                    .active_connection
+                    .clone()
+                    .unwrap_or_else(connection_info_from_env);
+
+                if info.password.is_none() {
+                    if let Ok(Some(secret)) = SecretStore::load_password(
+                        &info.name,
+                        &info.username,
+                        &info.host,
+                        info.port,
+                    ) {
+                        info.password = Some(secret);
+                    }
+                }
+
                 let tx_clone = tx.clone();
                 let cancel = Arc::new(AtomicBool::new(false));
                 cancel_flag = Some(cancel.clone());
 
                 tokio::spawn(async move {
                     let mut worker_session = SftpSession::default();
-                    let connect_result = worker_session.connect(info).await;
-                    let outcome = match connect_result {
-                        Ok(_) => {
-                            let progress_tx = {
-                                let tx_progress = tx_clone.clone();
-                                move |job_id: Uuid, transferred, size| {
-                                    let _ = tx_progress.send(WorkerMessage::Progress {
-                                        job_id,
-                                        transferred_bytes: transferred,
-                                        size_bytes: size,
-                                    });
-                                }
-                            };
+                    let protocol = info.protocol.clone();
 
-                            match job.direction {
-                                TransferDirection::Upload => worker_session
-                                    .upload_with_progress(&job, cancel.clone(), progress_tx)
-                                    .await,
-                                TransferDirection::Download => worker_session
-                                    .download_with_progress(&job, cancel.clone(), progress_tx)
-                                    .await,
+                    let outcome = match protocol {
+                        Protocol::Sftp => {
+                            let connect_result = worker_session.connect(info.clone()).await;
+                            match connect_result {
+                                Ok(_) => {
+                                    let progress_tx = {
+                                        let tx_progress = tx_clone.clone();
+                                        move |job_id: Uuid, transferred, size| {
+                                            let _ = tx_progress.send(WorkerMessage::Progress {
+                                                job_id,
+                                                transferred_bytes: transferred,
+                                                size_bytes: size,
+                                            });
+                                        }
+                                    };
+
+                                    match job.direction {
+                                        TransferDirection::Upload => worker_session
+                                            .upload_with_progress(&job, cancel.clone(), progress_tx)
+                                            .await,
+                                        TransferDirection::Download => worker_session
+                                            .download_with_progress(&job, cancel.clone(), progress_tx)
+                                            .await,
+                                    }
+                                }
+                                Err(err) => Err(err),
                             }
                         }
-                        Err(err) => Err(err),
+                        Protocol::Ftp | Protocol::Ftps => {
+                            let mut unified = UnifiedFtpSession::new();
+                            let variant = match protocol {
+                                Protocol::Ftp => FtpVariant::Ftp,
+                                Protocol::Ftps => FtpVariant::Ftps,
+                                Protocol::Sftp => unreachable!(),
+                            };
+
+                            match unified.connect(variant, info.clone()).await {
+                                Ok(_) => {
+                                    let result = match job.direction {
+                                        TransferDirection::Upload => {
+                                            unified.upload(variant, &job).await
+                                        }
+                                        TransferDirection::Download => {
+                                            unified.download(variant, &job).await
+                                        }
+                                    };
+                                    unified.disconnect().await.ok();
+                                    result
+                                }
+                                Err(err) => Err(err),
+                            }
+                        }
                     };
 
                     let _ = tx_clone.send(WorkerMessage::Done(WorkerResult {
@@ -166,7 +212,17 @@ async fn run(
                         KeyCode::Right => reduce(app, Action::QuickConnectSetProtocolNext),
                         KeyCode::Backspace => reduce(app, Action::QuickConnectBackspace),
                         KeyCode::Enter => {
-                            let info = app.quick_connect.clone();
+                            let mut info = app.quick_connect.clone();
+                            if info.password.is_none() {
+                                if let Ok(Some(secret)) = SecretStore::load_password(
+                                    &info.name,
+                                    &info.username,
+                                    &info.host,
+                                    info.port,
+                                ) {
+                                    info.password = Some(secret);
+                                }
+                            }
                             connect_with_info(app, session, info).await;
                             reduce(app, Action::ToggleQuickConnect);
                         }
@@ -196,7 +252,17 @@ async fn run(
                             }
                         }
                         KeyCode::Char('c') => {
-                            if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                            if let Some(mut bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                                if bm.password.is_none() {
+                                    if let Ok(Some(secret)) = SecretStore::load_password(
+                                        &bm.name,
+                                        &bm.username,
+                                        &bm.host,
+                                        bm.port,
+                                    ) {
+                                        bm.password = Some(secret);
+                                    }
+                                }
                                 connect_with_info(app, session, bm).await;
                                 reduce(app, Action::ToggleBookmarks);
                             }
@@ -275,7 +341,17 @@ async fn run(
                         if app.connected {
                             disconnect_session(app, session).await;
                         } else {
-                            let info = selected_or_quick_connect(app);
+                            let mut info = selected_or_quick_connect(app);
+                            if info.password.is_none() {
+                                if let Ok(Some(secret)) = SecretStore::load_password(
+                                    &info.name,
+                                    &info.username,
+                                    &info.host,
+                                    info.port,
+                                ) {
+                                    info.password = Some(secret);
+                                }
+                            }
                             connect_with_info(app, session, info).await;
                         }
                     }
@@ -488,7 +564,6 @@ async fn disconnect_session(app: &mut AppState, session: &mut SftpSession) {
 }
 
 async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: ConnectionInfo) {
-    // field validation for quick connect / bookmarks
     if info.name.trim().is_empty() {
         reduce(app, Action::SetStatus("Connect failed: label/name is required".to_string()));
         return;
@@ -513,38 +588,56 @@ async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: 
     };
     reduce(app, Action::Connect(info.clone()));
 
-    match session.connect(info.clone()).await {
-        Ok(_) => {
-            reduce(app, Action::SetConnected(true));
+    let list_target = app.remote_cwd.clone();
+    let result = connect_and_list_by_protocol(session, &info, &list_target).await;
 
-            match session.list_dir(&app.remote_cwd).await {
-                Ok(entries) => {
-                    reduce(app, Action::SetRemoteEntries(entries));
-                    app.active_connection = Some(info.clone());
-                    reduce(app, Action::SetStatus(format!(
-                        "Connected via {:?} to {} as {} (cwd: {})",
-                        info.protocol,
-                        info.host,
-                        info.username,
-                        app.remote_cwd
-                    )));
-                }
-                Err(err) => {
-                    reduce(app, Action::SetStatus(format!(
-                        "Connected, but initial list_dir failed at '{}': {err}",
-                        app.remote_cwd
-                    )));
-                }
-            }
+    match result {
+        Ok(entries) => {
+            reduce(app, Action::SetConnected(true));
+            reduce(app, Action::SetRemoteEntries(entries));
+            app.active_connection = Some(info.clone());
+            reduce(app, Action::SetStatus(format!(
+                "Connected via {:?} to {} as {} (cwd: {})",
+                info.protocol,
+                info.host,
+                info.username,
+                app.remote_cwd
+            )));
         }
         Err(err) => {
             reduce(app, Action::SetConnected(false));
             reduce(app, Action::SetStatus(format!(
-                "Connect failed for {}@{}:{} -> {err}",
+                "Connect failed for {}@{}:{} via {:?} -> {err}",
                 info.username,
                 info.host,
-                info.port
+                info.port,
+                info.protocol
             )));
+        }
+    }
+}
+
+async fn connect_and_list_by_protocol(
+    sftp_session: &mut SftpSession,
+    info: &ConnectionInfo,
+    path: &str,
+) -> Result<Vec<FileEntry>> {
+    match info.protocol {
+        Protocol::Sftp => {
+            sftp_session.connect(info.clone()).await?;
+            sftp_session.list_dir(path).await
+        }
+        Protocol::Ftp | Protocol::Ftps => {
+            let mut unified = UnifiedFtpSession::new();
+            let variant = match info.protocol {
+                Protocol::Ftp => FtpVariant::Ftp,
+                Protocol::Ftps => FtpVariant::Ftps,
+                Protocol::Sftp => unreachable!(),
+            };
+            unified.connect(variant, info.clone()).await?;
+            let entries = unified.list_dir(variant, path).await?;
+            unified.disconnect().await.ok();
+            Ok(entries)
         }
     }
 }
@@ -573,19 +666,50 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
         return;
     }
 
-    let exists = cfg
+    if let Some(password) = info.password.as_deref() {
+        if let Err(err) = SecretStore::save_password(
+            &info.name,
+            &info.username,
+            &info.host,
+            info.port,
+            password,
+        ) {
+            reduce(app, Action::SetStatus(format!("Save secret failed: {err}")));
+            return;
+        }
+    }
+
+    let existing_idx = cfg
         .sites
         .iter()
-        .any(|s| s.host == info.host && s.username == info.username && s.port == info.port);
+        .position(|s| s.host == info.host && s.username == info.username && s.port == info.port);
 
-    if !exists {
+    if let Some(idx) = existing_idx {
+        cfg.sites[idx] = info;
+        if cfg.default_site.is_none() {
+            cfg.default_site = Some(idx);
+        }
+
+        match SiteManager::save_to_default_path(&cfg) {
+            Ok(_) => {
+                app.selected_bookmark = idx;
+                reduce(app, Action::SetBookmarks(cfg.sites));
+                reduce(app, Action::SetStatus("Updated bookmark".to_string()));
+            }
+            Err(err) => {
+                reduce(app, Action::SetStatus(format!("Save bookmark failed: {err}")));
+            }
+        }
+    } else {
         cfg.sites.push(info);
+        let idx = cfg.sites.len().saturating_sub(1);
         if cfg.default_site.is_none() {
             cfg.default_site = Some(0);
         }
 
         match SiteManager::save_to_default_path(&cfg) {
             Ok(_) => {
+                app.selected_bookmark = idx;
                 reduce(app, Action::SetBookmarks(cfg.sites));
                 reduce(app, Action::SetStatus("Saved bookmark".to_string()));
             }
@@ -593,8 +717,6 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
                 reduce(app, Action::SetStatus(format!("Save bookmark failed: {err}")));
             }
         }
-    } else {
-        reduce(app, Action::SetStatus("Bookmark already exists".to_string()));
     }
 }
 
@@ -611,6 +733,7 @@ fn delete_selected_bookmark(app: &mut AppState) {
     }
 
     let removed = cfg.sites.remove(app.selected_bookmark);
+    let _ = SecretStore::delete_password(&removed.name, &removed.username, &removed.host, removed.port);
 
     if let Some(default_idx) = cfg.default_site {
         cfg.default_site = if cfg.sites.is_empty() {

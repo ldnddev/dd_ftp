@@ -33,9 +33,12 @@ Scaffold complete (architecture + crate layout).
 - ✅ Enhanced queue panel with worker state + active/next/failed transfer summaries
 - ✅ Added F1 help modal with dim backdrop and Esc close
 - ✅ Added bookmark/site manager persistence (`~/.config/dd_ftp/sites.toml`)
+- ✅ Passwords moved out of TOML into OS keyring via `keyring` crate
 - ✅ Added bookmark controls: `b` cycle saved sites, `B` save current quick-connect as bookmark
 - ✅ Added Quick Connect modal (`o`) and Bookmarks modal (`m`)
 - ✅ Added bookmark modal actions: edit (`e`), delete (`d`), set default (`D`)
+- ✅ FTP connect/list/upload/download routed via unified crate
+- ✅ FTPS explicit TLS connect/list/upload/download routed via unified crate
 - ⏳ Multi-worker parallel transfer processing
 
 ### Run
@@ -71,7 +74,7 @@ Controls:
 - `h` move to parent directory in focused pane
 - `r` refresh local listing (and remote when connected)
 - `b` cycle bookmarks
-- `B` save current quick-connect as bookmark
+- `B` save current quick-connect as bookmark (password saved to keyring)
 - `o` open Quick Connect modal (includes Name/Label field)
 - `m` open Bookmarks modal
 - `c` connect selected bookmark (falls back to quick-connect), or disconnect when connected
@@ -80,6 +83,7 @@ Controls:
 Quick Connect modal:
 - `Ctrl+S` save bookmark
 - first field is **Name/Label** (used in bookmark list and title bar)
+- includes **SSH Key** path field for SFTP key auth (example: `~/.ssh/id_rsa`)
 - `u` queue upload (selected local file -> remote cwd)
 - `d` queue download (selected remote file -> local cwd)
 - `x` show worker status hint
@@ -106,6 +110,11 @@ Quick smoke test:
 7. press `C` during transfer to test cancellation
 8. press `R` to retry last failed
 9. press `X` to clear pending
+
+## Protocol status
+- SFTP: ✅ production path
+- FTP: ✅ connect/list/upload/download in unified crate
+- FTPS: ✅ explicit TLS connect/list/upload/download in unified crate
 
 ## Architecture
 See [ARCHITECTURE.md](./ARCHITECTURE.md).

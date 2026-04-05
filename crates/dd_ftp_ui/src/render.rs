@@ -170,7 +170,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             Line::from("  b -> cycle bookmarks"),
             Line::from("  m -> open bookmarks modal"),
             Line::from("  o -> open quick connect"),
-            Line::from("  c -> connect (or disconnect when connected)"),
+            Line::from("  c -> connect/disconnect (SFTP+FTP connect path)"),
             Line::from("  r -> refresh listing(s)"),
             Line::from("  u -> queue upload"),
             Line::from("  d -> queue download"),
@@ -212,6 +212,8 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             .map(|p| "*".repeat(p.len()))
             .unwrap_or_default();
 
+        let private_key = app.quick_connect.private_key.clone().unwrap_or_default();
+
         let rows = vec![
             (QuickConnectField::Name, format!("Name: {}", app.quick_connect.name)),
             (QuickConnectField::Host, format!("Host: {}", app.quick_connect.host)),
@@ -223,6 +225,10 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             (
                 QuickConnectField::Password,
                 format!("Pass: {}", password_mask),
+            ),
+            (
+                QuickConnectField::PrivateKey,
+                format!("SSH Key: {}", private_key),
             ),
             (
                 QuickConnectField::Protocol,
@@ -255,6 +261,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
         lines.push(Line::from(""));
         lines.push(Line::from("Tab/Shift+Tab move field | ←/→ protocol | Enter connect"));
+        lines.push(Line::from("Set either Password or SSH Key for SFTP auth"));
         lines.push(Line::from("Ctrl+S save bookmark | Esc close"));
 
         let modal = Paragraph::new(lines)

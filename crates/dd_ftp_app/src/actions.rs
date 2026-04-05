@@ -33,6 +33,8 @@ pub enum Action {
     },
     ClearPendingTransfers,
     SetStatus(String),
+    ShowError(String),
+    ClearError,
     FocusNextPane,
     ToggleHelp,
     SelectUp,

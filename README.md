@@ -39,7 +39,7 @@ Scaffold complete (architecture + crate layout).
 - ✅ Added bookmark modal actions: edit (`e`), delete (`d`), set default (`D`)
 - ✅ FTP connect/list/upload/download routed via unified crate
 - ✅ FTPS explicit TLS connect/list/upload/download routed via unified crate
-- ⏳ Multi-worker parallel transfer processing
+- ✅ Multi-worker parallel transfer processing (default concurrency: 2)
 
 ### Run
 ```bash
@@ -75,6 +75,7 @@ Controls:
 - `r` refresh local listing (and remote when connected)
 - `b` cycle bookmarks
 - `B` save current quick-connect as bookmark (password saved to keyring)
+- `Ctrl+K` run keyring health check
 - `o` open Quick Connect modal (includes Name/Label field)
 - `m` open Bookmarks modal
 - `c` connect selected bookmark (falls back to quick-connect), or disconnect when connected
@@ -110,6 +111,12 @@ Quick smoke test:
 7. press `C` during transfer to test cancellation
 8. press `R` to retry last failed
 9. press `X` to clear pending
+
+## Keyring notes (Linux)
+- `archlinux-keyring` is unrelated (package-signing keys for pacman).
+- Password persistence uses the desktop keyring backend selected by the `keyring` crate.
+- Workspace enables `keyring` with Linux persistent backend feature (`linux-native-sync-persistent`).
+- Use `Ctrl+K` in-app to verify keyring backend availability.
 
 ## Protocol status
 - SFTP: ✅ production path

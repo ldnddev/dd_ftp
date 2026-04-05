@@ -39,12 +39,15 @@ async fn main() -> Result<()> {
     // Seed quick-connect from env for first run, then load bookmarks.
     app.quick_connect = connection_info_from_env();
 
+    run_keyring_health_check(&mut app);
+
     if let Ok(cfg) = SiteManager::load_or_default() {
         if !cfg.sites.is_empty() {
             reduce(&mut app, Action::SetBookmarks(cfg.sites.clone()));
             let selected_idx = cfg.default_site.unwrap_or(0).min(cfg.sites.len().saturating_sub(1));
             if let Some(selected) = cfg.sites.get(selected_idx) {
-                reduce(&mut app, Action::QuickConnectSetFromBookmark(selected.clone()));
+                let selected = hydrate_password_from_keyring(&mut app, selected.clone(), "startup");
+                reduce(&mut app, Action::QuickConnectSetFromBookmark(selected));
                 app.selected_bookmark = selected_idx;
             }
         }
@@ -67,7 +70,7 @@ async fn run(
     session: &mut SftpSession,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
-    let mut cancel_flag: Option<Arc<AtomicBool>> = None;
+    let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
 
     loop {
         terminal.draw(|f| dd_ftp_ui::render(f, app))?;
@@ -89,108 +92,132 @@ async fn run(
                     );
                 }
                 WorkerMessage::Done(result) => {
-                    cancel_flag = None;
+                    app.worker_active_count = app.worker_active_count.saturating_sub(1);
+                    app.worker_running = app.worker_active_count > 0;
+                    cancel_flags.retain(|f| !Arc::ptr_eq(f, &result.cancel_flag));
                     handle_worker_result(app, session, result).await;
                 }
             }
         }
 
-        // Start background worker for one queued transfer.
-        if app.connected && !app.worker_running && !app.queue.pending.is_empty() {
-            if let Some(job) = app.queue.start_next() {
-                app.worker_running = true;
-                app.worker_cancel_requested = false;
-                reduce(app, Action::SetStatus(format!("Processing {:?}: {}", job.direction, job.remote_path)));
+        // Start background workers for queued transfers up to max concurrency.
+        while app.connected
+            && app.worker_active_count < app.worker_max_concurrency
+            && !app.queue.pending.is_empty()
+        {
+            let Some(job) = app.queue.start_next() else {
+                break;
+            };
 
-                let mut info = app
-                    .active_connection
-                    .clone()
-                    .unwrap_or_else(connection_info_from_env);
+            app.worker_active_count += 1;
+            app.worker_running = true;
+            app.worker_cancel_requested = false;
+            reduce(app, Action::SetStatus(format!("Processing {:?}: {}", job.direction, job.remote_path)));
 
-                if info.password.is_none() {
-                    if let Ok(Some(secret)) = SecretStore::load_password(
-                        &info.name,
-                        &info.username,
-                        &info.host,
-                        info.port,
-                    ) {
-                        info.password = Some(secret);
-                    }
+            let mut info = app
+                .active_connection
+                .clone()
+                .unwrap_or_else(connection_info_from_env);
+
+            if info.password.is_none() {
+                if let Ok(Some(secret)) = SecretStore::load_password(
+                    &info.name,
+                    &info.username,
+                    &info.host,
+                    info.port,
+                ) {
+                    info.password = Some(secret);
                 }
-
-                let tx_clone = tx.clone();
-                let cancel = Arc::new(AtomicBool::new(false));
-                cancel_flag = Some(cancel.clone());
-
-                tokio::spawn(async move {
-                    let mut worker_session = SftpSession::default();
-                    let protocol = info.protocol.clone();
-
-                    let outcome = match protocol {
-                        Protocol::Sftp => {
-                            let connect_result = worker_session.connect(info.clone()).await;
-                            match connect_result {
-                                Ok(_) => {
-                                    let progress_tx = {
-                                        let tx_progress = tx_clone.clone();
-                                        move |job_id: Uuid, transferred, size| {
-                                            let _ = tx_progress.send(WorkerMessage::Progress {
-                                                job_id,
-                                                transferred_bytes: transferred,
-                                                size_bytes: size,
-                                            });
-                                        }
-                                    };
-
-                                    match job.direction {
-                                        TransferDirection::Upload => worker_session
-                                            .upload_with_progress(&job, cancel.clone(), progress_tx)
-                                            .await,
-                                        TransferDirection::Download => worker_session
-                                            .download_with_progress(&job, cancel.clone(), progress_tx)
-                                            .await,
-                                    }
-                                }
-                                Err(err) => Err(err),
-                            }
-                        }
-                        Protocol::Ftp | Protocol::Ftps => {
-                            let mut unified = UnifiedFtpSession::new();
-                            let variant = match protocol {
-                                Protocol::Ftp => FtpVariant::Ftp,
-                                Protocol::Ftps => FtpVariant::Ftps,
-                                Protocol::Sftp => unreachable!(),
-                            };
-
-                            match unified.connect(variant, info.clone()).await {
-                                Ok(_) => {
-                                    let result = match job.direction {
-                                        TransferDirection::Upload => {
-                                            unified.upload(variant, &job).await
-                                        }
-                                        TransferDirection::Download => {
-                                            unified.download(variant, &job).await
-                                        }
-                                    };
-                                    unified.disconnect().await.ok();
-                                    result
-                                }
-                                Err(err) => Err(err),
-                            }
-                        }
-                    };
-
-                    let _ = tx_clone.send(WorkerMessage::Done(WorkerResult {
-                        job,
-                        outcome,
-                        was_cancelled: cancel.load(Ordering::Relaxed),
-                    }));
-                });
             }
+
+            let tx_clone = tx.clone();
+            let cancel = Arc::new(AtomicBool::new(false));
+            cancel_flags.push(cancel.clone());
+
+            tokio::spawn(async move {
+                let mut worker_session = SftpSession::default();
+                let protocol = info.protocol.clone();
+
+                let outcome = match protocol {
+                    Protocol::Sftp => {
+                        let connect_result = worker_session.connect(info.clone()).await;
+                        match connect_result {
+                            Ok(_) => {
+                                let progress_tx = {
+                                    let tx_progress = tx_clone.clone();
+                                    move |job_id: Uuid, transferred, size| {
+                                        let _ = tx_progress.send(WorkerMessage::Progress {
+                                            job_id,
+                                            transferred_bytes: transferred,
+                                            size_bytes: size,
+                                        });
+                                    }
+                                };
+
+                                match job.direction {
+                                    TransferDirection::Upload => worker_session
+                                        .upload_with_progress(&job, cancel.clone(), progress_tx)
+                                        .await,
+                                    TransferDirection::Download => worker_session
+                                        .download_with_progress(&job, cancel.clone(), progress_tx)
+                                        .await,
+                                }
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Protocol::Ftp | Protocol::Ftps => {
+                        let mut unified = UnifiedFtpSession::new();
+                        let variant = match protocol {
+                            Protocol::Ftp => FtpVariant::Ftp,
+                            Protocol::Ftps => FtpVariant::Ftps,
+                            Protocol::Sftp => unreachable!(),
+                        };
+
+                        match unified.connect(variant, info.clone()).await {
+                            Ok(_) => {
+                                let result = match job.direction {
+                                    TransferDirection::Upload => {
+                                        unified.upload(variant, &job).await
+                                    }
+                                    TransferDirection::Download => {
+                                        unified.download(variant, &job).await
+                                    }
+                                };
+                                unified.disconnect().await.ok();
+                                result
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                };
+
+                let _ = tx_clone.send(WorkerMessage::Done(WorkerResult {
+                    job,
+                    outcome,
+                    was_cancelled: cancel.load(Ordering::Relaxed),
+                    cancel_flag: cancel,
+                }));
+            });
         }
 
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(key) = event::read()? {
+                if app.error_modal.is_some() {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => reduce(app, Action::ClearError),
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('k')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    run_keyring_health_check(app);
+                    continue;
+                }
+
                 if key.code == KeyCode::F(1) {
                     reduce(app, Action::ToggleHelp);
                     continue;
@@ -246,6 +273,7 @@ async fn run(
                         KeyCode::Char('k') | KeyCode::Up => reduce(app, Action::SelectPrevBookmark),
                         KeyCode::Enter => {
                             if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                                let bm = hydrate_password_from_keyring(app, bm, "bookmark-load");
                                 reduce(app, Action::QuickConnectSetFromBookmark(bm));
                                 reduce(app, Action::ToggleBookmarks);
                                 reduce(app, Action::ToggleQuickConnect);
@@ -272,6 +300,7 @@ async fn run(
                         }
                         KeyCode::Char('e') => {
                             if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                                let bm = hydrate_password_from_keyring(app, bm, "bookmark-edit");
                                 reduce(app, Action::QuickConnectSetFromBookmark(bm));
                                 reduce(app, Action::ToggleBookmarks);
                                 reduce(app, Action::ToggleQuickConnect);
@@ -403,10 +432,10 @@ async fn run(
                     KeyCode::Char('C') => {
                         if app.worker_running {
                             app.worker_cancel_requested = true;
-                            if let Some(flag) = &cancel_flag {
+                            for flag in &cancel_flags {
                                 flag.store(true, Ordering::Relaxed);
                             }
-                            reduce(app, Action::SetStatus("Cancel requested".to_string()));
+                            reduce(app, Action::SetStatus("Cancel requested for active transfers".to_string()));
                         } else {
                             reduce(app, Action::SetStatus("No active transfer to cancel".to_string()));
                         }
@@ -499,6 +528,7 @@ struct WorkerResult {
     job: TransferJob,
     outcome: anyhow::Result<()>,
     was_cancelled: bool,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -512,10 +542,14 @@ enum WorkerMessage {
 }
 
 async fn handle_worker_result(app: &mut AppState, session: &mut SftpSession, mut msg: WorkerResult) {
-    app.worker_running = false;
+    if app.worker_active_count == 0 {
+        app.worker_cancel_requested = false;
+    }
 
     if app.worker_cancel_requested || msg.was_cancelled {
-        app.worker_cancel_requested = false;
+        if app.worker_active_count == 0 {
+            app.worker_cancel_requested = false;
+        }
         msg.job.last_error = Some("Cancelled by user".to_string());
         reduce(app, Action::MarkTransferCancelled(msg.job));
         return;
@@ -553,6 +587,7 @@ async fn disconnect_session(app: &mut AppState, session: &mut SftpSession) {
             app.remote_entries.clear();
             app.queue.active.clear();
             app.worker_running = false;
+            app.worker_active_count = 0;
             app.worker_cancel_requested = false;
             app.active_connection = None;
             reduce(app, Action::SetStatus("Disconnected".to_string()));
@@ -642,11 +677,61 @@ async fn connect_and_list_by_protocol(
     }
 }
 
-fn selected_or_quick_connect(app: &AppState) -> ConnectionInfo {
+fn selected_or_quick_connect(app: &mut AppState) -> ConnectionInfo {
     if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
-        bm
+        hydrate_password_from_keyring(app, bm, "selected-bookmark")
     } else {
         app.quick_connect.clone()
+    }
+}
+
+fn hydrate_password_from_keyring(
+    app: &mut AppState,
+    mut info: ConnectionInfo,
+    context: &str,
+) -> ConnectionInfo {
+    if info.password.is_none() {
+        match SecretStore::load_password(&info.name, &info.username, &info.host, info.port) {
+            Ok(Some(secret)) => {
+                info.password = Some(secret);
+            }
+            Ok(None) => {
+                reduce(
+                    app,
+                    Action::SetStatus(format!(
+                        "No keyring password found ({context}) for {}@{}:{}",
+                        info.username, info.host, info.port
+                    )),
+                );
+            }
+            Err(err) => {
+                let msg = format!(
+                    "Keyring load failed ({context}) for {}@{}:{}: {err}",
+                    info.username, info.host, info.port
+                );
+                reduce(app, Action::SetStatus(msg.clone()));
+                reduce(app, Action::ShowError(msg));
+            }
+        }
+    }
+    info
+}
+
+fn run_keyring_health_check(app: &mut AppState) {
+    match SecretStore::check_backend_available() {
+        Ok(_) => {
+            reduce(
+                app,
+                Action::SetStatus("Keyring backend detected: password persistence enabled".to_string()),
+            );
+        }
+        Err(err) => {
+            let msg = format!(
+                "Keyring backend unavailable. Password persistence disabled. Details: {err}"
+            );
+            reduce(app, Action::SetStatus(msg.clone()));
+            reduce(app, Action::ShowError(msg));
+        }
     }
 }
 
@@ -666,7 +751,7 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
         return;
     }
 
-    if let Some(password) = info.password.as_deref() {
+    let secret_status = if let Some(password) = info.password.as_deref() {
         if let Err(err) = SecretStore::save_password(
             &info.name,
             &info.username,
@@ -674,10 +759,31 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
             info.port,
             password,
         ) {
-            reduce(app, Action::SetStatus(format!("Save secret failed: {err}")));
+            let msg = format!("Save secret failed: {err}");
+            reduce(app, Action::SetStatus(msg.clone()));
+            reduce(app, Action::ShowError(msg));
             return;
         }
-    }
+
+        let key = SecretStore::primary_key_for(&info.name, &info.username, &info.host, info.port);
+        match SecretStore::load_password(&info.name, &info.username, &info.host, info.port) {
+            Ok(Some(_)) => format!("Password saved to keyring (verified key: {key})"),
+            Ok(None) => {
+                let msg = format!(
+                    "Password save reported success, but verification lookup returned no entry (key: {key})"
+                );
+                reduce(app, Action::ShowError(msg.clone()));
+                msg
+            }
+            Err(err) => {
+                let msg = format!("Password save verification failed for key {key}: {err}");
+                reduce(app, Action::ShowError(msg.clone()));
+                msg
+            }
+        }
+    } else {
+        "No password provided (bookmark saved without keyring secret)".to_string()
+    };
 
     let existing_idx = cfg
         .sites
@@ -694,7 +800,10 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
             Ok(_) => {
                 app.selected_bookmark = idx;
                 reduce(app, Action::SetBookmarks(cfg.sites));
-                reduce(app, Action::SetStatus("Updated bookmark".to_string()));
+                reduce(
+                    app,
+                    Action::SetStatus(format!("Updated bookmark | {}", secret_status)),
+                );
             }
             Err(err) => {
                 reduce(app, Action::SetStatus(format!("Save bookmark failed: {err}")));
@@ -711,7 +820,10 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
             Ok(_) => {
                 app.selected_bookmark = idx;
                 reduce(app, Action::SetBookmarks(cfg.sites));
-                reduce(app, Action::SetStatus("Saved bookmark".to_string()));
+                reduce(
+                    app,
+                    Action::SetStatus(format!("Saved bookmark | {}", secret_status)),
+                );
             }
             Err(err) => {
                 reduce(app, Action::SetStatus(format!("Save bookmark failed: {err}")));

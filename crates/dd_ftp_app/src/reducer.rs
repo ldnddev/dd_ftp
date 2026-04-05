@@ -214,6 +214,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SetStatus(msg) => {
             state.status = msg;
         }
+        Action::ShowError(msg) => {
+            state.error_modal = Some(msg.clone());
+            state.status = format!("Error: {msg}");
+        }
+        Action::ClearError => {
+            state.error_modal = None;
+        }
         Action::FocusNextPane => {
             state.focus = match state.focus {
                 FocusPane::Local => FocusPane::Remote,

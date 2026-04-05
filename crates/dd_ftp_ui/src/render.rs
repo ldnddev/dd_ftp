@@ -118,8 +118,10 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
     let queue_text = vec![
         Line::from(format!(
-            "Worker: {} | Pending: {} | Active: {} | Complete: {} | Failed: {} | Cancelled: {}",
+            "Worker: {} ({}/{}) | Pending: {} | Active: {} | Complete: {} | Failed: {} | Cancelled: {}",
             worker_state,
+            app.worker_active_count,
+            app.worker_max_concurrency,
             app.queue.pending.len(),
             app.queue.active.len(),
             app.queue.completed.len(),
@@ -178,6 +180,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             Line::from("  X -> clear pending queue"),
             Line::from("  R -> retry last failed transfer"),
             Line::from("  C -> cancel active transfer"),
+            Line::from("  Ctrl+K -> keyring health check"),
             Line::from("  B -> save current quick-connect as bookmark"),
             Line::from(""),
             Line::from("Global"),
@@ -317,6 +320,36 @@ pub fn render(frame: &mut Frame, app: &AppState) {
                     .title(" Bookmarks ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
+            );
+
+        frame.render_widget(modal, area);
+    }
+
+    if let Some(err) = &app.error_modal {
+        let area = centered_rect(65, 35, frame.area());
+        frame.render_widget(Clear, area);
+
+        let lines = vec![
+            Line::from(vec![Span::styled(
+                "Error",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(err.clone()),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Press Esc or Enter to close",
+                Style::default().fg(Color::Yellow),
+            )]),
+        ];
+
+        let modal = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" Alert ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
             );
 
         frame.render_widget(modal, area);

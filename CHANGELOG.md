@@ -20,10 +20,18 @@ All notable changes to this project will be documented in this file.
   - `async_ftp` now uses `secure` feature
   - `tokio-rustls` pinned to `0.23` to match `async_ftp` secure API
   - `webpki-roots` pinned to `0.22`
+- Linux keyring backend now explicitly enabled via `keyring` feature set (`linux-native-sync-persistent`) for durable password persistence
+
+### Added
+- Parallel transfer worker scheduling in CLI runtime (up to `worker_max_concurrency`, default `2`)
+- Queue header now reports active worker usage (`active/max`)
 
 ### Fixed
 - FTPS compile/runtime blockers from mixed rustls API generations (0.20 vs 0.23+ styles)
 - Type inference issue in `retr(...)` callback return type for FTPS downloads
+- Bookmark edit/save flow now updates existing bookmark records instead of returning "Bookmark already exists"
+- Bookmark password persistence now survives app restarts on Linux with keyring backend enabled
+- Added keyring health check UX + error modal diagnostics to expose backend failures clearly
 
 ## [v0.3.0-phase3] - 2026-04-04
 

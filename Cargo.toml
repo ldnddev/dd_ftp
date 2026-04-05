@@ -41,7 +41,7 @@ webpki-roots = "0.22"
 
 # utility
 parking_lot = "0.12"
-keyring = "3"
+keyring = { version = "3", features = ["linux-native-sync-persistent", "apple-native", "windows-native"] }
 
 [profile.release]
 lto = true

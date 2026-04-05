@@ -64,11 +64,14 @@ pub struct AppState {
     pub quick_connect: ConnectionInfo,
     pub quick_connect_field: QuickConnectField,
     pub worker_running: bool,
+    pub worker_active_count: usize,
+    pub worker_max_concurrency: usize,
     pub worker_cancel_requested: bool,
     pub bookmarks: Vec<ConnectionInfo>,
     pub selected_bookmark: usize,
     pub active_connection: Option<ConnectionInfo>,
     pub status: String,
+    pub error_modal: Option<String>,
     pub queue: TransferQueue,
 }
 
@@ -89,11 +92,14 @@ impl Default for AppState {
             quick_connect: ConnectionInfo::default(),
             quick_connect_field: QuickConnectField::Name,
             worker_running: false,
+            worker_active_count: 0,
+            worker_max_concurrency: 2,
             worker_cancel_requested: false,
             bookmarks: vec![],
             selected_bookmark: 0,
             active_connection: None,
             status: "Ready".to_string(),
+            error_modal: None,
             queue: TransferQueue::default(),
         }
     }

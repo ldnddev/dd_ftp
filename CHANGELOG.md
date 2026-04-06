@@ -25,6 +25,11 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Parallel transfer worker scheduling in CLI runtime (up to `worker_max_concurrency`, default `2`)
 - Queue header now reports active worker usage (`active/max`)
+- Queue pane now renders per-job rows (active/pending/failed) with compact progress bars and truncation
+- Queue pane expands when focused to show more rows (A/P/F) with improved density
+- Theme file support in UI with lookup order:
+  - `./dd_ftp_theme.yml`
+  - `~/.config/ldnddev/dd_ftp_theme.yml`
 
 ### Fixed
 - FTPS compile/runtime blockers from mixed rustls API generations (0.20 vs 0.23+ styles)

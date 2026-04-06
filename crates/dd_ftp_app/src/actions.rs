@@ -37,6 +37,7 @@ pub enum Action {
     ClearError,
     FocusNextPane,
     ToggleHelp,
+    ToggleThemeDebug,
     SelectUp,
     SelectDown,
 }

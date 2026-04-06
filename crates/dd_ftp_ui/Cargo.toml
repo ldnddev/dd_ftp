@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 crossterm.workspace = true
 dd_ftp_app = { path = "../dd_ftp_app" }
 dd_ftp_core = { path = "../dd_ftp_core" }
 ratatui.workspace = true
+serde.workspace = true
+serde_yaml = "0.9"
+toml.workspace = true

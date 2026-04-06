@@ -41,6 +41,12 @@ async fn main() -> Result<()> {
 
     run_keyring_health_check(&mut app);
 
+    let theme_loaded = dd_ftp_ui::load_theme_with_source();
+    reduce(
+        &mut app,
+        Action::SetStatus(format!("Theme loaded: {}", theme_loaded.source.label())),
+    );
+
     if let Ok(cfg) = SiteManager::load_or_default() {
         if !cfg.sites.is_empty() {
             reduce(&mut app, Action::SetBookmarks(cfg.sites.clone()));
@@ -223,9 +229,21 @@ async fn run(
                     continue;
                 }
 
+                if key.code == KeyCode::F(2) {
+                    reduce(app, Action::ToggleThemeDebug);
+                    continue;
+                }
+
                 if app.show_help {
-                    if key.code == KeyCode::Esc {
-                        reduce(app, Action::ToggleHelp);
+                    match key.code {
+                        KeyCode::Esc => reduce(app, Action::ToggleHelp),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.help_scroll = app.help_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.help_scroll = app.help_scroll.saturating_add(1);
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -329,8 +347,20 @@ async fn run(
                         app.focus = FocusPane::Queue;
                         reduce(app, Action::SetStatus("Focus: Queue".to_string()));
                     }
-                    KeyCode::Up | KeyCode::Char('k') => reduce(app, Action::SelectUp),
-                    KeyCode::Down | KeyCode::Char('j') => reduce(app, Action::SelectDown),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if app.focus == FocusPane::Queue {
+                            app.queue_scroll = app.queue_scroll.saturating_sub(1);
+                        } else {
+                            reduce(app, Action::SelectUp)
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if app.focus == FocusPane::Queue {
+                            app.queue_scroll = app.queue_scroll.saturating_add(1);
+                        } else {
+                            reduce(app, Action::SelectDown)
+                        }
+                    }
                     KeyCode::Char('l') => {
                         navigate_into_directory(app, session).await;
                     }

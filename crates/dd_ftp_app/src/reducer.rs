@@ -231,6 +231,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ToggleHelp => {
             state.show_help = !state.show_help;
         }
+        Action::ToggleThemeDebug => {
+            state.show_theme_debug = !state.show_theme_debug;
+        }
         Action::SelectUp => match state.focus {
             FocusPane::Local => {
                 if state.selected_local > 0 {

@@ -40,6 +40,7 @@ Scaffold complete (architecture + crate layout).
 - ✅ FTP connect/list/upload/download routed via unified crate
 - ✅ FTPS explicit TLS connect/list/upload/download routed via unified crate
 - ✅ Multi-worker parallel transfer processing (default concurrency: 2)
+- ✅ Queue pane now shows per-job rows (active/pending/failed) with progress bars
 
 ### Run
 ```bash
@@ -64,6 +65,7 @@ export DD_FTP_PATH=/
 
 Controls:
 - `F1` toggle controls/help modal (`Esc` closes modal too)
+- `F2` toggle theme debug overlay
 - `q` quit
 - `1` focus Local pane
 - `2` focus Remote pane
@@ -83,6 +85,11 @@ Controls:
 
 Quick Connect modal:
 - `Ctrl+S` save bookmark
+- theme lookup order: `./dd_ftp_theme.yml` then `~/.config/ldnddev/dd_ftp_theme.yml`
+- header shows active theme source badge: `theme:local`, `theme:global`, or `theme:default`
+- all panes/modals render scrollbars; queue/help panes support `j/k` scrolling when focused/open
+- queue pane expands when focused (`3`) to show more active/pending/failed rows
+- theme key `scroll_bars` controls scrollbar color (default `#2a2d31`)
 - first field is **Name/Label** (used in bookmark list and title bar)
 - includes **SSH Key** path field for SFTP key auth (example: `~/.ssh/id_rsa`)
 - `u` queue upload (selected local file -> remote cwd)

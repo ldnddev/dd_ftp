@@ -59,6 +59,8 @@ pub struct AppState {
     pub selected_remote: usize,
     pub focus: FocusPane,
     pub show_help: bool,
+    pub show_theme_debug: bool,
+    pub help_scroll: usize,
     pub show_quick_connect: bool,
     pub show_bookmarks: bool,
     pub quick_connect: ConnectionInfo,
@@ -72,6 +74,7 @@ pub struct AppState {
     pub active_connection: Option<ConnectionInfo>,
     pub status: String,
     pub error_modal: Option<String>,
+    pub queue_scroll: usize,
     pub queue: TransferQueue,
 }
 
@@ -87,6 +90,8 @@ impl Default for AppState {
             selected_remote: 0,
             focus: FocusPane::Local,
             show_help: false,
+            show_theme_debug: false,
+            help_scroll: 0,
             show_quick_connect: false,
             show_bookmarks: false,
             quick_connect: ConnectionInfo::default(),
@@ -100,6 +105,7 @@ impl Default for AppState {
             active_connection: None,
             status: "Ready".to_string(),
             error_modal: None,
+            queue_scroll: 0,
             queue: TransferQueue::default(),
         }
     }

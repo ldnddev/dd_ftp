@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use dd_ftp_core::{ConnectionInfo, FileEntry};
 use dd_ftp_transfer::TransferQueue;
 
@@ -9,6 +11,14 @@ pub enum FocusPane {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptType {
+    CreateFile,
+    CreateFolder,
+    Rename,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuickConnectField {
     Name,
     Host,
@@ -63,8 +73,17 @@ pub struct AppState {
     pub help_scroll: usize,
     pub show_quick_connect: bool,
     pub show_bookmarks: bool,
+    pub show_filter: bool,
+    pub show_compare: bool,
+    pub show_prompt: bool,
+    pub prompt_type: Option<PromptType>,
+    pub prompt_value: String,
+    pub prompt_target: Option<String>,
+    pub filter_pattern: String,
+    pub mouse_pos: Option<(u16, u16)>,
     pub quick_connect: ConnectionInfo,
     pub quick_connect_field: QuickConnectField,
+    pub quick_connect_dirty_fields: HashSet<QuickConnectField>,
     pub worker_running: bool,
     pub worker_active_count: usize,
     pub worker_max_concurrency: usize,
@@ -76,6 +95,7 @@ pub struct AppState {
     pub error_modal: Option<String>,
     pub queue_scroll: usize,
     pub queue: TransferQueue,
+    pub ftp_session: Option<dd_ftp_ftp::UnifiedFtpSession>,
 }
 
 impl Default for AppState {
@@ -94,8 +114,17 @@ impl Default for AppState {
             help_scroll: 0,
             show_quick_connect: false,
             show_bookmarks: false,
+            show_filter: false,
+            show_compare: false,
+            show_prompt: false,
+            prompt_type: None,
+            prompt_value: String::new(),
+            prompt_target: None,
+            filter_pattern: String::new(),
+            mouse_pos: None,
             quick_connect: ConnectionInfo::default(),
             quick_connect_field: QuickConnectField::Name,
+            quick_connect_dirty_fields: HashSet::new(),
             worker_running: false,
             worker_active_count: 0,
             worker_max_concurrency: 2,
@@ -107,6 +136,7 @@ impl Default for AppState {
             error_modal: None,
             queue_scroll: 0,
             queue: TransferQueue::default(),
+            ftp_session: None,
         }
     }
 }

@@ -5,35 +5,41 @@
 
 colors:
   # Core backgrounds (dd_framework neutrals dark)
-  base_background: "#0f1114"       # Main app background
-  body_background: "#1a1c1f"       # Panel/sidebar background
-  modal_background: "#2a2d31"      # Popup/modal background
+  base_background: "#0F1114"       # Main app background
+  body_background: "#2A2D31"       # Panel/sidebar background
+  modal_background: "#1C1E21"      # Popup/modal background
 
   # Text colors (dd_framework text roles dark)
-  text_primary: "#f5f6f7"                  # Primary text
-  text_secondary: "#9ea3aa"              # Secondary/muted text
-  text_labels: "#ffc86e"              # Default state for labels
-  text_active_focus: "#6ec8ff"                # Active state for labels
-  modal_labels: "#ffc86e"           # Popup/modal Label text
-  modal_text: "#f5f6f7"           # Popup/modal Primary text
+  text_primary: "#F5F6F7"                  # Primary text
+  text_secondary: "#9EA3AA"              # Secondary/muted text
+  text_labels: "#FFAF46"              # Default state for labels
+  text_active_focus: "#64B4F5"                # Active state for labels
+  modal_labels: "#64B4F5"           # Popup/modal Label text
+  modal_text: "#F5F6F7"           # Popup/modal Primary text
 
   # Selection
-  selected_background: "#2a2d31"   # Selected row background
+  selected_background: "#0F1114"   # Selected row background
 
   # Borders (dd_framework support dark)
-  border_default: "#2a2d31"        # Default borders
-  border_active: "#6ec8ff"         # Active section highlight
-  scrollbar: "#ffc86e"             # Scrollbar color
-  scrollbar_hover: "#2a2d31"             # Scrollbar hover color
+  border_default: "#F5F6F7"        # Default borders
+  border_active: "#64B4F5"         # Active section highlight
+  scrollbar: "#FFA087"             # Scrollbar color
+  scrollbar_hover: "#64B4F5"             # Scrollbar hover color
 
   # Input field colors (lavender for focus, blue for default)
-  input_border_default: "#5ab4f5"         # Default input border (blue)
-  input_border_focus: "#8cc8ff"           # Focused input border (lavender)
-  input_text_default: "#5ab4f5"         # Default input border (blue)
-  input_text_focus: "#8cc8ff"           # Focused input border (lavender)
+  input_border_default: "#F5F6F7"         # Default input border
+  input_border_focus: "#64B4F5"           # Focused input border
+  input_text_default: "#F5F6F7"         # Default input border
+  input_text_focus: "#64B4F5"           # Focused input border
+  cursor: "#64B4F5"                     # Cursor color
 
   # Semantic colors (dd_framework status dark)
   success: "#82e0aa"               # Success
   warning: "#f5c469"               # Warning
   error: "#e57373"                 # Error
   info: "#5dade2"                  # Info
+  
+  # folder / file / link colors
+  folders: "#64B4F5"
+  files: "#FFAF46"
+  links: "#FFA087"

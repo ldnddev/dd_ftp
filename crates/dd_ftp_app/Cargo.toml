@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 chrono.workspace = true
 dd_ftp_core = { path = "../dd_ftp_core" }
+dd_ftp_ftp = { path = "../dd_ftp_ftp" }
 dd_ftp_transfer = { path = "../dd_ftp_transfer" }
 serde.workspace = true
 tokio.workspace = true

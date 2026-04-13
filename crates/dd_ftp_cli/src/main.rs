@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -28,16 +28,16 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 async fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = AppState::default();
-    app.local_entries = local_list(".");
-
-    // Seed quick-connect from env for first run, then load bookmarks.
-    app.quick_connect = connection_info_from_env();
+    let mut app = AppState {
+        local_entries: local_list("."),
+        quick_connect: connection_info_from_env(),
+        ..Default::default()
+    };
 
     run_keyring_health_check(&mut app);
 
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     let res = run(&mut terminal, &mut app, &mut session).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     res
@@ -177,7 +177,15 @@ async fn run(
                         let variant = match protocol {
                             Protocol::Ftp => FtpVariant::Ftp,
                             Protocol::Ftps => FtpVariant::Ftps,
-                            Protocol::Sftp => unreachable!(),
+                            Protocol::Sftp => {
+                                let _ = tx_clone.send(WorkerMessage::Done(WorkerResult {
+                                    job,
+                                    outcome: Err(anyhow::anyhow!("Unexpected SFTP in FTP worker")),
+                                    was_cancelled: false,
+                                    cancel_flag: cancel,
+                                }));
+                                return;
+                            }
                         };
 
                         match unified.connect(variant, info.clone()).await {
@@ -208,7 +216,8 @@ async fn run(
         }
 
         if event::poll(Duration::from_millis(150))? {
-            if let Event::Key(key) = event::read()? {
+            match event::read()? {
+                Event::Key(key) => {
                 if app.error_modal.is_some() {
                     match key.code {
                         KeyCode::Esc | KeyCode::Enter => reduce(app, Action::ClearError),
@@ -234,6 +243,11 @@ async fn run(
                     continue;
                 }
 
+                if key.code == KeyCode::Char('/') {
+                    reduce(app, Action::ToggleFilter);
+                    continue;
+                }
+
                 if app.show_help {
                     match key.code {
                         KeyCode::Esc => reduce(app, Action::ToggleHelp),
@@ -244,6 +258,97 @@ async fn run(
                             app.help_scroll = app.help_scroll.saturating_add(1);
                         }
                         _ => {}
+                    }
+                    continue;
+                }
+
+                if app.show_filter {
+                    match key.code {
+                        KeyCode::Esc => reduce(app, Action::ToggleFilter),
+                        KeyCode::Backspace => reduce(app, Action::FilterBackspace),
+                        KeyCode::Char(ch) => reduce(app, Action::FilterInput(ch)),
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('C') {
+                    reduce(app, Action::ToggleCompare);
+                    continue;
+                }
+
+                if app.show_prompt {
+                    match key.code {
+                        KeyCode::Esc => reduce(app, Action::CancelPrompt),
+                        KeyCode::Enter => {
+                            if let Some(prompt_type) = app.prompt_type {
+                                match prompt_type {
+                                    dd_ftp_app::PromptType::CreateFile => {
+                                        let name = app.prompt_value.clone();
+                                        reduce(app, Action::ConfirmPrompt);
+                                        create_file(app, session, &name).await;
+                                    }
+                                    dd_ftp_app::PromptType::CreateFolder => {
+                                        let name = app.prompt_value.clone();
+                                        reduce(app, Action::ConfirmPrompt);
+                                        create_folder(app, session, &name).await;
+                                    }
+                                    dd_ftp_app::PromptType::Rename => {
+                                        let new_name = app.prompt_value.clone();
+                                        let target = app.prompt_target.clone();
+                                        reduce(app, Action::ConfirmPrompt);
+                                        if let Some(t) = target {
+                                            rename_item(app, session, &t, &new_name).await;
+                                        }
+                                    }
+                                    dd_ftp_app::PromptType::Delete => {
+                                        if app.prompt_value.to_lowercase() == "y" {
+                                            let target = app.prompt_target.clone();
+                                            reduce(app, Action::ConfirmPrompt);
+                                            if let Some(t) = target {
+                                                delete_item(app, session, &t).await;
+                                            }
+                                        } else {
+                                            reduce(app, Action::CancelPrompt);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => reduce(app, Action::PromptBackspace),
+                        KeyCode::Char(ch) => reduce(app, Action::PromptInput(ch)),
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    reduce(app, Action::ShowCreatePrompt);
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('N') && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                    reduce(app, Action::ShowCreatePrompt);
+                    // Change prompt type to folder
+                    app.prompt_type = Some(dd_ftp_app::PromptType::CreateFolder);
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    reduce(app, Action::ShowRenamePrompt);
+                    // Pre-fill with current selection
+                    if let Some(entry) = get_selected_entry(app) {
+                        app.prompt_target = Some(entry.path.clone());
+                        app.prompt_value = entry.name.clone();
+                    }
+                    continue;
+                }
+
+                if key.code == KeyCode::Delete && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    reduce(app, Action::ShowDeletePrompt);
+                    if let Some(entry) = get_selected_entry(app) {
+                        app.prompt_target = Some(entry.path.clone());
+                        // Don't pre-fill prompt_value - user needs to type 'y'
                     }
                     continue;
                 }
@@ -371,11 +476,26 @@ async fn run(
                         app.local_entries = local_list(&app.local_cwd);
 
                         if app.connected {
-                            match session.list_dir(&app.remote_cwd).await {
-                                Ok(entries) => {
+                            let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
+                            let result = match (&mut app.ftp_session, variant_opt) {
+                                (Some(ftp), Some(Protocol::Ftp)) => {
+                                    ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
+                                }
+                                (Some(ftp), Some(Protocol::Ftps)) => {
+                                    ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
+                                }
+                                (Some(_), _) => {
+                                    reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
+                                    Ok(Vec::new())
+                                }
+                                (None, _) => session.list_dir(&app.remote_cwd).await,
+                            };
+                            match result {
+                                Ok(entries) if !entries.is_empty() => {
                                     reduce(app, Action::SetRemoteEntries(entries));
                                     reduce(app, Action::SetStatus("Refreshed local + remote listing".to_string()));
                                 }
+                                Ok(_) => {}
                                 Err(err) => {
                                     reduce(app, Action::SetStatus(format!("Remote refresh failed: {err}")));
                                 }
@@ -473,8 +593,15 @@ async fn run(
                     _ => {}
                 }
             }
+            Event::Mouse(mouse) => {
+                if mouse.kind == MouseEventKind::Moved {
+                    app.mouse_pos = Some((mouse.column, mouse.row));
+                }
+            }
+            _ => {}
         }
     }
+}
 }
 
 async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) {
@@ -495,9 +622,27 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
             }
 
             if let Some(entry) = app.remote_entries.get(app.selected_remote).cloned() {
+                reduce(app, Action::SetStatus(format!(
+                    "DEBUG: trying '{}' (kind={:?}, path={})",
+                    entry.name, entry.kind, entry.path
+                )));
                 if entry.kind == dd_ftp_core::EntryKind::Directory {
-                    app.remote_cwd = entry.path;
-                    match session.list_dir(&app.remote_cwd).await {
+                    app.remote_cwd = entry.name.clone();
+                    let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
+                    let result = match (&mut app.ftp_session, variant_opt) {
+                        (Some(ftp), Some(Protocol::Ftp)) => {
+                            ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
+                        }
+                        (Some(ftp), Some(Protocol::Ftps)) => {
+                            ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
+                        }
+                        (Some(_), _) => {
+                            reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
+                            Ok(Vec::new())
+                        }
+                        (None, _) => session.list_dir(&app.remote_cwd).await,
+                    };
+                    match result {
                         Ok(entries) => {
                             reduce(app, Action::SetRemoteEntries(entries));
                             reduce(app, Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)));
@@ -506,6 +651,8 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
                             reduce(app, Action::SetStatus(format!("Remote enter failed: {err}")));
                         }
                     }
+                } else {
+                    reduce(app, Action::SetStatus(format!("'{}' is not a directory", entry.name)));
                 }
             }
         }
@@ -539,7 +686,21 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
                 .unwrap_or_else(|| "/".to_string());
 
             app.remote_cwd = parent;
-            match session.list_dir(&app.remote_cwd).await {
+            let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
+            let result = match (&mut app.ftp_session, variant_opt) {
+                (Some(ftp), Some(Protocol::Ftp)) => {
+                    ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
+                }
+                (Some(ftp), Some(Protocol::Ftps)) => {
+                    ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
+                }
+                (Some(_), _) => {
+                    reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
+                    Ok(Vec::new())
+                }
+                (None, _) => session.list_dir(&app.remote_cwd).await,
+            };
+            match result {
                 Ok(entries) => {
                     reduce(app, Action::SetRemoteEntries(entries));
                     reduce(app, Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)));
@@ -611,6 +772,9 @@ async fn handle_worker_result(app: &mut AppState, session: &mut SftpSession, mut
 }
 
 async fn disconnect_session(app: &mut AppState, session: &mut SftpSession) {
+    if let Some(mut ftp) = app.ftp_session.take() {
+        let _ = ftp.disconnect().await;
+    }
     match session.disconnect().await {
         Ok(_) => {
             reduce(app, Action::Disconnect);
@@ -654,7 +818,7 @@ async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: 
     reduce(app, Action::Connect(info.clone()));
 
     let list_target = app.remote_cwd.clone();
-    let result = connect_and_list_by_protocol(session, &info, &list_target).await;
+    let result = connect_and_list_by_protocol(app, session, &info, &list_target).await;
 
     match result {
         Ok(entries) => {
@@ -683,25 +847,27 @@ async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: 
 }
 
 async fn connect_and_list_by_protocol(
+    app: &mut AppState,
     sftp_session: &mut SftpSession,
     info: &ConnectionInfo,
     path: &str,
 ) -> Result<Vec<FileEntry>> {
     match info.protocol {
         Protocol::Sftp => {
+            app.ftp_session = None;
             sftp_session.connect(info.clone()).await?;
             sftp_session.list_dir(path).await
         }
         Protocol::Ftp | Protocol::Ftps => {
-            let mut unified = UnifiedFtpSession::new();
             let variant = match info.protocol {
                 Protocol::Ftp => FtpVariant::Ftp,
                 Protocol::Ftps => FtpVariant::Ftps,
-                Protocol::Sftp => unreachable!(),
+                Protocol::Sftp => unreachable!("connect_and_list_by_protocol called with Sftp protocol"),
             };
+            let mut unified = UnifiedFtpSession::new();
             unified.connect(variant, info.clone()).await?;
             let entries = unified.list_dir(variant, path).await?;
-            unified.disconnect().await.ok();
+            app.ftp_session = Some(unified);
             Ok(entries)
         }
     }
@@ -979,4 +1145,168 @@ fn local_list(path: &str) -> Vec<FileEntry> {
 
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
+}
+
+fn get_selected_entry(app: &AppState) -> Option<dd_ftp_core::FileEntry> {
+    match app.focus {
+        dd_ftp_app::FocusPane::Local => app.local_entries.get(app.selected_local).cloned(),
+        dd_ftp_app::FocusPane::Remote => app.remote_entries.get(app.selected_remote).cloned(),
+        _ => None,
+    }
+}
+
+async fn create_file(app: &mut AppState, _session: &mut SftpSession, name: &str) {
+    if name.is_empty() {
+        reduce(app, Action::SetStatus("Cannot create file: empty name".to_string()));
+        return;
+    }
+
+    match app.focus {
+        dd_ftp_app::FocusPane::Local => {
+            let path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), name);
+            match std::fs::File::create(&path) {
+                Ok(_) => {
+                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(app, Action::SetStatus(format!("Created file: {}", name)));
+                }
+                Err(err) => {
+                    reduce(app, Action::SetStatus(format!("Failed to create file: {}", err)));
+                }
+            }
+        }
+        dd_ftp_app::FocusPane::Remote => {
+            if !app.connected {
+                reduce(app, Action::SetStatus("Not connected".to_string()));
+                return;
+            }
+            let path = format!("{}/{}", app.remote_cwd.trim_end_matches('/'), name);
+            // For now, create empty file via upload of empty content
+            let temp_file = std::env::temp_dir().join(format!("dd_ftp_empty_{}", name));
+            if std::fs::File::create(&temp_file).is_ok() {
+                let job = TransferJob::new(
+                    temp_file.to_string_lossy().to_string(),
+                    path,
+                    dd_ftp_core::TransferDirection::Upload,
+                );
+                reduce(app, Action::QueueTransfer(job));
+                reduce(app, Action::SetStatus(format!("Queued file creation: {}", name)));
+                // Clean up temp file
+                let _ = std::fs::remove_file(&temp_file);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn create_folder(app: &mut AppState, _session: &mut SftpSession, name: &str) {
+    if name.is_empty() {
+        reduce(app, Action::SetStatus("Cannot create folder: empty name".to_string()));
+        return;
+    }
+
+    match app.focus {
+        dd_ftp_app::FocusPane::Local => {
+            let path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), name);
+            match std::fs::create_dir(&path) {
+                Ok(_) => {
+                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(app, Action::SetStatus(format!("Created folder: {}", name)));
+                }
+                Err(err) => {
+                    reduce(app, Action::SetStatus(format!("Failed to create folder: {}", err)));
+                }
+            }
+        }
+        dd_ftp_app::FocusPane::Remote => {
+            if !app.connected {
+                reduce(app, Action::SetStatus("Not connected".to_string()));
+                return;
+            }
+            let path = format!("{}/{}", app.remote_cwd.trim_end_matches('/'), name);
+            // Remote folder creation not yet implemented
+            reduce(app, Action::SetStatus(format!("Remote folder creation not implemented: {}", path)));
+        }
+        _ => {}
+    }
+}
+
+async fn rename_item(app: &mut AppState, _session: &mut SftpSession, target: &str, new_name: &str) {
+    if new_name.is_empty() {
+        reduce(app, Action::SetStatus("Cannot rename: empty name".to_string()));
+        return;
+    }
+
+    match app.focus {
+        dd_ftp_app::FocusPane::Local => {
+            let new_path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), new_name);
+            match std::fs::rename(target, &new_path) {
+                Ok(_) => {
+                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(app, Action::SetStatus(format!("Renamed to: {}", new_name)));
+                }
+                Err(err) => {
+                    reduce(app, Action::SetStatus(format!("Failed to rename: {}", err)));
+                }
+            }
+        }
+        dd_ftp_app::FocusPane::Remote => {
+            if !app.connected {
+                reduce(app, Action::SetStatus("Not connected".to_string()));
+                return;
+            }
+            // Remote rename not yet implemented
+            reduce(app, Action::SetStatus(format!("Remote rename not implemented: {} -> {}", target, new_name)));
+        }
+        _ => {}
+    }
+}
+
+async fn delete_item(app: &mut AppState, _session: &mut SftpSession, target: &str) {
+    let is_dir = match app.focus {
+        dd_ftp_app::FocusPane::Local => {
+            app.local_entries.get(app.selected_local).map(|e| e.kind == dd_ftp_core::EntryKind::Directory).unwrap_or(false)
+        }
+        dd_ftp_app::FocusPane::Remote => {
+            app.remote_entries.get(app.selected_remote).map(|e| e.kind == dd_ftp_core::EntryKind::Directory).unwrap_or(false)
+        }
+        _ => false,
+    };
+
+    match app.focus {
+        dd_ftp_app::FocusPane::Local => {
+            // Resolve relative paths to absolute
+            let target_path = if target.starts_with("./") || target.starts_with("../") {
+                std::path::Path::new(&app.local_cwd).join(target)
+            } else {
+                std::path::PathBuf::from(target)
+            };
+            let target_str = target_path.to_string_lossy().to_string();
+            
+            reduce(app, Action::SetStatus(format!("DEBUG: Deleting '{}' (is_dir={})", target_str, is_dir)));
+            
+            let result = if is_dir {
+                std::fs::remove_dir(&target_path)
+            } else {
+                std::fs::remove_file(&target_path)
+            };
+            match result {
+                Ok(_) => {
+                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(app, Action::SetStatus(format!("Deleted: {}", target_str)));
+                }
+                Err(err) => {
+                    reduce(app, Action::SetStatus(format!("Failed to delete '{}': {}", target_str, err)));
+                }
+            }
+        }
+        dd_ftp_app::FocusPane::Remote => {
+            if !app.connected {
+                reduce(app, Action::SetStatus("Not connected".to_string()));
+                return;
+            }
+            // Remote delete not yet implemented
+            reduce(app, Action::SetStatus(format!("Remote delete not implemented: {}", target)));
+        }
+        _ => {}
+    }
 }

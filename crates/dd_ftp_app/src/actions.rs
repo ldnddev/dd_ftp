@@ -40,10 +40,20 @@ pub enum Action {
     ToggleThemeDebug,
     SelectUp,
     SelectDown,
-}
-
-#[derive(Debug)]
-pub enum AppEvent {
-    Ui(Action),
-    EffectCompleted(Action),
+    ToggleFilter,
+    FilterInput(char),
+    FilterBackspace,
+    ClearFilter,
+    ToggleCompare,
+    CreateFile(String),
+    CreateFolder(String),
+    RenameItem(String, String),
+    DeleteItem(String),
+    ShowCreatePrompt,
+    ShowRenamePrompt,
+    ShowDeletePrompt,
+    PromptInput(char),
+    PromptBackspace,
+    ConfirmPrompt,
+    CancelPrompt,
 }

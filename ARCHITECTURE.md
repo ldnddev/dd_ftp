@@ -9,13 +9,14 @@ A terminal-based FTP client built with Rust + ratatui, inspired by FileZilla but
 dd_ftp/
 ├── Cargo.toml
 ├── crates/
+│   ├── dd_ftp_cli
 │   ├── dd_ftp_app
 │   ├── dd_ftp_ui
 │   ├── dd_ftp_core
+│   ├── dd_ftp_ftp
 │   ├── dd_ftp_protocols
 │   ├── dd_ftp_transfer
-│   ├── dd_ftp_storage
-│   └── dd_ftp_utils
+│   └── dd_ftp_storage
 ```
 
 ## Core Principles
@@ -45,17 +46,18 @@ dd_ftp/
 - Parallel transfers
 - Bookmarks
 
-### Phase 5 (Deferred)
+### Phase 5
 - Filters
-- Directory comparison
+- Directory compare
 - Sync browsing
+
+### Phase 6 (Deferred)
 - Proxy
 - Logging expansion
 - Remote search
 
 ## Next Steps
 
-- Scaffold workspace
-- Implement SFTP session
-- Build minimal UI loop
-- Add queue system
+- **Filters** - Filter file listings by pattern (in progress)
+- Directory compare
+- Sync browsing

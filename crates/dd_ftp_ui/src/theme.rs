@@ -21,11 +21,16 @@ pub struct Theme {
     pub input_border_focus: Color,
     pub input_text_default: Color,
     pub input_text_focus: Color,
-    pub scroll_bars: Color,
+    pub cursor: Color,
+    pub scrollbar: Color,
+    pub scrollbar_hover: Color,
     pub success: Color,
     pub warning: Color,
     pub error: Color,
     pub info: Color,
+    pub folder: Color,
+    pub file: Color,
+    pub link: Color,
 }
 
 impl Default for Theme {
@@ -48,11 +53,16 @@ impl Default for Theme {
             input_border_focus: Color::Rgb(0x8c, 0xc8, 0xff),
             input_text_default: Color::Rgb(0x5a, 0xb4, 0xf5),
             input_text_focus: Color::Rgb(0x8c, 0xc8, 0xff),
-            scroll_bars: Color::Rgb(0x2a, 0x2d, 0x31),
+            cursor: Color::Rgb(0x6e, 0xc8, 0xff),
+            scrollbar: Color::Rgb(0x2a, 0x2d, 0x31),
+            scrollbar_hover: Color::Rgb(0x6e, 0xc8, 0xff),
             success: Color::Rgb(0x82, 0xe0, 0xaa),
             warning: Color::Rgb(0xf5, 0xc4, 0x69),
             error: Color::Rgb(0xe5, 0x73, 0x73),
             info: Color::Rgb(0x5d, 0xad, 0xe2),
+            folder: Color::Rgb(0x5d, 0xad, 0xe2),
+            file: Color::Rgb(0xf5, 0xf6, 0xf7),
+            link: Color::Rgb(0xf5, 0xc4, 0x69),
         }
     }
 }
@@ -81,11 +91,16 @@ struct ThemeColors {
     input_border_focus: String,
     input_text_default: String,
     input_text_focus: String,
-    scroll_bars: Option<String>,
+    cursor: Option<String>,
+    scrollbar: Option<String>,
+    scrollbar_hover: Option<String>,
     success: String,
     warning: String,
     error: String,
     info: String,
+    folders: Option<String>,
+    files: Option<String>,
+    links: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,10 +183,7 @@ fn parse_theme(content: &str) -> anyhow::Result<ThemeFile> {
             continue;
         }
         if let Some((k, v)) = l.split_once(':') {
-            map.insert(
-                k.trim().to_string(),
-                v.trim().trim_matches('"').to_string(),
-            );
+            map.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
         }
     }
 
@@ -200,11 +212,16 @@ fn parse_theme(content: &str) -> anyhow::Result<ThemeFile> {
             input_border_focus: get("input_border_focus")?,
             input_text_default: get("input_text_default")?,
             input_text_focus: get("input_text_focus")?,
-            scroll_bars: map.get("scroll_bars").cloned(),
+            cursor: map.get("cursor").cloned(),
+            scrollbar: map.get("scrollbar").cloned(),
+            scrollbar_hover: map.get("scrollbar_hover").cloned(),
             success: get("success")?,
             warning: get("warning")?,
             error: get("error")?,
             info: get("info")?,
+            folders: map.get("folders").cloned(),
+            files: map.get("files").cloned(),
+            links: map.get("links").cloned(),
         },
     })
 }
@@ -214,7 +231,8 @@ fn map_theme(tf: ThemeFile) -> Theme {
     Theme {
         base_background: parse_hex(&c.base_background).unwrap_or(Theme::default().base_background),
         body_background: parse_hex(&c.body_background).unwrap_or(Theme::default().body_background),
-        modal_background: parse_hex(&c.modal_background).unwrap_or(Theme::default().modal_background),
+        modal_background: parse_hex(&c.modal_background)
+            .unwrap_or(Theme::default().modal_background),
         text_primary: parse_hex(&c.text_primary).unwrap_or(Theme::default().text_primary),
         text_secondary: parse_hex(&c.text_secondary).unwrap_or(Theme::default().text_secondary),
         text_labels: parse_hex(&c.text_labels).unwrap_or(Theme::default().text_labels),
@@ -231,22 +249,52 @@ fn map_theme(tf: ThemeFile) -> Theme {
             .unwrap_or(Theme::default().text_active_focus),
         modal_labels: parse_hex(&c.modal_labels).unwrap_or(Theme::default().modal_labels),
         modal_text: parse_hex(&c.modal_text).unwrap_or(Theme::default().modal_text),
-        selected_background: parse_hex(&c.selected_background).unwrap_or(Theme::default().selected_background),
+        selected_background: parse_hex(&c.selected_background)
+            .unwrap_or(Theme::default().selected_background),
         border_default: parse_hex(&c.border_default).unwrap_or(Theme::default().border_default),
         border_active: parse_hex(&c.border_active).unwrap_or(Theme::default().border_active),
-        input_border_default: parse_hex(&c.input_border_default).unwrap_or(Theme::default().input_border_default),
-        input_border_focus: parse_hex(&c.input_border_focus).unwrap_or(Theme::default().input_border_focus),
-        input_text_default: parse_hex(&c.input_text_default).unwrap_or(Theme::default().input_text_default),
-        input_text_focus: parse_hex(&c.input_text_focus).unwrap_or(Theme::default().input_text_focus),
-        scroll_bars: c
-            .scroll_bars
+        input_border_default: parse_hex(&c.input_border_default)
+            .unwrap_or(Theme::default().input_border_default),
+        input_border_focus: parse_hex(&c.input_border_focus)
+            .unwrap_or(Theme::default().input_border_focus),
+        input_text_default: parse_hex(&c.input_text_default)
+            .unwrap_or(Theme::default().input_text_default),
+        input_text_focus: parse_hex(&c.input_text_focus)
+            .unwrap_or(Theme::default().input_text_focus),
+        cursor: c
+            .cursor
             .as_deref()
             .and_then(parse_hex)
-            .unwrap_or(Theme::default().scroll_bars),
+            .unwrap_or(Theme::default().cursor),
+        scrollbar: c
+            .scrollbar
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(Theme::default().scrollbar),
+        scrollbar_hover: c
+            .scrollbar_hover
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(Theme::default().scrollbar_hover),
         success: parse_hex(&c.success).unwrap_or(Theme::default().success),
         warning: parse_hex(&c.warning).unwrap_or(Theme::default().warning),
         error: parse_hex(&c.error).unwrap_or(Theme::default().error),
         info: parse_hex(&c.info).unwrap_or(Theme::default().info),
+        folder: c
+            .folders
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(Theme::default().folder),
+        file: c
+            .files
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(Theme::default().file),
+        link: c
+            .links
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(Theme::default().link),
     }
 }
 

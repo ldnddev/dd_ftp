@@ -110,3 +110,6 @@ Notable tokens:
 
 ## Architecture
 See [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+## License
+MIT

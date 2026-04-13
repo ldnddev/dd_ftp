@@ -622,12 +622,8 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
             }
 
             if let Some(entry) = app.remote_entries.get(app.selected_remote).cloned() {
-                reduce(app, Action::SetStatus(format!(
-                    "DEBUG: trying '{}' (kind={:?}, path={})",
-                    entry.name, entry.kind, entry.path
-                )));
                 if entry.kind == dd_ftp_core::EntryKind::Directory {
-                    app.remote_cwd = entry.name.clone();
+                    app.remote_cwd = join_remote_path(&app.remote_cwd, &entry.name);
                     let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
                     let result = match (&mut app.ftp_session, variant_opt) {
                         (Some(ftp), Some(Protocol::Ftp)) => {
@@ -679,13 +675,7 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
                 return;
             }
 
-            let parent = Path::new(&app.remote_cwd)
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| "/".to_string());
-
-            app.remote_cwd = parent;
+            app.remote_cwd = parent_remote_path(&app.remote_cwd);
             let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
             let result = match (&mut app.ftp_session, variant_opt) {
                 (Some(ftp), Some(Protocol::Ftp)) => {
@@ -1119,10 +1109,63 @@ fn connection_info_from_env() -> ConnectionInfo {
     }
 }
 
+fn join_remote_path(base: &str, child: &str) -> String {
+    if child.starts_with('/') {
+        return child.to_string();
+    }
+    let base = if base.is_empty() { "/" } else { base };
+    if base == "/" {
+        format!("/{}", child.trim_start_matches('/'))
+    } else {
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            child.trim_start_matches('/')
+        )
+    }
+}
+
+fn parent_remote_path(path: &str) -> String {
+    let p = if path.is_empty() { "/" } else { path };
+    if p == "/" {
+        return "/".to_string();
+    }
+    let trimmed = p.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(idx) => trimmed[..idx].to_string(),
+    }
+}
+
 fn local_list(path: &str) -> Vec<FileEntry> {
     let mut out = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(path) {
+    let current_path = if path.is_empty() { "." } else { path };
+    let parent_path = Path::new(current_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| current_path.to_string());
+
+    out.push(FileEntry {
+        name: ".".to_string(),
+        path: current_path.to_string(),
+        kind: dd_ftp_core::EntryKind::Directory,
+        size: 0,
+        modified: None,
+        permissions: None,
+    });
+
+    out.push(FileEntry {
+        name: "..".to_string(),
+        path: parent_path,
+        kind: dd_ftp_core::EntryKind::Directory,
+        size: 0,
+        modified: None,
+        permissions: None,
+    });
+
+    if let Ok(entries) = std::fs::read_dir(current_path) {
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
                 let kind = if meta.is_dir() {
@@ -1143,8 +1186,15 @@ fn local_list(path: &str) -> Vec<FileEntry> {
         }
     }
 
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    out
+    let (special, mut regular): (Vec<_>, Vec<_>) = out
+        .into_iter()
+        .partition(|e| e.name == "." || e.name == "..");
+
+    regular.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let mut result = special;
+    result.extend(regular);
+    result
 }
 
 fn get_selected_entry(app: &AppState) -> Option<dd_ftp_core::FileEntry> {

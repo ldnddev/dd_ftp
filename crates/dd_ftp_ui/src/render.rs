@@ -84,10 +84,20 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         queue_area,
     );
 
+    let content_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(content_area);
+
+    let path_panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(content_rows[0]);
+
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(content_area);
+        .split(content_rows[1]);
 
     let filter_match = |name: &str| {
         if app.filter_pattern.is_empty() {
@@ -160,6 +170,33 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     } else {
         Style::default().fg(t.text_labels)
     };
+
+    let local_path = Paragraph::new(shorten_middle(&app.local_cwd, 70))
+        .style(Style::default().bg(t.body_background).fg(t.text_primary))
+        .block(
+            Block::default()
+                .title(Line::from(vec![Span::styled(
+                    " Local Path ",
+                    Style::default().fg(t.text_labels),
+                )]))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.border_default)),
+        );
+
+    let remote_path = Paragraph::new(shorten_middle(&app.remote_cwd, 70))
+        .style(Style::default().bg(t.body_background).fg(t.text_primary))
+        .block(
+            Block::default()
+                .title(Line::from(vec![Span::styled(
+                    " Remote Path ",
+                    Style::default().fg(t.text_labels),
+                )]))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.border_default)),
+        );
+
+    frame.render_widget(local_path, path_panes[0]);
+    frame.render_widget(remote_path, path_panes[1]);
 
     let local = List::new(local_items)
         .style(Style::default().bg(t.body_background).fg(t.text_primary))

@@ -17,8 +17,8 @@ Use this document as the single source of truth for theming all ldnddev TUI apps
 
 Every app should load theme files in this order:
 
-1. `./dd_ftp_theme.yml` (project-local override)
-2. `~/.config/ldnddev/dd_ftp_theme.yml` (global default)
+1. `./PROJECT_NAME_theme.yml` (project-local override, example file name './dd_ftp_theme.yml')
+2. `~/.config/ldnddev/PROJECT_NAME_theme.yml` (global default, example file name './dd_ftp_theme.yml')
 3. Built-in application defaults
 
 > If adapting for another app name, keep the same schema and only rename file prefix if needed.
@@ -29,43 +29,38 @@ Every app should load theme files in this order:
 
 ```yaml
 colors:
-  # Core backgrounds
-  base_background: "#0f1114"
-  body_background: "#1a1c1f"
-  modal_background: "#2a2d31"
+  base_background: "#0F1114"
+  body_background: "#2A2D31"
+  modal_background: "#1C1E21"
 
-  # Core text
-  text_primary: "#f5f6f7"
-  text_secondary: "#9ea3aa"
+  text_primary: "#F5F6F7"
+  text_secondary: "#9EA3AA"
+  text_labels: "#FFAF46"
+  text_active_focus: "#64B4F5"
+  modal_labels: "#64B4F5"
+  modal_text: "#F5F6F7"
 
-  # Labels / headings
-  text_labels: "#9ea3aa"
-  text_labels_active: "#6ec8ff"
-  text_active_focus: "#6ec8ff"
+  selected_background: "#0F1114"
 
-  # Modal-specific text
-  modal_labels: "#f5f6f7"
-  modal_text: "#f5f6f7"
+  border_default: "#F5F6F7"
+  border_active: "#64B4F5"
+  scrollbar: "#FFA087"
+  scrollbar_hover: "#64B4F5"
 
-  # Selection + borders
-  selected_background: "#2a2d31"
-  border_default: "#2a2d31"
-  border_active: "#6ec8ff"
+  input_border_default: "#F5F6F7"
+  input_border_focus: "#64B4F5"
+  input_text_default: "#F5F6F7"
+  input_text_focus: "#64B4F5"
+  cursor: "#64B4F5"
 
-  # Input fields
-  input_border_default: "#5ab4f5"
-  input_border_focus: "#8cc8ff"
-  input_text_default: "#5ab4f5"
-  input_text_focus: "#8cc8ff"
-
-  # Scrollbars
-  scroll_bars: "#2a2d31"
-
-  # Semantic state colors
   success: "#82e0aa"
   warning: "#f5c469"
   error: "#e57373"
   info: "#5dade2"
+
+  folders: "#64B4F5"
+  files: "#FFAF46"
+  links: "#FFA087"
 ```
 
 ---
@@ -84,46 +79,71 @@ These mappings should stay consistent across all apps.
 - `modal_background`
   - Every modal/dialog surface
 
-### 2) Borders (1px-equivalent in TUI)
+### 2) Text colors
 
-- **Default border**: `border_default`
-- **Focused/active border**: `border_active`
+- `text_primary`: "#F5F6F7"
+    -  Primary text
+- `text_secondary`
+    - Secondary/muted text
+- `text_labels`
+    - Default state for labels
+- `text_active_focus`
+    - Active/selected/focused state for labels
+- `modal_labels`
+    - Popup/modal Label text
+- `modal_text`
+    - Popup/modal Primary text
 
-### 3) Pane/Section Labels
+### 3) Selections
 
-- Default pane labels (`[1] Local`, `[2] Remote`, etc.): `text_labels`
-- Active/focused pane label: `text_active_focus`
+- `selected_background`
+    - Active/selected/focused row background
 
-### 4) Modal Typography
+### 4) Borders (1px-equivalent in TUI)
 
-- Modal title/label text: `modal_labels`
-- Modal body/default text: `modal_text`
+- `border_default`
+    -  Default borders
+- `border_active`
+    - Active section highlight
 
 ### 5) Input Fields (all text-entry fields)
 
-Each editable field must have a bordered input box:
+Each editable field must have a bordered input box:  
+- `input_border_default`
+    - Default input border
+- `input_border_focus`
+    - Active/selected/focused input border
+- `input_text_default` 
+    - Default input border
+- `input_text_focus` 
+    - Active/selected/focused input border
+- `cursor`
+    - Cursor color
 
-- default border: `input_border_default`
-- focused border: `input_border_focus`
-- default input text: `input_text_default`
-- focused input text: `input_text_focus`
-- input field labels: `text_labels_active`
+### 6) Scrollbars
 
-### 6) Selection States
+- `scrollbar`
+    - All scrollbars (pane + modal)
+- `scrollbar_hover`
+    - ALL scrollbar hover color (pane + modal)
 
-- Selected row/item background: `selected_background`
-
-### 7) Scrollbars
-
-- All scrollbars (pane + modal): `scroll_bars`
-
-### 8) Semantic States
-
-- Success states/messages: `success`
-- Warning states/messages: `warning`
-- Error states/messages: `error`
-- Informational/progress states: `info`
-- Secondary/meta text (helper/counters/subtext): `text_secondary`
+### 7) Semantic colors
+- `success`
+    - Success toast messages
+- `warning`
+    - Warning toast messages
+- `error`
+    - Error toast messages
+- `info`
+    - Info toast messages
+  
+### 8) folder / file / link colors
+- `folders`
+    - Default folder color for text (if needed)
+- `files`
+    - Default file color for text (if needed)
+- `links`
+    - Default symlink color for text (if needed)
 
 ---
 
@@ -175,6 +195,4 @@ Then enforce schema compatibility in loaders as apps evolve.
 
 ## Maintainer Note
 
-If a new UI element needs color mapping and no token exists, add a token here first,
-then implement it in code. Do not invent app-specific one-off tokens unless they are
-promoted into this standard.
+If a new UI element needs color mapping and no token exists, add a token here first, then implement it in code. Do not invent app-specific one-off tokens unless they are promoted into this standard.

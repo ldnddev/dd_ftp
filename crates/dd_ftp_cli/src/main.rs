@@ -79,6 +79,7 @@ async fn run(
     let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
 
     loop {
+        app.expire_toast();
         terminal.draw(|f| dd_ftp_ui::render(f, app))?;
 
         while let Ok(msg) = rx.try_recv() {
@@ -218,14 +219,6 @@ async fn run(
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
                 Event::Key(key) => {
-                if app.error_modal.is_some() {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Enter => reduce(app, Action::ClearError),
-                        _ => {}
-                    }
-                    continue;
-                }
-
                 if key.code == KeyCode::Char('k')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {

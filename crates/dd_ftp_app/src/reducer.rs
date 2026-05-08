@@ -1,4 +1,4 @@
-use crate::{Action, AppState, FocusPane, PromptType, QuickConnectField};
+use crate::{Action, AppState, FocusPane, PromptType, QuickConnectField, Toast};
 use dd_ftp_core::Protocol;
 
 pub fn reduce(state: &mut AppState, action: Action) {
@@ -242,11 +242,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.status = msg;
         }
         Action::ShowError(msg) => {
-            state.error_modal = Some(msg.clone());
+            state.toast = Some(Toast::error(msg.clone()));
             state.status = format!("Error: {msg}");
         }
         Action::ClearError => {
-            state.error_modal = None;
+            state.toast = None;
         }
         Action::FocusNextPane => {
             state.focus = match state.focus {

@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use dd_ftp_core::{ConnectionInfo, FileEntry};
 use dd_ftp_transfer::TransferQueue;
 
+use crate::Toast;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
     Local,
@@ -92,10 +94,18 @@ pub struct AppState {
     pub selected_bookmark: usize,
     pub active_connection: Option<ConnectionInfo>,
     pub status: String,
-    pub error_modal: Option<String>,
+    pub toast: Option<Toast>,
     pub queue_scroll: usize,
     pub queue: TransferQueue,
     pub ftp_session: Option<dd_ftp_ftp::UnifiedFtpSession>,
+}
+
+impl AppState {
+    pub fn expire_toast(&mut self) {
+        if self.toast.as_ref().is_some_and(Toast::is_expired) {
+            self.toast = None;
+        }
+    }
 }
 
 impl Default for AppState {
@@ -133,7 +143,7 @@ impl Default for AppState {
             selected_bookmark: 0,
             active_connection: None,
             status: "Ready".to_string(),
-            error_modal: None,
+            toast: None,
             queue_scroll: 0,
             queue: TransferQueue::default(),
             ftp_session: None,

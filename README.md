@@ -108,8 +108,5 @@ Notable tokens:
 - FTP: ✅
 - FTPS: ✅
 
-## Architecture
-See [ARCHITECTURE.md](./ARCHITECTURE.md).
-
 ## License
 MIT

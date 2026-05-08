@@ -1,4 +1,4 @@
-use dd_ftp_app::{AppState, FocusPane, QuickConnectField};
+use dd_ftp_app::{AppState, FocusPane, QuickConnectField, ToastLevel};
 use dd_ftp_core::{Protocol, TransferJob};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -389,8 +389,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         format!("{} | site:none", app.status)
     };
 
-    let status_color = if app.error_modal.is_some()
-        || app.status.to_lowercase().contains("failed")
+    let status_color = if app.status.to_lowercase().contains("failed")
         || app.status.to_lowercase().contains("error")
     {
         t.error
@@ -799,57 +798,6 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         );
     }
 
-    if let Some(err) = &app.error_modal {
-        let area = centered_rect(65, 35, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Block::default().style(Style::default().bg(t.modal_background)),
-            area,
-        );
-
-        let lines = vec![
-            Line::from(vec![Span::styled(
-                "Error",
-                Style::default()
-                    .fg(t.modal_labels)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(""),
-            Line::from(err.clone()),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Press Esc or Enter to close",
-                Style::default().fg(t.warning),
-            )]),
-        ];
-
-        let modal = Paragraph::new(lines.clone())
-            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .title(Line::from(vec![Span::styled(
-                        " Alert ",
-                        Style::default()
-                            .fg(t.modal_labels)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.error)),
-            );
-
-        frame.render_widget(modal, area);
-        render_scrollbar(
-            frame,
-            area,
-            0,
-            lines.len(),
-            t.scrollbar,
-            t.scrollbar_hover,
-            app.mouse_pos,
-        );
-    }
-
     if app.show_prompt {
         let area = centered_rect(60, 30, frame.area());
         frame.render_widget(Clear, area);
@@ -914,6 +862,56 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
         frame.render_widget(modal, area);
     }
+
+    if let Some(toast) = &app.toast {
+        render_toast(frame, frame.area(), toast, &t);
+    }
+}
+
+fn render_toast(frame: &mut Frame, area: Rect, toast: &dd_ftp_app::Toast, t: &Theme) {
+    let width = area.width.min(56);
+    let height = area.height.min(5);
+
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let x = area.x + area.width.saturating_sub(width);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height.saturating_add(1)));
+    let toast_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let (title, border_color) = match toast.level {
+        ToastLevel::Info => (" Info ", t.info),
+        ToastLevel::Success => (" Success ", t.success),
+        ToastLevel::Warning => (" Warning ", t.warning),
+        ToastLevel::Error => (" Error ", t.error),
+    };
+
+    frame.render_widget(Clear, toast_area);
+
+    let toast_widget = Paragraph::new(toast.message.clone())
+        .style(Style::default().bg(t.modal_background).fg(t.modal_text))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(Line::from(vec![Span::styled(
+                    title,
+                    Style::default()
+                        .fg(t.modal_labels)
+                        .add_modifier(Modifier::BOLD),
+                )]))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        );
+
+    frame.render_widget(toast_widget, toast_area);
 }
 
 fn format_job_summary(job: &TransferJob) -> String {

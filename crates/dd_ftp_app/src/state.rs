@@ -106,6 +106,14 @@ impl AppState {
             self.toast = None;
         }
     }
+
+    pub fn any_modal_open(&self) -> bool {
+        self.show_help
+            || self.show_filter
+            || self.show_prompt
+            || self.show_quick_connect
+            || self.show_bookmarks
+    }
 }
 
 impl Default for AppState {

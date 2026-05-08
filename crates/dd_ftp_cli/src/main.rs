@@ -219,24 +219,25 @@ async fn run(
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
                 Event::Key(key) => {
-                if key.code == KeyCode::Char('k')
+                if !app.any_modal_open()
+                    && key.code == KeyCode::Char('k')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     run_keyring_health_check(app);
                     continue;
                 }
 
-                if key.code == KeyCode::F(1) {
+                if !app.any_modal_open() && key.code == KeyCode::F(1) {
                     reduce(app, Action::ToggleHelp);
                     continue;
                 }
 
-                if key.code == KeyCode::F(2) {
+                if !app.any_modal_open() && key.code == KeyCode::F(2) {
                     reduce(app, Action::ToggleThemeDebug);
                     continue;
                 }
 
-                if key.code == KeyCode::Char('/') {
+                if !app.any_modal_open() && key.code == KeyCode::Char('/') {
                     reduce(app, Action::ToggleFilter);
                     continue;
                 }
@@ -265,7 +266,7 @@ async fn run(
                     continue;
                 }
 
-                if key.code == KeyCode::Char('C') {
+                if !app.any_modal_open() && key.code == KeyCode::Char('C') {
                     reduce(app, Action::ToggleCompare);
                     continue;
                 }
@@ -315,21 +316,28 @@ async fn run(
                     continue;
                 }
 
-                if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if !app.any_modal_open()
+                    && key.code == KeyCode::Char('n')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
                     reduce(app, Action::ShowCreatePrompt);
                     continue;
                 }
 
-                if key.code == KeyCode::Char('N') && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+                if !app.any_modal_open()
+                    && key.code == KeyCode::Char('N')
+                    && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                {
                     reduce(app, Action::ShowCreatePrompt);
-                    // Change prompt type to folder
                     app.prompt_type = Some(dd_ftp_app::PromptType::CreateFolder);
                     continue;
                 }
 
-                if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                if !app.any_modal_open()
+                    && key.code == KeyCode::Char('e')
+                    && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     reduce(app, Action::ShowRenamePrompt);
-                    // Pre-fill with current selection
                     if let Some(entry) = get_selected_entry(app) {
                         app.prompt_target = Some(entry.path.clone());
                         app.prompt_value = entry.name.clone();
@@ -337,11 +345,13 @@ async fn run(
                     continue;
                 }
 
-                if key.code == KeyCode::Delete && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if !app.any_modal_open()
+                    && key.code == KeyCode::Delete
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
                     reduce(app, Action::ShowDeletePrompt);
                     if let Some(entry) = get_selected_entry(app) {
                         app.prompt_target = Some(entry.path.clone());
-                        // Don't pre-fill prompt_value - user needs to type 'y'
                     }
                     continue;
                 }

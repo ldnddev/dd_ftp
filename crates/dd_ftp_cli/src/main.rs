@@ -80,7 +80,9 @@ async fn run(
 
     loop {
         app.expire_toast();
-        terminal.draw(|f| dd_ftp_ui::render(f, app))?;
+        let mut app_layout = dd_ftp_ui::LayoutMap::default();
+        terminal.draw(|f| dd_ftp_ui::render(f, app, &mut app_layout))?;
+        let _ = &app_layout; // consumed by mouse handling in a later task
 
         while let Ok(msg) = rx.try_recv() {
             match msg {

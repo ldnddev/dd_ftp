@@ -11,9 +11,11 @@ use ratatui::{
     Frame,
 };
 
+use crate::layout::LayoutMap;
 use crate::theme::{load_theme_with_source, Theme};
 
-pub fn render(frame: &mut Frame, app: &AppState) {
+pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
+    *map = LayoutMap::default();
     let loaded = load_theme_with_source();
     let t = loaded.theme;
 
@@ -74,6 +76,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     let content_area = vertical[2];
     let queue_area = vertical[3];
     let status_area = vertical[4];
+    map.queue = queue_area;
 
     frame.render_widget(
         Block::default().style(Style::default().bg(t.body_background)),
@@ -98,6 +101,8 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(content_rows[1]);
+    map.local_list = panes[0];
+    map.remote_list = panes[1];
 
     let filter_match = |name: &str| {
         if app.filter_pattern.is_empty() {
@@ -271,6 +276,9 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         t.scrollbar_hover,
         app.mouse_pos,
     );
+    map.local_scrollbar = Rect { x: panes[0].x + panes[0].width.saturating_sub(1), y: panes[0].y, width: 1, height: panes[0].height };
+    map.remote_scrollbar = Rect { x: panes[1].x + panes[1].width.saturating_sub(1), y: panes[1].y, width: 1, height: panes[1].height };
+    map.queue_scrollbar = Rect { x: queue_area.x + queue_area.width.saturating_sub(1), y: queue_area.y, width: 1, height: queue_area.height };
 
     if app.show_compare {
         render_compare_view(frame, content_area, app, &t);

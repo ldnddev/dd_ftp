@@ -650,7 +650,7 @@ async fn run(
                             .unwrap_or(false);
                         last_click = Some((mx, my, now));
                         match hit_test(&app_layout, mx, my) {
-                            Some(Region::List(pane)) => {
+                            Some(Region::List(pane)) if !app.any_modal_open() => {
                                 app.focus = match pane {
                                     Pane::Local => FocusPane::Local,
                                     Pane::Remote => FocusPane::Remote,
@@ -677,6 +677,7 @@ async fn run(
                                             Pane::Remote => app.selected_remote = idx,
                                         }
                                         if is_double {
+                                            last_click = None;
                                             navigate_into_directory(app, session).await;
                                         }
                                     }
@@ -688,6 +689,7 @@ async fn run(
                             Some(Region::Control(ControlId::BookmarkRow(i))) => {
                                 app.selected_bookmark = i.min(app.bookmarks.len().saturating_sub(1));
                                 if is_double {
+                                    last_click = None;
                                     if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
                                         let bm = hydrate_password_from_keyring(app, bm, "bookmark-load");
                                         reduce(app, Action::QuickConnectSetFromBookmark(bm));

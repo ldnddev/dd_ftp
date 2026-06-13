@@ -82,7 +82,6 @@ async fn run(
         app.expire_toast();
         let mut app_layout = dd_ftp_ui::LayoutMap::default();
         terminal.draw(|f| dd_ftp_ui::render(f, app, &mut app_layout))?;
-        let _ = &app_layout; // consumed by mouse handling in a later task
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -599,8 +598,42 @@ async fn run(
                 }
             }
             Event::Mouse(mouse) => {
-                if mouse.kind == MouseEventKind::Moved {
-                    app.mouse_pos = Some((mouse.column, mouse.row));
+                use dd_ftp_ui::{hit_test, Region, Pane, ScrollRegion};
+                let (mx, my) = (mouse.column, mouse.row);
+                match mouse.kind {
+                    MouseEventKind::Moved => {
+                        app.mouse_pos = Some((mx, my));
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                        match hit_test(&app_layout, mx, my) {
+                            Some(Region::List(pane)) => {
+                                app.focus = match pane {
+                                    Pane::Local => FocusPane::Local,
+                                    Pane::Remote => FocusPane::Remote,
+                                };
+                                for _ in 0..3 {
+                                    reduce(app, if up { Action::SelectUp } else { Action::SelectDown });
+                                }
+                            }
+                            Some(Region::Scrollbar(ScrollRegion::Queue)) => {
+                                app.queue_scroll = if up {
+                                    app.queue_scroll.saturating_sub(3)
+                                } else {
+                                    app.queue_scroll.saturating_add(3)
+                                };
+                            }
+                            Some(Region::Scrollbar(ScrollRegion::Help)) => {
+                                app.help_scroll = if up {
+                                    app.help_scroll.saturating_sub(3)
+                                } else {
+                                    app.help_scroll.saturating_add(3)
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}

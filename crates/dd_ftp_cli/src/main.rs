@@ -81,6 +81,7 @@ async fn run(
     let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
     let mut last_click: Option<(u16, u16, Instant)> = None;
+    let mut drag: Option<dd_ftp_ui::ScrollRegion> = None;
 
     loop {
         app.expire_toast();
@@ -698,8 +699,26 @@ async fn run(
                                     }
                                 }
                             }
+                            Some(Region::Scrollbar(sr)) => {
+                                let allow = match sr {
+                                    ScrollRegion::Help => true,
+                                    _ => !app.any_modal_open(),
+                                };
+                                if allow {
+                                    drag = Some(sr);
+                                    apply_scrollbar_drag(app, &app_layout, sr, my);
+                                }
+                            }
                             _ => {}
                         }
+                    }
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                        if let Some(sr) = drag {
+                            apply_scrollbar_drag(app, &app_layout, sr, my);
+                        }
+                    }
+                    MouseEventKind::Up(_) => {
+                        drag = None;
                     }
                     _ => {}
                 }
@@ -708,6 +727,47 @@ async fn run(
         }
     }
 }
+}
+
+fn apply_scrollbar_drag(
+    app: &mut AppState,
+    layout: &dd_ftp_ui::LayoutMap,
+    sr: dd_ftp_ui::ScrollRegion,
+    my: u16,
+) {
+    use dd_ftp_ui::ScrollRegion;
+    let track = match sr {
+        ScrollRegion::ListLocal => layout.local_scrollbar,
+        ScrollRegion::ListRemote => layout.remote_scrollbar,
+        ScrollRegion::Queue => layout.queue_scrollbar,
+        ScrollRegion::Help => layout.help_scrollbar.unwrap_or_default(),
+    };
+    if track.height == 0 {
+        return;
+    }
+    let rel = my.saturating_sub(track.y).min(track.height.saturating_sub(1));
+    let denom = track.height.saturating_sub(1).max(1) as f32;
+    let frac = rel as f32 / denom;
+    match sr {
+        ScrollRegion::ListLocal => {
+            let n = app.local_entries.len().saturating_sub(1);
+            app.selected_local = (frac * n as f32).round() as usize;
+        }
+        ScrollRegion::ListRemote => {
+            let n = app.remote_entries.len().saturating_sub(1);
+            app.selected_remote = (frac * n as f32).round() as usize;
+        }
+        ScrollRegion::Queue => {
+            let n = app.queue.pending.len()
+                + app.queue.active.len()
+                + app.queue.completed.len()
+                + app.queue.failed.len();
+            app.queue_scroll = (frac * n as f32).round() as usize;
+        }
+        ScrollRegion::Help => {
+            app.help_scroll = (frac * track.height as f32).round() as usize;
+        }
+    }
 }
 
 async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) {

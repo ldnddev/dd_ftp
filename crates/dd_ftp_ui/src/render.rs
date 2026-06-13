@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::layout::LayoutMap;
+use crate::layout::{ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap};
 use crate::theme::{load_theme_with_source, Theme};
 
 pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
@@ -515,6 +515,14 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                 app.mouse_pos,
             );
         }
+
+        map.help = Some(area);
+        map.help_scrollbar = Some(Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: area.y,
+            width: 1,
+            height: area.height,
+        });
     }
 
     if app.show_quick_connect {
@@ -658,6 +666,26 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     );
 
                 frame.render_widget(input, cols[col_idx]);
+
+                let cell = cols[col_idx];
+                match field {
+                    QuickConnectField::Protocol => {
+                        map.controls.push(ControlRegion { id: ControlId::QcProtocol, area: cell });
+                    }
+                    other => {
+                        let fid = match other {
+                            QuickConnectField::Name => FieldId::QcName,
+                            QuickConnectField::Host => FieldId::QcHost,
+                            QuickConnectField::Port => FieldId::QcPort,
+                            QuickConnectField::Username => FieldId::QcUsername,
+                            QuickConnectField::Password => FieldId::QcPassword,
+                            QuickConnectField::PrivateKey => FieldId::QcPrivateKey,
+                            QuickConnectField::Path => FieldId::QcPath,
+                            QuickConnectField::Protocol => unreachable!(),
+                        };
+                        map.fields.push(FieldRegion { id: fid, area: cell, text_x: cell.x + 1 });
+                    }
+                }
             }
         }
 
@@ -736,6 +764,22 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             t.scrollbar_hover,
             app.mouse_pos,
         );
+
+        // Record one ControlRegion per bookmark row. Each bookmark occupies one
+        // line (line0 = "Bookmarks", line1 = blank, then bookmarks starting at
+        // line2 with border offset +1 = y + 3 + i). Wrap{trim:true} could shift
+        // rows for very long names; this is the accepted single-line approximation.
+        if !app.bookmarks.is_empty() {
+            for i in 0..app.bookmarks.len() {
+                let y = area.y + 3 + i as u16;
+                if y < area.y + area.height.saturating_sub(1) {
+                    map.controls.push(ControlRegion {
+                        id: ControlId::BookmarkRow(i),
+                        area: Rect { x: area.x + 1, y, width: area.width.saturating_sub(2), height: 1 },
+                    });
+                }
+            }
+        }
     }
 
     if app.show_theme_debug {
@@ -869,6 +913,22 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             );
 
         frame.render_widget(modal, area);
+
+        let has_target_line = app.prompt_type == Some(dd_ftp_app::PromptType::Delete)
+            && app.prompt_target.is_some();
+        let input_line_offset =
+            1 /* message */ + if has_target_line { 1 } else { 0 } + 1 /* blank */;
+        let prompt_input_area = Rect {
+            x: area.x + 3,
+            y: area.y + 1 + input_line_offset as u16,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        map.fields.push(FieldRegion {
+            id: FieldId::Prompt,
+            area: prompt_input_area,
+            text_x: area.x + 3,
+        });
     }
 
     if let Some(toast) = &app.toast {

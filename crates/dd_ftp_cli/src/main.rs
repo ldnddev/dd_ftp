@@ -18,11 +18,14 @@ use crossterm::{
 };
 use dd_ftp_app::{reduce, Action, AppState, FocusPane};
 use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob};
-use uuid::Uuid;
 use dd_ftp_ftp::{FtpVariant, UnifiedFtpSession};
 use dd_ftp_protocols::SftpSession;
 use dd_ftp_storage::{SecretStore, SiteManager};
+use dd_ftp_ui::{hit_test, Pane, Region, ScrollRegion};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use uuid::Uuid;
+
+const SCROLL_STEP: usize = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -598,7 +601,6 @@ async fn run(
                 }
             }
             Event::Mouse(mouse) => {
-                use dd_ftp_ui::{hit_test, Region, Pane, ScrollRegion};
                 let (mx, my) = (mouse.column, mouse.row);
                 match mouse.kind {
                     MouseEventKind::Moved => {
@@ -607,27 +609,32 @@ async fn run(
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                         match hit_test(&app_layout, mx, my) {
-                            Some(Region::List(pane)) => {
-                                app.focus = match pane {
-                                    Pane::Local => FocusPane::Local,
-                                    Pane::Remote => FocusPane::Remote,
-                                };
-                                for _ in 0..3 {
+                            Some(Region::List(Pane::Local))
+                            | Some(Region::Scrollbar(ScrollRegion::ListLocal)) => {
+                                app.focus = FocusPane::Local;
+                                for _ in 0..SCROLL_STEP {
+                                    reduce(app, if up { Action::SelectUp } else { Action::SelectDown });
+                                }
+                            }
+                            Some(Region::List(Pane::Remote))
+                            | Some(Region::Scrollbar(ScrollRegion::ListRemote)) => {
+                                app.focus = FocusPane::Remote;
+                                for _ in 0..SCROLL_STEP {
                                     reduce(app, if up { Action::SelectUp } else { Action::SelectDown });
                                 }
                             }
                             Some(Region::Scrollbar(ScrollRegion::Queue)) => {
                                 app.queue_scroll = if up {
-                                    app.queue_scroll.saturating_sub(3)
+                                    app.queue_scroll.saturating_sub(SCROLL_STEP)
                                 } else {
-                                    app.queue_scroll.saturating_add(3)
+                                    app.queue_scroll.saturating_add(SCROLL_STEP)
                                 };
                             }
                             Some(Region::Scrollbar(ScrollRegion::Help)) => {
                                 app.help_scroll = if up {
-                                    app.help_scroll.saturating_sub(3)
+                                    app.help_scroll.saturating_sub(SCROLL_STEP)
                                 } else {
-                                    app.help_scroll.saturating_add(3)
+                                    app.help_scroll.saturating_add(SCROLL_STEP)
                                 };
                             }
                             _ => {}

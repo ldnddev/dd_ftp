@@ -5,7 +5,7 @@ use std::{
         Arc,
     },
     path::Path,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc;
@@ -21,7 +21,7 @@ use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDi
 use dd_ftp_ftp::{FtpVariant, UnifiedFtpSession};
 use dd_ftp_protocols::SftpSession;
 use dd_ftp_storage::{SecretStore, SiteManager};
-use dd_ftp_ui::{hit_test, Pane, Region, ScrollRegion};
+use dd_ftp_ui::{hit_test, ControlId, Pane, Region, ScrollRegion};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use uuid::Uuid;
 
@@ -80,6 +80,7 @@ async fn run(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut last_click: Option<(u16, u16, Instant)> = None;
 
     loop {
         app.expire_toast();
@@ -636,6 +637,64 @@ async fn run(
                                 } else {
                                     app.help_scroll.saturating_add(SCROLL_STEP)
                                 };
+                            }
+                            _ => {}
+                        }
+                    }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        let now = Instant::now();
+                        let is_double = last_click
+                            .map(|(lx, ly, t)| {
+                                lx == mx && ly == my && now.duration_since(t) < Duration::from_millis(300)
+                            })
+                            .unwrap_or(false);
+                        last_click = Some((mx, my, now));
+                        match hit_test(&app_layout, mx, my) {
+                            Some(Region::List(pane)) => {
+                                app.focus = match pane {
+                                    Pane::Local => FocusPane::Local,
+                                    Pane::Remote => FocusPane::Remote,
+                                };
+                                let (list_rect, offset, len) = match pane {
+                                    Pane::Local => (
+                                        app_layout.local_list,
+                                        app_layout.local_list_offset,
+                                        app.local_entries.len(),
+                                    ),
+                                    Pane::Remote => (
+                                        app_layout.remote_list,
+                                        app_layout.remote_list_offset,
+                                        app.remote_entries.len(),
+                                    ),
+                                };
+                                let content_top = list_rect.y + 1; // top border
+                                if my >= content_top {
+                                    let row = (my - content_top) as usize;
+                                    let idx = offset + row;
+                                    if idx < len {
+                                        match pane {
+                                            Pane::Local => app.selected_local = idx,
+                                            Pane::Remote => app.selected_remote = idx,
+                                        }
+                                        if is_double {
+                                            navigate_into_directory(app, session).await;
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Region::Control(ControlId::QcProtocol)) => {
+                                reduce(app, Action::QuickConnectSetProtocolNext);
+                            }
+                            Some(Region::Control(ControlId::BookmarkRow(i))) => {
+                                app.selected_bookmark = i.min(app.bookmarks.len().saturating_sub(1));
+                                if is_double {
+                                    if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
+                                        let bm = hydrate_password_from_keyring(app, bm, "bookmark-load");
+                                        reduce(app, Action::QuickConnectSetFromBookmark(bm));
+                                        reduce(app, Action::ToggleBookmarks);
+                                        reduce(app, Action::ToggleQuickConnect);
+                                    }
+                                }
                             }
                             _ => {}
                         }

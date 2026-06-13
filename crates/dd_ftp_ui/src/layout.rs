@@ -44,6 +44,8 @@ pub struct LayoutMap {
     pub help: Option<Rect>,
     pub fields: Vec<FieldRegion>,
     pub controls: Vec<ControlRegion>,
+    pub local_list_offset: usize,
+    pub remote_list_offset: usize,
 }
 
 fn contains(r: Rect, x: u16, y: u16) -> bool {

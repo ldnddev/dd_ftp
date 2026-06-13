@@ -256,7 +256,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     remote_state.select(Some(app.selected_remote));
 
     frame.render_stateful_widget(local, panes[0], &mut local_state);
+    map.local_list_offset = local_state.offset();
     frame.render_stateful_widget(remote, panes[1], &mut remote_state);
+    map.remote_list_offset = remote_state.offset();
 
     render_scrollbar(
         frame,

@@ -16,7 +16,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dd_ftp_app::{reduce, Action, AppState, FocusPane};
+use dd_ftp_app::{reduce, Action, AppState, FocusPane, QuickConnectField};
 use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob};
 use dd_ftp_ftp::{FtpVariant, UnifiedFtpSession};
 use dd_ftp_protocols::SftpSession;
@@ -317,6 +317,28 @@ async fn run(
                                 }
                             }
                         }
+                        KeyCode::Left => {
+                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                            app.prompt_value.move_cursor(-1, shift);
+                        }
+                        KeyCode::Right => {
+                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                            app.prompt_value.move_cursor(1, shift);
+                        }
+                        KeyCode::Home => {
+                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                            app.prompt_value.move_home(shift);
+                        }
+                        KeyCode::End => {
+                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                            app.prompt_value.move_end(shift);
+                        }
+                        KeyCode::Delete => {
+                            app.prompt_value.delete();
+                        }
+                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.prompt_value.delete_word_left();
+                        }
                         KeyCode::Backspace => reduce(app, Action::PromptBackspace),
                         KeyCode::Char(ch) => reduce(app, Action::PromptInput(ch)),
                         _ => {}
@@ -369,8 +391,34 @@ async fn run(
                         KeyCode::Esc => reduce(app, Action::ToggleQuickConnect),
                         KeyCode::Tab => reduce(app, Action::QuickConnectNextField),
                         KeyCode::BackTab => reduce(app, Action::QuickConnectPrevField),
-                        KeyCode::Left => reduce(app, Action::QuickConnectSetProtocolPrev),
-                        KeyCode::Right => reduce(app, Action::QuickConnectSetProtocolNext),
+                        KeyCode::Left => {
+                            if app.quick_connect_field == QuickConnectField::Protocol {
+                                reduce(app, Action::QuickConnectSetProtocolPrev);
+                            } else {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                reduce(app, Action::QuickConnectMoveCursor { dir: -1, shift });
+                            }
+                        }
+                        KeyCode::Right => {
+                            if app.quick_connect_field == QuickConnectField::Protocol {
+                                reduce(app, Action::QuickConnectSetProtocolNext);
+                            } else {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                reduce(app, Action::QuickConnectMoveCursor { dir: 1, shift });
+                            }
+                        }
+                        KeyCode::Home => {
+                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                            app.qc_field.move_home(shift);
+                        }
+                        KeyCode::End => {
+                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                            app.qc_field.move_end(shift);
+                        }
+                        KeyCode::Delete => {
+                            app.qc_field.delete();
+                            app.qc_flush();
+                        }
                         KeyCode::Backspace => reduce(app, Action::QuickConnectBackspace),
                         KeyCode::Enter => {
                             let mut info = app.quick_connect.clone();
@@ -386,6 +434,10 @@ async fn run(
                             }
                             connect_with_info(app, session, info).await;
                             reduce(app, Action::ToggleQuickConnect);
+                        }
+                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.qc_field.delete_word_left();
+                            app.qc_flush();
                         }
                         KeyCode::Char('s')
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>

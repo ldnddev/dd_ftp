@@ -21,7 +21,7 @@ use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDi
 use dd_ftp_ftp::{FtpVariant, UnifiedFtpSession};
 use dd_ftp_protocols::SftpSession;
 use dd_ftp_storage::{SecretStore, SiteManager};
-use dd_ftp_ui::{hit_test, ControlId, Pane, Region, ScrollRegion};
+use dd_ftp_ui::{hit_test, ControlId, FieldId, Pane, Region, ScrollRegion};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use uuid::Uuid;
 
@@ -84,6 +84,7 @@ async fn run(
     let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
     let mut last_click: Option<(u16, u16, Instant)> = None;
     let mut drag: Option<dd_ftp_ui::ScrollRegion> = None;
+    let mut drag_field: Option<dd_ftp_ui::FieldId> = None;
 
     loop {
         app.expire_toast();
@@ -767,6 +768,28 @@ async fn run(
                                     apply_scrollbar_drag(app, &app_layout, sr, my);
                                 }
                             }
+                            Some(Region::Field(fid)) => {
+                                if let Some(fr) = app_layout.fields.iter().find(|f| f.id == fid).copied() {
+                                    match fid {
+                                        FieldId::Prompt => {
+                                            let len = app.prompt_value.len();
+                                            let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                            app.prompt_value.begin_drag(idx);
+                                            drag_field = Some(fid);
+                                        }
+                                        _ => {
+                                            if let Some(qf) = qc_field_for(fid) {
+                                                app.quick_connect_field = qf;
+                                                reduce(app, Action::QuickConnectSyncField);
+                                                let len = app.qc_field.len();
+                                                let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                                reduce(app, Action::QuickConnectBeginSelect(idx));
+                                                drag_field = Some(fid);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -774,9 +797,26 @@ async fn run(
                         if let Some(sr) = drag {
                             apply_scrollbar_drag(app, &app_layout, sr, my);
                         }
+                        if let Some(fid) = drag_field {
+                            if let Some(fr) = app_layout.fields.iter().find(|f| f.id == fid).copied() {
+                                match fid {
+                                    FieldId::Prompt => {
+                                        let len = app.prompt_value.len();
+                                        let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                        app.prompt_value.extend_drag(idx);
+                                    }
+                                    _ => {
+                                        let len = app.qc_field.len();
+                                        let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                        reduce(app, Action::QuickConnectExtendSelect(idx));
+                                    }
+                                }
+                            }
+                        }
                     }
                     MouseEventKind::Up(_) => {
                         drag = None;
+                        drag_field = None;
                     }
                     _ => {}
                 }
@@ -785,6 +825,20 @@ async fn run(
         }
     }
 }
+}
+
+fn qc_field_for(fid: dd_ftp_ui::FieldId) -> Option<QuickConnectField> {
+    use dd_ftp_ui::FieldId::*;
+    Some(match fid {
+        QcName => QuickConnectField::Name,
+        QcHost => QuickConnectField::Host,
+        QcPort => QuickConnectField::Port,
+        QcUsername => QuickConnectField::Username,
+        QcPassword => QuickConnectField::Password,
+        QcPrivateKey => QuickConnectField::PrivateKey,
+        QcPath => QuickConnectField::Path,
+        Prompt => return None,
+    })
 }
 
 fn apply_scrollbar_drag(

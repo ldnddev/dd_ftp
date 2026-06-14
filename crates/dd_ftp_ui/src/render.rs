@@ -14,6 +14,33 @@ use ratatui::{
 use crate::layout::{ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap};
 use crate::theme::{load_theme_with_source, Theme};
 
+fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec<Span<'static>> {
+    let display: Vec<char> = if masked {
+        std::iter::repeat_n('*', tf.len()).collect()
+    } else {
+        tf.value.chars().collect()
+    };
+    let sel = tf.selected_range();
+    let cursor_style = Style::default().fg(t.cursor).add_modifier(Modifier::RAPID_BLINK);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, ch) in display.iter().enumerate() {
+        if i == tf.cursor {
+            spans.push(Span::styled("█".to_string(), cursor_style));
+        }
+        let selected = sel.is_some_and(|(lo, hi)| i >= lo && i < hi);
+        let style = if selected {
+            Style::default().fg(t.input_text_focus).bg(t.selection)
+        } else {
+            Style::default().fg(t.input_text_focus)
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    if tf.cursor >= display.len() {
+        spans.push(Span::styled("█".to_string(), cursor_style));
+    }
+    spans
+}
+
 pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     *map = LayoutMap::default();
     let loaded = load_theme_with_source();
@@ -641,15 +668,14 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     t.input_text_default
                 };
 
-                let input_content = if focused {
+                let input_content = if focused && *field != QuickConnectField::Protocol {
+                    let masked = *field == QuickConnectField::Password;
+                    Line::from(render_field_line(&app.qc_field, masked, &t))
+                } else if focused {
+                    // Protocol focused: show its value with a trailing caret as before
                     Line::from(vec![
                         Span::styled(value.clone(), Style::default().fg(text_color)),
-                        Span::styled(
-                            "█",
-                            Style::default()
-                                .fg(t.cursor)
-                                .add_modifier(Modifier::RAPID_BLINK),
-                        ),
+                        Span::styled("█".to_string(), Style::default().fg(t.cursor).add_modifier(Modifier::RAPID_BLINK)),
                     ])
                 } else {
                     Line::from(Span::styled(value.clone(), Style::default().fg(text_color)))
@@ -773,7 +799,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         // rows for very long names; this is the accepted single-line approximation.
         if !app.bookmarks.is_empty() {
             for i in 0..app.bookmarks.len() {
-                let y = area.y + 3 + i as u16;
+                let y = area.y.saturating_add(3 + i as u16);
                 if y < area.y + area.height.saturating_sub(1) {
                     map.controls.push(ControlRegion {
                         id: ControlId::BookmarkRow(i),
@@ -884,16 +910,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(t.input_text_focus)),
-            Span::styled(&app.prompt_value.value, Style::default().fg(t.input_text_focus)),
-            Span::styled(
-                "█",
-                Style::default()
-                    .fg(t.cursor)
-                    .add_modifier(Modifier::RAPID_BLINK),
-            ),
-        ]));
+        let mut prompt_spans = vec![Span::styled("> ", Style::default().fg(t.input_text_focus))];
+        prompt_spans.extend(render_field_line(&app.prompt_value, false, &t));
+        lines.push(Line::from(prompt_spans));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "Enter to confirm | Esc to cancel",
@@ -921,9 +940,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         let input_line_offset =
             1 /* message */ + if has_target_line { 1 } else { 0 } + 1 /* blank */;
         let prompt_input_area = Rect {
-            x: area.x + 3,
+            x: area.x + 1,
             y: area.y + 1 + input_line_offset as u16,
-            width: area.width.saturating_sub(4),
+            width: area.width.saturating_sub(2),
             height: 1,
         };
         map.fields.push(FieldRegion {

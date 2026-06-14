@@ -52,6 +52,7 @@ colors:
   input_text_default: "#F5F6F7"
   input_text_focus: "#64B4F5"
   cursor: "#64B4F5"
+  selection: "#64B4F5"
 
   success: "#82e0aa"
   warning: "#f5c469"
@@ -119,6 +120,8 @@ Each editable field must have a bordered input box:
     - Active/selected/focused input border
 - `cursor`
     - Cursor color
+- `selection`
+    - Background highlight for selected text ranges in input fields
 
 ### 6) Scrollbars
 

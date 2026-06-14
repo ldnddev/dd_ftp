@@ -886,7 +886,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("> ", Style::default().fg(t.input_text_focus)),
-            Span::styled(&app.prompt_value, Style::default().fg(t.input_text_focus)),
+            Span::styled(&app.prompt_value.value, Style::default().fg(t.input_text_focus)),
             Span::styled(
                 "█",
                 Style::default()

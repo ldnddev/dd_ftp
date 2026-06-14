@@ -1,4 +1,4 @@
-use crate::{Action, AppState, FocusPane, PromptType, QuickConnectField, Toast};
+use crate::{Action, AppState, FocusPane, PromptType, QuickConnectField, TextField, Toast};
 use dd_ftp_core::Protocol;
 
 pub fn reduce(state: &mut AppState, action: Action) {
@@ -308,38 +308,38 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ShowCreatePrompt => {
             state.show_prompt = true;
             state.prompt_type = Some(PromptType::CreateFile);
-            state.prompt_value.clear();
+            state.prompt_value = TextField::default();
             state.prompt_target = None;
         }
         Action::ShowRenamePrompt => {
             state.show_prompt = true;
             state.prompt_type = Some(PromptType::Rename);
-            state.prompt_value.clear();
+            state.prompt_value = TextField::default();
             // Target will be set based on current selection
             state.prompt_target = None;
         }
         Action::ShowDeletePrompt => {
             state.show_prompt = true;
             state.prompt_type = Some(PromptType::Delete);
-            state.prompt_value.clear();
+            state.prompt_value = TextField::default();
             state.prompt_target = None;
         }
         Action::PromptInput(ch) => {
-            state.prompt_value.push(ch);
+            state.prompt_value.insert_char(ch);
         }
         Action::PromptBackspace => {
-            state.prompt_value.pop();
+            state.prompt_value.backspace();
         }
         Action::ConfirmPrompt => {
             state.show_prompt = false;
             state.prompt_type = None;
-            state.prompt_value.clear();
+            state.prompt_value = TextField::default();
             state.prompt_target = None;
         }
         Action::CancelPrompt => {
             state.show_prompt = false;
             state.prompt_type = None;
-            state.prompt_value.clear();
+            state.prompt_value = TextField::default();
             state.prompt_target = None;
         }
         Action::CreateFile(_)
@@ -348,5 +348,21 @@ pub fn reduce(state: &mut AppState, action: Action) {
         | Action::DeleteItem(_) => {
             // These are handled by the main loop, not the reducer
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+    use crate::AppState;
+
+    #[test]
+    fn prompt_input_inserts_at_cursor() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ShowCreatePrompt);
+        reduce(&mut s, Action::PromptInput('a'));
+        reduce(&mut s, Action::PromptInput('b'));
+        assert_eq!(s.prompt_value.value, "ab");
+        assert_eq!(s.prompt_value.cursor, 2);
     }
 }

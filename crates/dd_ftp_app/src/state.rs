@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use dd_ftp_core::{ConnectionInfo, FileEntry};
 use dd_ftp_transfer::TransferQueue;
 
-use crate::Toast;
+use crate::{TextField, Toast};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
@@ -79,7 +79,7 @@ pub struct AppState {
     pub show_compare: bool,
     pub show_prompt: bool,
     pub prompt_type: Option<PromptType>,
-    pub prompt_value: String,
+    pub prompt_value: TextField,
     pub prompt_target: Option<String>,
     pub filter_pattern: String,
     pub mouse_pos: Option<(u16, u16)>,
@@ -136,7 +136,7 @@ impl Default for AppState {
             show_compare: false,
             show_prompt: false,
             prompt_type: None,
-            prompt_value: String::new(),
+            prompt_value: TextField::default(),
             prompt_target: None,
             filter_pattern: String::new(),
             mouse_pos: None,

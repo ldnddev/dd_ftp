@@ -284,17 +284,17 @@ async fn run(
                             if let Some(prompt_type) = app.prompt_type {
                                 match prompt_type {
                                     dd_ftp_app::PromptType::CreateFile => {
-                                        let name = app.prompt_value.clone();
+                                        let name = app.prompt_value.value.clone();
                                         reduce(app, Action::ConfirmPrompt);
                                         create_file(app, session, &name).await;
                                     }
                                     dd_ftp_app::PromptType::CreateFolder => {
-                                        let name = app.prompt_value.clone();
+                                        let name = app.prompt_value.value.clone();
                                         reduce(app, Action::ConfirmPrompt);
                                         create_folder(app, session, &name).await;
                                     }
                                     dd_ftp_app::PromptType::Rename => {
-                                        let new_name = app.prompt_value.clone();
+                                        let new_name = app.prompt_value.value.clone();
                                         let target = app.prompt_target.clone();
                                         reduce(app, Action::ConfirmPrompt);
                                         if let Some(t) = target {
@@ -302,7 +302,7 @@ async fn run(
                                         }
                                     }
                                     dd_ftp_app::PromptType::Delete => {
-                                        if app.prompt_value.to_lowercase() == "y" {
+                                        if app.prompt_value.value.to_lowercase() == "y" {
                                             let target = app.prompt_target.clone();
                                             reduce(app, Action::ConfirmPrompt);
                                             if let Some(t) = target {
@@ -346,7 +346,7 @@ async fn run(
                     reduce(app, Action::ShowRenamePrompt);
                     if let Some(entry) = get_selected_entry(app) {
                         app.prompt_target = Some(entry.path.clone());
-                        app.prompt_value = entry.name.clone();
+                        app.prompt_value = dd_ftp_app::TextField::from_str(&entry.name);
                     }
                     continue;
                 }

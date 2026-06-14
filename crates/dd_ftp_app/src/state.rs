@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use dd_ftp_core::{ConnectionInfo, FileEntry};
 use dd_ftp_transfer::TransferQueue;
 
@@ -85,7 +83,7 @@ pub struct AppState {
     pub mouse_pos: Option<(u16, u16)>,
     pub quick_connect: ConnectionInfo,
     pub quick_connect_field: QuickConnectField,
-    pub quick_connect_dirty_fields: HashSet<QuickConnectField>,
+    pub qc_field: TextField,
     pub worker_running: bool,
     pub worker_active_count: usize,
     pub worker_max_concurrency: usize,
@@ -104,6 +102,39 @@ impl AppState {
     pub fn expire_toast(&mut self) {
         if self.toast.as_ref().is_some_and(Toast::is_expired) {
             self.toast = None;
+        }
+    }
+
+    pub fn qc_active_value(&self) -> String {
+        use crate::QuickConnectField as F;
+        match self.quick_connect_field {
+            F::Name => self.quick_connect.name.clone(),
+            F::Host => self.quick_connect.host.clone(),
+            F::Port => self.quick_connect.port.to_string(),
+            F::Username => self.quick_connect.username.clone(),
+            F::Password => self.quick_connect.password.clone().unwrap_or_default(),
+            F::PrivateKey => self.quick_connect.private_key.clone().unwrap_or_default(),
+            F::Path => self.quick_connect.initial_path.clone(),
+            F::Protocol => String::new(),
+        }
+    }
+
+    pub fn qc_hydrate(&mut self) {
+        self.qc_field = TextField::from_str(&self.qc_active_value());
+    }
+
+    pub fn qc_flush(&mut self) {
+        use crate::QuickConnectField as F;
+        let v = self.qc_field.value.clone();
+        match self.quick_connect_field {
+            F::Name => self.quick_connect.name = v,
+            F::Host => self.quick_connect.host = v,
+            F::Port => self.quick_connect.port = v.parse().unwrap_or(0),
+            F::Username => self.quick_connect.username = v,
+            F::Password => self.quick_connect.password = Some(v),
+            F::PrivateKey => self.quick_connect.private_key = Some(v),
+            F::Path => self.quick_connect.initial_path = v,
+            F::Protocol => {}
         }
     }
 
@@ -142,7 +173,7 @@ impl Default for AppState {
             mouse_pos: None,
             quick_connect: ConnectionInfo::default(),
             quick_connect_field: QuickConnectField::Name,
-            quick_connect_dirty_fields: HashSet::new(),
+            qc_field: TextField::default(),
             worker_running: false,
             worker_active_count: 0,
             worker_max_concurrency: 2,

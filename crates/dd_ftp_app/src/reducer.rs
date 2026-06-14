@@ -57,7 +57,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             if state.show_quick_connect {
                 state.show_bookmarks = false;
                 state.quick_connect_field = QuickConnectField::Name;
-                state.quick_connect_dirty_fields.clear();
+                state.qc_hydrate();
             }
         }
         Action::ToggleBookmarks => {
@@ -68,98 +68,36 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::QuickConnectNextField => {
             state.quick_connect_field = state.quick_connect_field.next();
+            state.qc_hydrate();
         }
         Action::QuickConnectPrevField => {
             state.quick_connect_field = state.quick_connect_field.prev();
+            state.qc_hydrate();
         }
         Action::QuickConnectInput(ch) => {
-            let field = state.quick_connect_field;
-            if !state.quick_connect_dirty_fields.contains(&field) {
-                match field {
-                    QuickConnectField::Name => state.quick_connect.name.clear(),
-                    QuickConnectField::Host => state.quick_connect.host.clear(),
-                    QuickConnectField::Port => state.quick_connect.port = 0,
-                    QuickConnectField::Username => state.quick_connect.username.clear(),
-                    QuickConnectField::Password => {
-                        state.quick_connect.password = Some(String::new())
-                    }
-                    QuickConnectField::PrivateKey => {
-                        state.quick_connect.private_key = Some(String::new())
-                    }
-                    QuickConnectField::Protocol => {}
-                    QuickConnectField::Path => state.quick_connect.initial_path.clear(),
-                }
-                state.quick_connect_dirty_fields.insert(field);
-            }
-            match field {
-                QuickConnectField::Name => state.quick_connect.name.push(ch),
-                QuickConnectField::Host => state.quick_connect.host.push(ch),
-                QuickConnectField::Port => {
-                    if ch.is_ascii_digit() {
-                        let mut s = state.quick_connect.port.to_string();
-                        if s == "0" {
-                            s.clear();
-                        }
-                        s.push(ch);
-                        if let Ok(p) = s.parse::<u16>() {
-                            state.quick_connect.port = p;
-                        }
-                    }
-                }
-                QuickConnectField::Username => state.quick_connect.username.push(ch),
-                QuickConnectField::Password => {
-                    let mut pw = state.quick_connect.password.clone().unwrap_or_default();
-                    pw.push(ch);
-                    state.quick_connect.password = Some(pw);
-                }
-                QuickConnectField::PrivateKey => {
-                    let mut key = state.quick_connect.private_key.clone().unwrap_or_default();
-                    key.push(ch);
-                    state.quick_connect.private_key = Some(key);
-                }
-                QuickConnectField::Protocol => {}
-                QuickConnectField::Path => state.quick_connect.initial_path.push(ch),
+            if state.quick_connect_field != QuickConnectField::Port || ch.is_ascii_digit() {
+                state.qc_field.insert_char(ch);
+                state.qc_flush();
             }
         }
         Action::QuickConnectBackspace => {
-            let field = state.quick_connect_field;
-            if !state.quick_connect_dirty_fields.contains(&field) {
-                state.quick_connect_dirty_fields.insert(field);
-            }
-            match field {
-                QuickConnectField::Name => {
-                    state.quick_connect.name.pop();
-                }
-                QuickConnectField::Host => {
-                    state.quick_connect.host.pop();
-                }
-                QuickConnectField::Port => {
-                    let mut s = state.quick_connect.port.to_string();
-                    s.pop();
-                    state.quick_connect.port = if s.is_empty() {
-                        0
-                    } else {
-                        s.parse::<u16>().unwrap_or(state.quick_connect.port)
-                    };
-                }
-                QuickConnectField::Username => {
-                    state.quick_connect.username.pop();
-                }
-                QuickConnectField::Password => {
-                    let mut pw = state.quick_connect.password.clone().unwrap_or_default();
-                    pw.pop();
-                    state.quick_connect.password = Some(pw);
-                }
-                QuickConnectField::PrivateKey => {
-                    let mut key = state.quick_connect.private_key.clone().unwrap_or_default();
-                    key.pop();
-                    state.quick_connect.private_key = Some(key);
-                }
-                QuickConnectField::Protocol => {}
-                QuickConnectField::Path => {
-                    state.quick_connect.initial_path.pop();
-                }
-            }
+            state.qc_field.backspace();
+            state.qc_flush();
+        }
+        Action::QuickConnectSyncField => {
+            state.qc_hydrate();
+        }
+        Action::QuickConnectSetCursor(i) => {
+            state.qc_field.set_cursor(i);
+        }
+        Action::QuickConnectBeginSelect(i) => {
+            state.qc_field.begin_drag(i);
+        }
+        Action::QuickConnectExtendSelect(i) => {
+            state.qc_field.extend_drag(i);
+        }
+        Action::QuickConnectMoveCursor { dir, shift } => {
+            state.qc_field.move_cursor(dir, shift);
         }
         Action::QuickConnectSetProtocolNext => {
             state.quick_connect.protocol = match state.quick_connect.protocol {
@@ -178,6 +116,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::QuickConnectSetFromBookmark(info) => {
             state.quick_connect = info;
             state.quick_connect_field = QuickConnectField::Name;
+            state.qc_hydrate();
             state.status = "Loaded bookmark into quick connect".to_string();
         }
         Action::QueueTransfer(job) => {
@@ -348,6 +287,34 @@ pub fn reduce(state: &mut AppState, action: Action) {
         | Action::DeleteItem(_) => {
             // These are handled by the main loop, not the reducer
         }
+    }
+}
+
+#[cfg(test)]
+mod qc_tests {
+    use super::*;
+    use crate::{AppState, QuickConnectField};
+
+    #[test]
+    fn qc_field_change_hydrates_text_field() {
+        let mut s = AppState::default();
+        s.quick_connect.host = "example.com".into();
+        s.quick_connect_field = QuickConnectField::Host;
+        reduce(&mut s, Action::QuickConnectSyncField); // hydrate active field
+        assert_eq!(s.qc_field.value, "example.com");
+        assert_eq!(s.qc_field.cursor, 11);
+    }
+
+    #[test]
+    fn qc_backspace_with_selection_clears_field() {
+        let mut s = AppState::default();
+        s.quick_connect.host = "abc".into();
+        s.quick_connect_field = QuickConnectField::Host;
+        reduce(&mut s, Action::QuickConnectSyncField);
+        s.qc_field.anchor = Some(0);
+        s.qc_field.cursor = 3; // whole value selected
+        reduce(&mut s, Action::QuickConnectBackspace);
+        assert_eq!(s.quick_connect.host, "");
     }
 }
 

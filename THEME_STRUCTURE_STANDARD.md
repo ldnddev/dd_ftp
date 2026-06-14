@@ -52,7 +52,7 @@ colors:
   input_text_default: "#F5F6F7"
   input_text_focus: "#64B4F5"
   cursor: "#64B4F5"
-  selection: "#64B4F5"
+  selection: "#2060A0"
 
   success: "#82e0aa"
   warning: "#f5c469"

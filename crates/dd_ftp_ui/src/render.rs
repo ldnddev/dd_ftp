@@ -21,22 +21,25 @@ fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec
         tf.value.chars().collect()
     };
     let sel = tf.selected_range();
-    let cursor_style = Style::default().fg(t.cursor).add_modifier(Modifier::RAPID_BLINK);
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, ch) in display.iter().enumerate() {
-        if i == tf.cursor {
-            spans.push(Span::styled("█".to_string(), cursor_style));
-        }
         let selected = sel.is_some_and(|(lo, hi)| i >= lo && i < hi);
-        let style = if selected {
+        let mut style = if selected {
             Style::default().fg(t.input_text_focus).bg(t.selection)
         } else {
             Style::default().fg(t.input_text_focus)
         };
+        if i == tf.cursor {
+            // block caret over this char: no extra column, so hit-testing stays aligned
+            style = style.add_modifier(Modifier::REVERSED).add_modifier(Modifier::RAPID_BLINK);
+        }
         spans.push(Span::styled(ch.to_string(), style));
     }
     if tf.cursor >= display.len() {
-        spans.push(Span::styled("█".to_string(), cursor_style));
+        spans.push(Span::styled(
+            "█".to_string(),
+            Style::default().fg(t.cursor).add_modifier(Modifier::RAPID_BLINK),
+        ));
     }
     spans
 }
@@ -945,6 +948,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             width: area.width.saturating_sub(2),
             height: 1,
         };
+        // hitbox starts at the modal inner edge (area.x+1); text_x adds the 2-col "> " prefix
         map.fields.push(FieldRegion {
             id: FieldId::Prompt,
             area: prompt_input_area,

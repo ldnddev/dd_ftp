@@ -800,16 +800,18 @@ async fn run(
                         if let Some(fid) = drag_field {
                             if let Some(fr) = app_layout.fields.iter().find(|f| f.id == fid).copied() {
                                 match fid {
-                                    FieldId::Prompt => {
+                                    FieldId::Prompt if app.show_prompt => {
                                         let len = app.prompt_value.len();
                                         let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
                                         app.prompt_value.extend_drag(idx);
                                     }
-                                    _ => {
+                                    FieldId::Prompt => {}
+                                    _ if app.show_quick_connect => {
                                         let len = app.qc_field.len();
                                         let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
                                         reduce(app, Action::QuickConnectExtendSelect(idx));
                                     }
+                                    _ => {}
                                 }
                             }
                         }

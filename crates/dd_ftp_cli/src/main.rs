@@ -612,14 +612,18 @@ async fn run(
                         let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                         match hit_test(&app_layout, mx, my) {
                             Some(Region::List(Pane::Local))
-                            | Some(Region::Scrollbar(ScrollRegion::ListLocal)) => {
+                            | Some(Region::Scrollbar(ScrollRegion::ListLocal))
+                                if !app.any_modal_open() =>
+                            {
                                 app.focus = FocusPane::Local;
                                 for _ in 0..SCROLL_STEP {
                                     reduce(app, if up { Action::SelectUp } else { Action::SelectDown });
                                 }
                             }
                             Some(Region::List(Pane::Remote))
-                            | Some(Region::Scrollbar(ScrollRegion::ListRemote)) => {
+                            | Some(Region::Scrollbar(ScrollRegion::ListRemote))
+                                if !app.any_modal_open() =>
+                            {
                                 app.focus = FocusPane::Remote;
                                 for _ in 0..SCROLL_STEP {
                                     reduce(app, if up { Action::SelectUp } else { Action::SelectDown });
@@ -735,7 +739,6 @@ fn apply_scrollbar_drag(
     sr: dd_ftp_ui::ScrollRegion,
     my: u16,
 ) {
-    use dd_ftp_ui::ScrollRegion;
     let track = match sr {
         ScrollRegion::ListLocal => layout.local_scrollbar,
         ScrollRegion::ListRemote => layout.remote_scrollbar,
@@ -761,7 +764,8 @@ fn apply_scrollbar_drag(
             let n = app.queue.pending.len()
                 + app.queue.active.len()
                 + app.queue.completed.len()
-                + app.queue.failed.len();
+                + app.queue.failed.len()
+                + app.queue.cancelled.len();
             app.queue_scroll = (frac * n as f32).round() as usize;
         }
         ScrollRegion::Help => {

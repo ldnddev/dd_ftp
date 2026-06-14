@@ -83,6 +83,10 @@ pub struct AppState {
     pub mouse_pos: Option<(u16, u16)>,
     pub quick_connect: ConnectionInfo,
     pub quick_connect_field: QuickConnectField,
+    /// Derived editing view of the currently focused quick-connect field.
+    /// Invariant: call `qc_hydrate()` before reading and `qc_flush()` after
+    /// mutating, and re-hydrate whenever `quick_connect` or
+    /// `quick_connect_field` is changed directly.
     pub qc_field: TextField,
     pub worker_running: bool,
     pub worker_active_count: usize,

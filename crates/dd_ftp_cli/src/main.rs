@@ -41,6 +41,8 @@ async fn main() -> Result<()> {
         quick_connect: connection_info_from_env(),
         ..Default::default()
     };
+    // Seed the active-field editor from the env-populated connection.
+    app.qc_hydrate();
 
     run_keyring_health_check(&mut app);
 

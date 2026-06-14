@@ -21,7 +21,10 @@ pub enum Action {
     QuickConnectSetCursor(usize),
     QuickConnectBeginSelect(usize),
     QuickConnectExtendSelect(usize),
-    QuickConnectMoveCursor { dir: i32, shift: bool },
+    QuickConnectMoveCursor {
+        dir: i32,
+        shift: bool,
+    },
     QuickConnectSetProtocolNext,
     QuickConnectSetProtocolPrev,
     QuickConnectSetFromBookmark(ConnectionInfo),

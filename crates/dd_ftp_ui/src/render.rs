@@ -31,14 +31,18 @@ fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec
         };
         if i == tf.cursor {
             // block caret over this char: no extra column, so hit-testing stays aligned
-            style = style.add_modifier(Modifier::REVERSED).add_modifier(Modifier::RAPID_BLINK);
+            style = style
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::RAPID_BLINK);
         }
         spans.push(Span::styled(ch.to_string(), style));
     }
     if tf.cursor >= display.len() {
         spans.push(Span::styled(
             "█".to_string(),
-            Style::default().fg(t.cursor).add_modifier(Modifier::RAPID_BLINK),
+            Style::default()
+                .fg(t.cursor)
+                .add_modifier(Modifier::RAPID_BLINK),
         ));
     }
     spans
@@ -308,9 +312,24 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         t.scrollbar_hover,
         app.mouse_pos,
     );
-    map.local_scrollbar = Rect { x: panes[0].x + panes[0].width.saturating_sub(1), y: panes[0].y, width: 1, height: panes[0].height };
-    map.remote_scrollbar = Rect { x: panes[1].x + panes[1].width.saturating_sub(1), y: panes[1].y, width: 1, height: panes[1].height };
-    map.queue_scrollbar = Rect { x: queue_area.x + queue_area.width.saturating_sub(1), y: queue_area.y, width: 1, height: queue_area.height };
+    map.local_scrollbar = Rect {
+        x: panes[0].x + panes[0].width.saturating_sub(1),
+        y: panes[0].y,
+        width: 1,
+        height: panes[0].height,
+    };
+    map.remote_scrollbar = Rect {
+        x: panes[1].x + panes[1].width.saturating_sub(1),
+        y: panes[1].y,
+        width: 1,
+        height: panes[1].height,
+    };
+    map.queue_scrollbar = Rect {
+        x: queue_area.x + queue_area.width.saturating_sub(1),
+        y: queue_area.y,
+        width: 1,
+        height: queue_area.height,
+    };
 
     if app.show_compare {
         render_compare_view(frame, content_area, app, &t);
@@ -678,7 +697,12 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     // Protocol focused: show its value with a trailing caret as before
                     Line::from(vec![
                         Span::styled(value.clone(), Style::default().fg(text_color)),
-                        Span::styled("█".to_string(), Style::default().fg(t.cursor).add_modifier(Modifier::RAPID_BLINK)),
+                        Span::styled(
+                            "█".to_string(),
+                            Style::default()
+                                .fg(t.cursor)
+                                .add_modifier(Modifier::RAPID_BLINK),
+                        ),
                     ])
                 } else {
                     Line::from(Span::styled(value.clone(), Style::default().fg(text_color)))
@@ -701,7 +725,10 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                 let cell = cols[col_idx];
                 match field {
                     QuickConnectField::Protocol => {
-                        map.controls.push(ControlRegion { id: ControlId::QcProtocol, area: cell });
+                        map.controls.push(ControlRegion {
+                            id: ControlId::QcProtocol,
+                            area: cell,
+                        });
                     }
                     other => {
                         let fid = match other {
@@ -714,7 +741,11 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                             QuickConnectField::Path => FieldId::QcPath,
                             QuickConnectField::Protocol => unreachable!(),
                         };
-                        map.fields.push(FieldRegion { id: fid, area: cell, text_x: cell.x + 1 });
+                        map.fields.push(FieldRegion {
+                            id: fid,
+                            area: cell,
+                            text_x: cell.x + 1,
+                        });
                     }
                 }
             }
@@ -806,7 +837,12 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                 if y < area.y + area.height.saturating_sub(1) {
                     map.controls.push(ControlRegion {
                         id: ControlId::BookmarkRow(i),
-                        area: Rect { x: area.x + 1, y, width: area.width.saturating_sub(2), height: 1 },
+                        area: Rect {
+                            x: area.x + 1,
+                            y,
+                            width: area.width.saturating_sub(2),
+                            height: 1,
+                        },
                     });
                 }
             }
@@ -938,8 +974,8 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
 
         frame.render_widget(modal, area);
 
-        let has_target_line = app.prompt_type == Some(dd_ftp_app::PromptType::Delete)
-            && app.prompt_target.is_some();
+        let has_target_line =
+            app.prompt_type == Some(dd_ftp_app::PromptType::Delete) && app.prompt_target.is_some();
         let input_line_offset =
             1 /* message */ + if has_target_line { 1 } else { 0 } + 1 /* blank */;
         let prompt_input_area = Rect {

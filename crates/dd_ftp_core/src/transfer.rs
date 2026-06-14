@@ -33,7 +33,11 @@ pub struct TransferJob {
 }
 
 impl TransferJob {
-    pub fn new(local_path: impl Into<String>, remote_path: impl Into<String>, direction: TransferDirection) -> Self {
+    pub fn new(
+        local_path: impl Into<String>,
+        remote_path: impl Into<String>,
+        direction: TransferDirection,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),

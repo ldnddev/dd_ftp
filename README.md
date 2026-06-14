@@ -89,6 +89,23 @@ export DD_FTP_PATH=/
 - `Ctrl+Alt+e` rename selected item
 - `Ctrl+Delete` delete selected item
 
+### Mouse
+- Scroll wheel over a list, queue, or help region scrolls it (also works over the scrollbar rail)
+- Single-click a file row: focus that pane and select the row
+- Double-click a directory row: enter it
+- Click-drag a list / queue / help scrollbar thumb to scroll
+- Bookmarks modal: single-click selects a bookmark; double-click loads it into quick connect
+- Quick connect: click the Protocol field to cycle SFTP → FTP → FTPS
+- Input fields (quick connect + prompts): click to position the cursor; click-drag to select a range; typing or `Backspace` replaces the selection
+
+### Keyboard field editing (quick-connect fields and prompts)
+- `Left` / `Right` move the cursor one character
+- `Shift+Left` / `Shift+Right` extend the selection
+- `Home` / `End` jump to start / end of the field (`Shift` to extend)
+- `Delete` removes the character at the cursor (or the active selection)
+- `Ctrl+W` deletes the previous word
+- When the Protocol field is focused, `Left` / `Right` cycle the protocol
+
 ## Theme
 
 Theme lookup order:

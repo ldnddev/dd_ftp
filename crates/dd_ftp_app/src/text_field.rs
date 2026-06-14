@@ -2,7 +2,7 @@
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextField {
     pub value: String,
-    pub cursor: usize,        // char index in 0..=len
+    pub cursor: usize,         // char index in 0..=len
     pub anchor: Option<usize>, // Some => active selection between anchor and cursor
 }
 
@@ -11,21 +11,41 @@ impl TextField {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let len = s.chars().count();
-        TextField { value: s.to_string(), cursor: len, anchor: None }
+        TextField {
+            value: s.to_string(),
+            cursor: len,
+            anchor: None,
+        }
     }
 
-    pub fn len(&self) -> usize { self.value.chars().count() }
-    pub fn is_empty(&self) -> bool { self.value.is_empty() }
+    pub fn len(&self) -> usize {
+        self.value.chars().count()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
 
     /// Selection as a half-open char range [start, end), if active and non-empty.
     pub fn selected_range(&self) -> Option<(usize, usize)> {
         let a = self.anchor?;
-        let (lo, hi) = if a <= self.cursor { (a, self.cursor) } else { (self.cursor, a) };
-        if lo == hi { None } else { Some((lo, hi)) }
+        let (lo, hi) = if a <= self.cursor {
+            (a, self.cursor)
+        } else {
+            (self.cursor, a)
+        };
+        if lo == hi {
+            None
+        } else {
+            Some((lo, hi))
+        }
     }
 
     fn byte_at(&self, char_idx: usize) -> usize {
-        self.value.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(self.value.len())
+        self.value
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.value.len())
     }
 
     fn delete_range(&mut self, lo: usize, hi: usize) {
@@ -54,14 +74,18 @@ impl TextField {
     }
 
     pub fn backspace(&mut self) {
-        if self.delete_selection_if_any() { return; }
+        if self.delete_selection_if_any() {
+            return;
+        }
         if self.cursor > 0 {
             self.delete_range(self.cursor - 1, self.cursor);
         }
     }
 
     pub fn delete(&mut self) {
-        if self.delete_selection_if_any() { return; }
+        if self.delete_selection_if_any() {
+            return;
+        }
         if self.cursor < self.len() {
             self.delete_range(self.cursor, self.cursor + 1);
         }
@@ -70,30 +94,53 @@ impl TextField {
     /// dir: -1 left, +1 right. shift extends selection, else collapses it.
     pub fn move_cursor(&mut self, dir: i32, shift: bool) {
         if shift {
-            if self.anchor.is_none() { self.anchor = Some(self.cursor); }
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
         } else {
             self.anchor = None;
         }
-        if dir < 0 { self.cursor = self.cursor.saturating_sub(1); }
-        else if dir > 0 { self.cursor = (self.cursor + 1).min(self.len()); }
+        if dir < 0 {
+            self.cursor = self.cursor.saturating_sub(1);
+        } else if dir > 0 {
+            self.cursor = (self.cursor + 1).min(self.len());
+        }
     }
 
     pub fn move_home(&mut self, shift: bool) {
-        if shift { if self.anchor.is_none() { self.anchor = Some(self.cursor); } } else { self.anchor = None; }
+        if shift {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
         self.cursor = 0;
     }
 
     pub fn move_end(&mut self, shift: bool) {
-        if shift { if self.anchor.is_none() { self.anchor = Some(self.cursor); } } else { self.anchor = None; }
+        if shift {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
         self.cursor = self.len();
     }
 
     pub fn delete_word_left(&mut self) {
-        if self.delete_selection_if_any() { return; }
+        if self.delete_selection_if_any() {
+            return;
+        }
         let chars: Vec<char> = self.value.chars().collect();
         let mut i = self.cursor;
-        while i > 0 && chars[i - 1].is_whitespace() { i -= 1; }
-        while i > 0 && !chars[i - 1].is_whitespace() { i -= 1; }
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
         self.delete_range(i, self.cursor);
     }
 
@@ -118,7 +165,11 @@ mod tests {
     use super::*;
 
     fn tf(s: &str, cursor: usize) -> TextField {
-        TextField { value: s.to_string(), cursor, anchor: None }
+        TextField {
+            value: s.to_string(),
+            cursor,
+            anchor: None,
+        }
     }
 
     #[test]
@@ -139,7 +190,11 @@ mod tests {
 
     #[test]
     fn typing_replaces_active_selection() {
-        let mut f = TextField { value: "hello".into(), cursor: 4, anchor: Some(1) };
+        let mut f = TextField {
+            value: "hello".into(),
+            cursor: 4,
+            anchor: Some(1),
+        };
         f.insert_char('X'); // selection [1,4) = "ell" replaced
         assert_eq!(f.value, "hXo");
         assert_eq!(f.cursor, 2);
@@ -148,7 +203,11 @@ mod tests {
 
     #[test]
     fn backspace_deletes_active_selection() {
-        let mut f = TextField { value: "hello".into(), cursor: 1, anchor: Some(4) };
+        let mut f = TextField {
+            value: "hello".into(),
+            cursor: 1,
+            anchor: Some(4),
+        };
         f.backspace();
         assert_eq!(f.value, "ho");
         assert_eq!(f.cursor, 1);

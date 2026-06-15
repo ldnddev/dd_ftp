@@ -18,7 +18,6 @@ pub enum Action {
     QuickConnectInput(char),
     QuickConnectBackspace,
     QuickConnectSyncField,
-    QuickConnectSetCursor(usize),
     QuickConnectBeginSelect(usize),
     QuickConnectExtendSelect(usize),
     QuickConnectMoveCursor {

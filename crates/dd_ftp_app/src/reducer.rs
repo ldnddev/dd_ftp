@@ -87,9 +87,6 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::QuickConnectSyncField => {
             state.qc_hydrate();
         }
-        Action::QuickConnectSetCursor(i) => {
-            state.qc_field.set_cursor(i);
-        }
         Action::QuickConnectBeginSelect(i) => {
             state.qc_field.begin_drag(i);
         }

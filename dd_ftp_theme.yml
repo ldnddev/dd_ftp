@@ -1,7 +1,15 @@
-# dd_staticbuilder TUI Theme Configuration
-# Based on dd_framework color system
-# Lookup order: ./theme.yml, ./.theme.yml, ~/.config/ldnddev/dd_staticbuilder/.theme.yml
+# dd_ftp TUI Theme Configuration
+# LDNDDEV TUI Visual Standard v1 canonical tokens
+# Lookup order: ./dd_ftp_theme.yml, ~/.config/ldnddev/dd_ftp_theme.yml, built-in defaults
 #
+
+version: 1
+
+# Optional: override the rotating header taglines. If omitted or empty,
+# dd_ftp uses its built-in list (see DEFAULT_HEADER_QUOTES in dd_ftp_app).
+# header_quotes:
+#   - "Your custom tagline here."
+#   - "Another one for variety."
 
 colors:
   # Core backgrounds (dd_framework neutrals dark)

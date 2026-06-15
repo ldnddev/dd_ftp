@@ -65,7 +65,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Length(filter_height),
             Constraint::Min(1),
             Constraint::Length(queue_height),
@@ -93,18 +93,48 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         frame.render_widget(filter, vertical[1]);
     }
 
-    let title_text = match app.focus {
-        FocusPane::Local => "dd_ftp | F1: help | [/] filter | [m] bookmarks | [u] upload",
-        FocusPane::Remote => "dd_ftp | F1: help | [/] filter | [m] bookmarks | [d] download",
-        FocusPane::Queue => "dd_ftp | F1: help | [R] retry [C] cancel [X] clear",
-    };
+    // Header: fixed 3-line bordered shell. Title-left brands the app,
+    // title-right shows live connection state, body line is a random tagline.
+    let conn_label = app
+        .active_connection
+        .as_ref()
+        .map(|c| {
+            if c.name.trim().is_empty() {
+                format!(" {}@{}:{} ", c.username, c.host, c.port)
+            } else {
+                format!(" {} ", c.name)
+            }
+        })
+        .unwrap_or_else(|| " disconnected ".to_string());
 
-    let title = Paragraph::new(title_text).style(
-        Style::default()
-            .fg(t.text_active_focus)
-            .bg(t.base_background),
-    );
-    frame.render_widget(title, vertical[0]);
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border_active))
+        .style(Style::default().bg(t.base_background))
+        .title(Line::from(vec![Span::styled(
+            " dd_ftp ",
+            Style::default()
+                .fg(t.text_active_focus)
+                .add_modifier(Modifier::BOLD),
+        )]))
+        .title_top(
+            Line::from(vec![Span::styled(
+                conn_label,
+                Style::default().fg(if app.connected {
+                    t.success
+                } else {
+                    t.text_secondary
+                }),
+            )])
+            .right_aligned(),
+        );
+    let header = Paragraph::new(Line::from(Span::styled(
+        app.header_copy.as_str(),
+        Style::default().fg(t.text_secondary),
+    )))
+    .block(header_block)
+    .style(Style::default().bg(t.base_background));
+    frame.render_widget(header, vertical[0]);
 
     // Main content background (local/remote/queue region)
     let content_area = vertical[2];
@@ -430,45 +460,41 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         app.mouse_pos,
     );
 
-    let connected_label = app
-        .active_connection
-        .as_ref()
-        .map(|c| {
-            if c.name.trim().is_empty() {
-                format!("site:{}@{}:{}", c.username, c.host, c.port)
-            } else {
-                format!("site:{}", c.name)
-            }
-        })
-        .unwrap_or_else(|| "site:none".to_string());
-
-    let status_text = if app.connected {
-        format!("{} | {}", app.status, connected_label)
+    // Footer: width-adaptive key hints (terse on narrow, full on wide).
+    // Always leads with F1:Help. Connection state lives in the header; the
+    // transient status string is shown right-aligned only when there is room.
+    let keys = if status_area.width < 75 {
+        "F1:Help  Tab:Pane  j/k:Nav  /:Filter  u/d:Xfer  m:Sites  q:Quit"
+    } else if status_area.width < 110 {
+        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u/d: Up/Down   m: Bookmarks   o: Connect   q: Quit"
     } else {
-        format!("{} | site:none", app.status)
+        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   r: Refresh   q: Quit   (mouse: click/scroll/drag)"
     };
+    let footer_keys =
+        Paragraph::new(keys).style(Style::default().fg(t.text_secondary).bg(t.base_background));
+    frame.render_widget(footer_keys, status_area);
 
-    let status_color = if app.status.to_lowercase().contains("failed")
-        || app.status.to_lowercase().contains("error")
-    {
-        t.error
-    } else if app.status.to_lowercase().contains("saved")
-        || app.status.to_lowercase().contains("connected")
-        || app.status.to_lowercase().contains("complete")
-    {
-        t.success
-    } else if app.status.to_lowercase().contains("loading")
-        || app.status.to_lowercase().contains("refresh")
-        || app.status.to_lowercase().contains("processing")
-    {
-        t.info
-    } else {
-        t.warning
-    };
-
-    let status =
-        Paragraph::new(status_text).style(Style::default().fg(status_color).bg(t.base_background));
-    frame.render_widget(status, status_area);
+    // Right-aligned transient status, only when the terminal is wide enough
+    // that it won't collide with the key hints.
+    if status_area.width >= 90 && !app.status.is_empty() {
+        let s = app.status.to_lowercase();
+        let status_color = if s.contains("failed") || s.contains("error") {
+            t.error
+        } else if s.contains("saved") || s.contains("connected") || s.contains("complete") {
+            t.success
+        } else if s.contains("loading") || s.contains("refresh") || s.contains("processing") {
+            t.info
+        } else {
+            t.text_secondary
+        };
+        let status = Paragraph::new(Line::from(Span::styled(
+            format!("{} ", app.status),
+            Style::default().fg(status_color),
+        )))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(t.base_background));
+        frame.render_widget(status, status_area);
+    }
 
     if app.show_help {
         let backdrop = Block::default().style(
@@ -863,15 +889,29 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(built-in defaults)".to_string());
 
-        let lines = vec![
+        let version_str = loaded
+            .version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(none)".to_string());
+
+        let mut lines = vec![
             Line::from(vec![Span::styled(
                 "Theme Debug",
                 Style::default()
                     .fg(t.modal_labels)
                     .add_modifier(Modifier::BOLD),
             )]),
-            Line::from(format!("source: {}", loaded.source.label())),
-            Line::from(format!("path:   {}", p)),
+            Line::from(format!("source:  {}", loaded.source.label())),
+            Line::from(format!("path:    {}", p)),
+            Line::from(format!("version: {}", version_str)),
+        ];
+        if let Some(w) = loaded.warning.as_ref() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("warning: {}", w),
+                Style::default().fg(t.warning),
+            )]));
+        }
+        lines.extend([
             Line::from(""),
             Line::from("color tokens:"),
             Line::from("base_background / body_background / modal_background"),
@@ -888,7 +928,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                 "Press F2 to close",
                 Style::default().fg(t.warning),
             )]),
-        ];
+        ]);
 
         let modal = Paragraph::new(lines)
             .style(Style::default().bg(t.modal_background).fg(t.modal_text))

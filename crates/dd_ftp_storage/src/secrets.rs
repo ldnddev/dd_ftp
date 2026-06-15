@@ -95,7 +95,12 @@ impl SecretStore {
         Ok(())
     }
 
-    pub fn load_password(site_name: &str, username: &str, host: &str, port: u16) -> Result<Option<String>> {
+    pub fn load_password(
+        site_name: &str,
+        username: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<String>> {
         let keys = Self::candidate_keys(site_name, username, host, port);
         let primary_key = keys
             .first()

@@ -50,7 +50,9 @@ impl SftpSession {
             agent
                 .list_identities()
                 .context("failed to list ssh-agent identities")?;
-            let identities = agent.identities().context("failed to read ssh-agent identities")?;
+            let identities = agent
+                .identities()
+                .context("failed to read ssh-agent identities")?;
 
             let mut authed = false;
             for identity in identities {
@@ -86,14 +88,19 @@ impl SftpSession {
 
     fn list_dir_sync(info: &ConnectionInfo, path: &str) -> Result<Vec<FileEntry>> {
         let session = Self::open_authenticated_session(info)?;
-        let sftp = session.sftp().context("failed to initialize sftp subsystem")?;
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
 
         let mut out = Vec::new();
         for (full_path, stat) in sftp
             .readdir(Path::new(path))
             .with_context(|| format!("failed reading remote path: {path}"))?
         {
-            let Some(name) = full_path.file_name().map(|s| s.to_string_lossy().to_string()) else {
+            let Some(name) = full_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+            else {
                 continue;
             };
 
@@ -134,7 +141,9 @@ impl SftpSession {
         F: FnMut(u64, Option<u64>) + Send + 'static,
     {
         let session = Self::open_authenticated_session(info)?;
-        let sftp = session.sftp().context("failed to initialize sftp subsystem")?;
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
 
         let mut local_file = File::open(&job.local_path)
             .with_context(|| format!("cannot open local file: {}", job.local_path))?;
@@ -175,7 +184,9 @@ impl SftpSession {
         F: FnMut(u64, Option<u64>) + Send + 'static,
     {
         let session = Self::open_authenticated_session(info)?;
-        let sftp = session.sftp().context("failed to initialize sftp subsystem")?;
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
 
         let remote_path = Path::new(&job.remote_path);
         let mut remote_file = sftp

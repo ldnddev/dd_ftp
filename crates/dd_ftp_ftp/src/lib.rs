@@ -3,9 +3,7 @@ use std::convert::TryFrom;
 use anyhow::{Context, Result};
 use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, TransferJob};
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio_rustls::rustls::{
-    client::ServerName, ClientConfig, OwnedTrustAnchor, RootCertStore,
-};
+use tokio_rustls::rustls::{client::ServerName, ClientConfig, OwnedTrustAnchor, RootCertStore};
 
 #[derive(Debug, Clone, Copy)]
 pub enum FtpVariant {
@@ -117,7 +115,10 @@ impl UnifiedFtpSession {
     pub async fn list_dir(&mut self, _variant: FtpVariant, path: &str) -> Result<Vec<FileEntry>> {
         let stream = self.stream.as_mut().context("not connected")?;
 
-        stream.cwd(path).await.with_context(|| format!("FTP cwd failed: {path}"))?;
+        stream
+            .cwd(path)
+            .await
+            .with_context(|| format!("FTP cwd failed: {path}"))?;
 
         let entries = stream
             .list(None)

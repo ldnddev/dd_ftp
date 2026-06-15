@@ -1,28 +1,35 @@
 use std::{
     io,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    path::Path,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dd_ftp_app::{reduce, Action, AppState, FocusPane};
-use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob};
-use uuid::Uuid;
+use dd_ftp_app::{reduce, Action, AppState, FocusPane, QuickConnectField};
+use dd_ftp_core::{
+    ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob,
+};
 use dd_ftp_ftp::{FtpVariant, UnifiedFtpSession};
 use dd_ftp_protocols::SftpSession;
 use dd_ftp_storage::{SecretStore, SiteManager};
+use dd_ftp_ui::{hit_test, ControlId, FieldId, Pane, Region, ScrollRegion};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use uuid::Uuid;
+
+const SCROLL_STEP: usize = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,6 +45,8 @@ async fn main() -> Result<()> {
         quick_connect: connection_info_from_env(),
         ..Default::default()
     };
+    // Seed the active-field editor from the env-populated connection.
+    app.qc_hydrate();
 
     run_keyring_health_check(&mut app);
 
@@ -50,7 +59,10 @@ async fn main() -> Result<()> {
     if let Ok(cfg) = SiteManager::load_or_default() {
         if !cfg.sites.is_empty() {
             reduce(&mut app, Action::SetBookmarks(cfg.sites.clone()));
-            let selected_idx = cfg.default_site.unwrap_or(0).min(cfg.sites.len().saturating_sub(1));
+            let selected_idx = cfg
+                .default_site
+                .unwrap_or(0)
+                .min(cfg.sites.len().saturating_sub(1));
             if let Some(selected) = cfg.sites.get(selected_idx) {
                 let selected = hydrate_password_from_keyring(&mut app, selected.clone(), "startup");
                 reduce(&mut app, Action::QuickConnectSetFromBookmark(selected));
@@ -64,7 +76,11 @@ async fn main() -> Result<()> {
     let res = run(&mut terminal, &mut app, &mut session).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     res
@@ -77,10 +93,14 @@ async fn run(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut last_click: Option<(u16, u16, Instant)> = None;
+    let mut drag: Option<dd_ftp_ui::ScrollRegion> = None;
+    let mut drag_field: Option<dd_ftp_ui::FieldId> = None;
 
     loop {
         app.expire_toast();
-        terminal.draw(|f| dd_ftp_ui::render(f, app))?;
+        let mut app_layout = dd_ftp_ui::LayoutMap::default();
+        terminal.draw(|f| dd_ftp_ui::render(f, app, &mut app_layout))?;
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -119,7 +139,13 @@ async fn run(
             app.worker_active_count += 1;
             app.worker_running = true;
             app.worker_cancel_requested = false;
-            reduce(app, Action::SetStatus(format!("Processing {:?}: {}", job.direction, job.remote_path)));
+            reduce(
+                app,
+                Action::SetStatus(format!(
+                    "Processing {:?}: {}",
+                    job.direction, job.remote_path
+                )),
+            );
 
             let mut info = app
                 .active_connection
@@ -127,12 +153,9 @@ async fn run(
                 .unwrap_or_else(connection_info_from_env);
 
             if info.password.is_none() {
-                if let Ok(Some(secret)) = SecretStore::load_password(
-                    &info.name,
-                    &info.username,
-                    &info.host,
-                    info.port,
-                ) {
+                if let Ok(Some(secret)) =
+                    SecretStore::load_password(&info.name, &info.username, &info.host, info.port)
+                {
                     info.password = Some(secret);
                 }
             }
@@ -162,12 +185,20 @@ async fn run(
                                 };
 
                                 match job.direction {
-                                    TransferDirection::Upload => worker_session
-                                        .upload_with_progress(&job, cancel.clone(), progress_tx)
-                                        .await,
-                                    TransferDirection::Download => worker_session
-                                        .download_with_progress(&job, cancel.clone(), progress_tx)
-                                        .await,
+                                    TransferDirection::Upload => {
+                                        worker_session
+                                            .upload_with_progress(&job, cancel.clone(), progress_tx)
+                                            .await
+                                    }
+                                    TransferDirection::Download => {
+                                        worker_session
+                                            .download_with_progress(
+                                                &job,
+                                                cancel.clone(),
+                                                progress_tx,
+                                            )
+                                            .await
+                                    }
                                 }
                             }
                             Err(err) => Err(err),
@@ -219,392 +250,759 @@ async fn run(
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
                 Event::Key(key) => {
-                if !app.any_modal_open()
-                    && key.code == KeyCode::Char('k')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    run_keyring_health_check(app);
-                    continue;
-                }
-
-                if !app.any_modal_open() && key.code == KeyCode::F(1) {
-                    reduce(app, Action::ToggleHelp);
-                    continue;
-                }
-
-                if !app.any_modal_open() && key.code == KeyCode::F(2) {
-                    reduce(app, Action::ToggleThemeDebug);
-                    continue;
-                }
-
-                if !app.any_modal_open() && key.code == KeyCode::Char('/') {
-                    reduce(app, Action::ToggleFilter);
-                    continue;
-                }
-
-                if app.show_help {
-                    match key.code {
-                        KeyCode::Esc => reduce(app, Action::ToggleHelp),
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.help_scroll = app.help_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.help_scroll = app.help_scroll.saturating_add(1);
-                        }
-                        _ => {}
+                    if !app.any_modal_open()
+                        && key.code == KeyCode::Char('k')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        run_keyring_health_check(app);
+                        continue;
                     }
-                    continue;
-                }
 
-                if app.show_filter {
-                    match key.code {
-                        KeyCode::Esc => reduce(app, Action::ToggleFilter),
-                        KeyCode::Backspace => reduce(app, Action::FilterBackspace),
-                        KeyCode::Char(ch) => reduce(app, Action::FilterInput(ch)),
-                        _ => {}
+                    if !app.any_modal_open() && key.code == KeyCode::F(1) {
+                        reduce(app, Action::ToggleHelp);
+                        continue;
                     }
-                    continue;
-                }
 
-                if !app.any_modal_open() && key.code == KeyCode::Char('C') {
-                    reduce(app, Action::ToggleCompare);
-                    continue;
-                }
+                    if !app.any_modal_open() && key.code == KeyCode::F(2) {
+                        reduce(app, Action::ToggleThemeDebug);
+                        continue;
+                    }
 
-                if app.show_prompt {
-                    match key.code {
-                        KeyCode::Esc => reduce(app, Action::CancelPrompt),
-                        KeyCode::Enter => {
-                            if let Some(prompt_type) = app.prompt_type {
-                                match prompt_type {
-                                    dd_ftp_app::PromptType::CreateFile => {
-                                        let name = app.prompt_value.clone();
-                                        reduce(app, Action::ConfirmPrompt);
-                                        create_file(app, session, &name).await;
-                                    }
-                                    dd_ftp_app::PromptType::CreateFolder => {
-                                        let name = app.prompt_value.clone();
-                                        reduce(app, Action::ConfirmPrompt);
-                                        create_folder(app, session, &name).await;
-                                    }
-                                    dd_ftp_app::PromptType::Rename => {
-                                        let new_name = app.prompt_value.clone();
-                                        let target = app.prompt_target.clone();
-                                        reduce(app, Action::ConfirmPrompt);
-                                        if let Some(t) = target {
-                                            rename_item(app, session, &t, &new_name).await;
+                    if !app.any_modal_open() && key.code == KeyCode::Char('/') {
+                        reduce(app, Action::ToggleFilter);
+                        continue;
+                    }
+
+                    if app.show_help {
+                        match key.code {
+                            KeyCode::Esc => reduce(app, Action::ToggleHelp),
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.help_scroll = app.help_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.help_scroll = app.help_scroll.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if app.show_filter {
+                        match key.code {
+                            KeyCode::Esc => reduce(app, Action::ToggleFilter),
+                            KeyCode::Backspace => reduce(app, Action::FilterBackspace),
+                            KeyCode::Char(ch) => reduce(app, Action::FilterInput(ch)),
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if !app.any_modal_open() && key.code == KeyCode::Char('C') {
+                        reduce(app, Action::ToggleCompare);
+                        continue;
+                    }
+
+                    if app.show_prompt {
+                        match key.code {
+                            KeyCode::Esc => reduce(app, Action::CancelPrompt),
+                            KeyCode::Enter => {
+                                if let Some(prompt_type) = app.prompt_type {
+                                    match prompt_type {
+                                        dd_ftp_app::PromptType::CreateFile => {
+                                            let name = app.prompt_value.value.clone();
+                                            reduce(app, Action::ConfirmPrompt);
+                                            create_file(app, session, &name).await;
                                         }
-                                    }
-                                    dd_ftp_app::PromptType::Delete => {
-                                        if app.prompt_value.to_lowercase() == "y" {
+                                        dd_ftp_app::PromptType::CreateFolder => {
+                                            let name = app.prompt_value.value.clone();
+                                            reduce(app, Action::ConfirmPrompt);
+                                            create_folder(app, session, &name).await;
+                                        }
+                                        dd_ftp_app::PromptType::Rename => {
+                                            let new_name = app.prompt_value.value.clone();
                                             let target = app.prompt_target.clone();
                                             reduce(app, Action::ConfirmPrompt);
                                             if let Some(t) = target {
-                                                delete_item(app, session, &t).await;
+                                                rename_item(app, session, &t, &new_name).await;
                                             }
-                                        } else {
-                                            reduce(app, Action::CancelPrompt);
+                                        }
+                                        dd_ftp_app::PromptType::Delete => {
+                                            if app.prompt_value.value.to_lowercase() == "y" {
+                                                let target = app.prompt_target.clone();
+                                                reduce(app, Action::ConfirmPrompt);
+                                                if let Some(t) = target {
+                                                    delete_item(app, session, &t).await;
+                                                }
+                                            } else {
+                                                reduce(app, Action::CancelPrompt);
+                                            }
                                         }
                                     }
                                 }
                             }
+                            KeyCode::Left => {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                app.prompt_value.move_cursor(-1, shift);
+                            }
+                            KeyCode::Right => {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                app.prompt_value.move_cursor(1, shift);
+                            }
+                            KeyCode::Home => {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                app.prompt_value.move_home(shift);
+                            }
+                            KeyCode::End => {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                app.prompt_value.move_end(shift);
+                            }
+                            KeyCode::Delete => {
+                                app.prompt_value.delete();
+                            }
+                            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.prompt_value.delete_word_left();
+                            }
+                            KeyCode::Backspace => reduce(app, Action::PromptBackspace),
+                            KeyCode::Char(ch) => reduce(app, Action::PromptInput(ch)),
+                            _ => {}
                         }
-                        KeyCode::Backspace => reduce(app, Action::PromptBackspace),
-                        KeyCode::Char(ch) => reduce(app, Action::PromptInput(ch)),
-                        _ => {}
+                        continue;
                     }
-                    continue;
-                }
 
-                if !app.any_modal_open()
-                    && key.code == KeyCode::Char('n')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    reduce(app, Action::ShowCreatePrompt);
-                    continue;
-                }
-
-                if !app.any_modal_open()
-                    && key.code == KeyCode::Char('N')
-                    && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                {
-                    reduce(app, Action::ShowCreatePrompt);
-                    app.prompt_type = Some(dd_ftp_app::PromptType::CreateFolder);
-                    continue;
-                }
-
-                if !app.any_modal_open()
-                    && key.code == KeyCode::Char('e')
-                    && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                {
-                    reduce(app, Action::ShowRenamePrompt);
-                    if let Some(entry) = get_selected_entry(app) {
-                        app.prompt_target = Some(entry.path.clone());
-                        app.prompt_value = entry.name.clone();
+                    if !app.any_modal_open()
+                        && key.code == KeyCode::Char('n')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        reduce(app, Action::ShowCreatePrompt);
+                        continue;
                     }
-                    continue;
-                }
 
-                if !app.any_modal_open()
-                    && key.code == KeyCode::Delete
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    reduce(app, Action::ShowDeletePrompt);
-                    if let Some(entry) = get_selected_entry(app) {
-                        app.prompt_target = Some(entry.path.clone());
+                    if !app.any_modal_open()
+                        && key.code == KeyCode::Char('N')
+                        && key
+                            .modifiers
+                            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                    {
+                        reduce(app, Action::ShowCreatePrompt);
+                        app.prompt_type = Some(dd_ftp_app::PromptType::CreateFolder);
+                        continue;
                     }
-                    continue;
-                }
 
-                if app.show_quick_connect {
-                    match key.code {
-                        KeyCode::Esc => reduce(app, Action::ToggleQuickConnect),
-                        KeyCode::Tab => reduce(app, Action::QuickConnectNextField),
-                        KeyCode::BackTab => reduce(app, Action::QuickConnectPrevField),
-                        KeyCode::Left => reduce(app, Action::QuickConnectSetProtocolPrev),
-                        KeyCode::Right => reduce(app, Action::QuickConnectSetProtocolNext),
-                        KeyCode::Backspace => reduce(app, Action::QuickConnectBackspace),
-                        KeyCode::Enter => {
-                            let mut info = app.quick_connect.clone();
-                            if info.password.is_none() {
-                                if let Ok(Some(secret)) = SecretStore::load_password(
-                                    &info.name,
-                                    &info.username,
-                                    &info.host,
-                                    info.port,
-                                ) {
-                                    info.password = Some(secret);
+                    if !app.any_modal_open()
+                        && key.code == KeyCode::Char('e')
+                        && key
+                            .modifiers
+                            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        reduce(app, Action::ShowRenamePrompt);
+                        if let Some(entry) = get_selected_entry(app) {
+                            app.prompt_target = Some(entry.path.clone());
+                            app.prompt_value = dd_ftp_app::TextField::from_str(&entry.name);
+                        }
+                        continue;
+                    }
+
+                    if !app.any_modal_open()
+                        && key.code == KeyCode::Delete
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        reduce(app, Action::ShowDeletePrompt);
+                        if let Some(entry) = get_selected_entry(app) {
+                            app.prompt_target = Some(entry.path.clone());
+                        }
+                        continue;
+                    }
+
+                    if app.show_quick_connect {
+                        match key.code {
+                            KeyCode::Esc => reduce(app, Action::ToggleQuickConnect),
+                            KeyCode::Tab => reduce(app, Action::QuickConnectNextField),
+                            KeyCode::BackTab => reduce(app, Action::QuickConnectPrevField),
+                            KeyCode::Left => {
+                                if app.quick_connect_field == QuickConnectField::Protocol {
+                                    reduce(app, Action::QuickConnectSetProtocolPrev);
+                                } else {
+                                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                    reduce(app, Action::QuickConnectMoveCursor { dir: -1, shift });
                                 }
                             }
-                            connect_with_info(app, session, info).await;
-                            reduce(app, Action::ToggleQuickConnect);
-                        }
-                        KeyCode::Char('s')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            save_quick_connect_bookmark(app);
-                        }
-                        KeyCode::Char(ch) => {
-                            reduce(app, Action::QuickConnectInput(ch));
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                if app.show_bookmarks {
-                    match key.code {
-                        KeyCode::Esc => reduce(app, Action::ToggleBookmarks),
-                        KeyCode::Char('j') | KeyCode::Down => reduce(app, Action::SelectNextBookmark),
-                        KeyCode::Char('k') | KeyCode::Up => reduce(app, Action::SelectPrevBookmark),
-                        KeyCode::Enter => {
-                            if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
-                                let bm = hydrate_password_from_keyring(app, bm, "bookmark-load");
-                                reduce(app, Action::QuickConnectSetFromBookmark(bm));
-                                reduce(app, Action::ToggleBookmarks);
-                                reduce(app, Action::ToggleQuickConnect);
+                            KeyCode::Right => {
+                                if app.quick_connect_field == QuickConnectField::Protocol {
+                                    reduce(app, Action::QuickConnectSetProtocolNext);
+                                } else {
+                                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                    reduce(app, Action::QuickConnectMoveCursor { dir: 1, shift });
+                                }
                             }
-                        }
-                        KeyCode::Char('c') => {
-                            if let Some(mut bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
-                                if bm.password.is_none() {
+                            KeyCode::Home => {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                app.qc_field.move_home(shift);
+                            }
+                            KeyCode::End => {
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                app.qc_field.move_end(shift);
+                            }
+                            KeyCode::Delete => {
+                                app.qc_field.delete();
+                                app.qc_flush();
+                            }
+                            KeyCode::Backspace => reduce(app, Action::QuickConnectBackspace),
+                            KeyCode::Enter => {
+                                let mut info = app.quick_connect.clone();
+                                if info.password.is_none() {
                                     if let Ok(Some(secret)) = SecretStore::load_password(
-                                        &bm.name,
-                                        &bm.username,
-                                        &bm.host,
-                                        bm.port,
+                                        &info.name,
+                                        &info.username,
+                                        &info.host,
+                                        info.port,
                                     ) {
-                                        bm.password = Some(secret);
+                                        info.password = Some(secret);
                                     }
                                 }
-                                connect_with_info(app, session, bm).await;
-                                reduce(app, Action::ToggleBookmarks);
+                                connect_with_info(app, session, info).await;
+                                reduce(app, Action::ToggleQuickConnect);
+                            }
+                            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.qc_field.delete_word_left();
+                                app.qc_flush();
+                            }
+                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                save_quick_connect_bookmark(app);
+                            }
+                            KeyCode::Char(ch) => {
+                                reduce(app, Action::QuickConnectInput(ch));
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if app.show_bookmarks {
+                        match key.code {
+                            KeyCode::Esc => reduce(app, Action::ToggleBookmarks),
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                reduce(app, Action::SelectNextBookmark)
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                reduce(app, Action::SelectPrevBookmark)
+                            }
+                            KeyCode::Enter => {
+                                if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned()
+                                {
+                                    let bm =
+                                        hydrate_password_from_keyring(app, bm, "bookmark-load");
+                                    reduce(app, Action::QuickConnectSetFromBookmark(bm));
+                                    reduce(app, Action::ToggleBookmarks);
+                                    reduce(app, Action::ToggleQuickConnect);
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                if let Some(mut bm) =
+                                    app.bookmarks.get(app.selected_bookmark).cloned()
+                                {
+                                    if bm.password.is_none() {
+                                        if let Ok(Some(secret)) = SecretStore::load_password(
+                                            &bm.name,
+                                            &bm.username,
+                                            &bm.host,
+                                            bm.port,
+                                        ) {
+                                            bm.password = Some(secret);
+                                        }
+                                    }
+                                    connect_with_info(app, session, bm).await;
+                                    reduce(app, Action::ToggleBookmarks);
+                                }
+                            }
+                            KeyCode::Char('d') => {
+                                delete_selected_bookmark(app);
+                            }
+                            KeyCode::Char('e') => {
+                                if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned()
+                                {
+                                    let bm =
+                                        hydrate_password_from_keyring(app, bm, "bookmark-edit");
+                                    reduce(app, Action::QuickConnectSetFromBookmark(bm));
+                                    reduce(app, Action::ToggleBookmarks);
+                                    reduce(app, Action::ToggleQuickConnect);
+                                }
+                            }
+                            KeyCode::Char('D') => {
+                                set_default_bookmark(app);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    match key.code {
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Tab => reduce(app, Action::FocusNextPane),
+                        KeyCode::Char('1') => {
+                            app.focus = FocusPane::Local;
+                            reduce(app, Action::SetStatus("Focus: Local".to_string()));
+                        }
+                        KeyCode::Char('2') => {
+                            app.focus = FocusPane::Remote;
+                            reduce(app, Action::SetStatus("Focus: Remote".to_string()));
+                        }
+                        KeyCode::Char('3') => {
+                            app.focus = FocusPane::Queue;
+                            reduce(app, Action::SetStatus("Focus: Queue".to_string()));
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.focus == FocusPane::Queue {
+                                app.queue_scroll = app.queue_scroll.saturating_sub(1);
+                            } else {
+                                reduce(app, Action::SelectUp)
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if app.focus == FocusPane::Queue {
+                                app.queue_scroll = app.queue_scroll.saturating_add(1);
+                            } else {
+                                reduce(app, Action::SelectDown)
+                            }
+                        }
+                        KeyCode::Char('l') => {
+                            navigate_into_directory(app, session).await;
+                        }
+                        KeyCode::Char('h') => {
+                            navigate_parent_directory(app, session).await;
+                        }
+                        KeyCode::Char('r') => {
+                            app.local_entries = local_list(&app.local_cwd);
+
+                            if app.connected {
+                                let variant_opt =
+                                    app.active_connection.as_ref().map(|c| c.protocol.clone());
+                                let result = match (&mut app.ftp_session, variant_opt) {
+                                    (Some(ftp), Some(Protocol::Ftp)) => {
+                                        ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
+                                    }
+                                    (Some(ftp), Some(Protocol::Ftps)) => {
+                                        ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
+                                    }
+                                    (Some(_), _) => {
+                                        reduce(
+                                            app,
+                                            Action::SetStatus("Unknown FTP variant".to_string()),
+                                        );
+                                        Ok(Vec::new())
+                                    }
+                                    (None, _) => session.list_dir(&app.remote_cwd).await,
+                                };
+                                match result {
+                                    Ok(entries) if !entries.is_empty() => {
+                                        reduce(app, Action::SetRemoteEntries(entries));
+                                        reduce(
+                                            app,
+                                            Action::SetStatus(
+                                                "Refreshed local + remote listing".to_string(),
+                                            ),
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        reduce(
+                                            app,
+                                            Action::SetStatus(format!(
+                                                "Remote refresh failed: {err}"
+                                            )),
+                                        );
+                                    }
+                                }
+                            } else {
+                                reduce(
+                                    app,
+                                    Action::SetStatus("Refreshed local listing".to_string()),
+                                );
+                            }
+                        }
+                        KeyCode::Char('b') => {
+                            reduce(app, Action::SelectNextBookmark);
+                        }
+                        KeyCode::Char('B') => {
+                            save_quick_connect_bookmark(app);
+                        }
+                        KeyCode::Char('o') => {
+                            reduce(app, Action::ToggleQuickConnect);
+                        }
+                        KeyCode::Char('m') => {
+                            reduce(app, Action::ToggleBookmarks);
+                        }
+                        KeyCode::Char('c') => {
+                            if app.connected {
+                                disconnect_session(app, session).await;
+                            } else {
+                                let mut info = selected_or_quick_connect(app);
+                                if info.password.is_none() {
+                                    if let Ok(Some(secret)) = SecretStore::load_password(
+                                        &info.name,
+                                        &info.username,
+                                        &info.host,
+                                        info.port,
+                                    ) {
+                                        info.password = Some(secret);
+                                    }
+                                }
+                                connect_with_info(app, session, info).await;
+                            }
+                        }
+                        KeyCode::Char('u') => {
+                            if !app.connected {
+                                reduce(app, Action::SetStatus("Not connected".to_string()));
+                                continue;
+                            }
+
+                            let selected = app.local_entries.get(app.selected_local).cloned();
+                            if let Some(local) = selected {
+                                if local.kind == dd_ftp_core::EntryKind::Directory {
+                                    reduce(
+                                        app,
+                                        Action::SetStatus(
+                                            "Select a local file to upload".to_string(),
+                                        ),
+                                    );
+                                    continue;
+                                }
+
+                                let remote_target = format!(
+                                    "{}/{}",
+                                    app.remote_cwd.trim_end_matches('/'),
+                                    local.name
+                                );
+                                let job = TransferJob::new(
+                                    local.path,
+                                    remote_target,
+                                    TransferDirection::Upload,
+                                );
+                                reduce(app, Action::QueueTransfer(job));
                             }
                         }
                         KeyCode::Char('d') => {
-                            delete_selected_bookmark(app);
-                        }
-                        KeyCode::Char('e') => {
-                            if let Some(bm) = app.bookmarks.get(app.selected_bookmark).cloned() {
-                                let bm = hydrate_password_from_keyring(app, bm, "bookmark-edit");
-                                reduce(app, Action::QuickConnectSetFromBookmark(bm));
-                                reduce(app, Action::ToggleBookmarks);
-                                reduce(app, Action::ToggleQuickConnect);
+                            if !app.connected {
+                                reduce(app, Action::SetStatus("Not connected".to_string()));
+                                continue;
+                            }
+
+                            let selected = app.remote_entries.get(app.selected_remote).cloned();
+                            if let Some(remote) = selected {
+                                if remote.kind == dd_ftp_core::EntryKind::Directory {
+                                    reduce(
+                                        app,
+                                        Action::SetStatus(
+                                            "Select a remote file to download".to_string(),
+                                        ),
+                                    );
+                                    continue;
+                                }
+
+                                let local_target = format!(
+                                    "{}/{}",
+                                    app.local_cwd.trim_end_matches('/'),
+                                    remote.name
+                                );
+                                let job = TransferJob::new(
+                                    local_target,
+                                    remote.path,
+                                    TransferDirection::Download,
+                                );
+                                reduce(app, Action::QueueTransfer(job));
                             }
                         }
-                        KeyCode::Char('D') => {
-                            set_default_bookmark(app);
+                        KeyCode::Char('x') => {
+                            reduce(
+                                app,
+                                Action::SetStatus("Worker auto-processes queue".to_string()),
+                            );
+                        }
+                        KeyCode::Char('X') => {
+                            reduce(app, Action::ClearPendingTransfers);
+                        }
+                        KeyCode::Char('R') => {
+                            reduce(app, Action::RetryLastFailed);
+                        }
+                        KeyCode::Char('C') => {
+                            if app.worker_running {
+                                app.worker_cancel_requested = true;
+                                for flag in &cancel_flags {
+                                    flag.store(true, Ordering::Relaxed);
+                                }
+                                reduce(
+                                    app,
+                                    Action::SetStatus(
+                                        "Cancel requested for active transfers".to_string(),
+                                    ),
+                                );
+                            } else {
+                                reduce(
+                                    app,
+                                    Action::SetStatus("No active transfer to cancel".to_string()),
+                                );
+                            }
                         }
                         _ => {}
                     }
-                    continue;
                 }
-
-                match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Tab => reduce(app, Action::FocusNextPane),
-                    KeyCode::Char('1') => {
-                        app.focus = FocusPane::Local;
-                        reduce(app, Action::SetStatus("Focus: Local".to_string()));
-                    }
-                    KeyCode::Char('2') => {
-                        app.focus = FocusPane::Remote;
-                        reduce(app, Action::SetStatus("Focus: Remote".to_string()));
-                    }
-                    KeyCode::Char('3') => {
-                        app.focus = FocusPane::Queue;
-                        reduce(app, Action::SetStatus("Focus: Queue".to_string()));
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if app.focus == FocusPane::Queue {
-                            app.queue_scroll = app.queue_scroll.saturating_sub(1);
-                        } else {
-                            reduce(app, Action::SelectUp)
+                Event::Mouse(mouse) => {
+                    let (mx, my) = (mouse.column, mouse.row);
+                    match mouse.kind {
+                        MouseEventKind::Moved => {
+                            app.mouse_pos = Some((mx, my));
                         }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if app.focus == FocusPane::Queue {
-                            app.queue_scroll = app.queue_scroll.saturating_add(1);
-                        } else {
-                            reduce(app, Action::SelectDown)
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                            match hit_test(&app_layout, mx, my) {
+                                Some(Region::List(Pane::Local))
+                                | Some(Region::Scrollbar(ScrollRegion::ListLocal))
+                                    if !app.any_modal_open() =>
+                                {
+                                    app.focus = FocusPane::Local;
+                                    for _ in 0..SCROLL_STEP {
+                                        reduce(
+                                            app,
+                                            if up {
+                                                Action::SelectUp
+                                            } else {
+                                                Action::SelectDown
+                                            },
+                                        );
+                                    }
+                                }
+                                Some(Region::List(Pane::Remote))
+                                | Some(Region::Scrollbar(ScrollRegion::ListRemote))
+                                    if !app.any_modal_open() =>
+                                {
+                                    app.focus = FocusPane::Remote;
+                                    for _ in 0..SCROLL_STEP {
+                                        reduce(
+                                            app,
+                                            if up {
+                                                Action::SelectUp
+                                            } else {
+                                                Action::SelectDown
+                                            },
+                                        );
+                                    }
+                                }
+                                Some(Region::Scrollbar(ScrollRegion::Queue)) => {
+                                    app.queue_scroll = if up {
+                                        app.queue_scroll.saturating_sub(SCROLL_STEP)
+                                    } else {
+                                        app.queue_scroll.saturating_add(SCROLL_STEP)
+                                    };
+                                }
+                                Some(Region::Scrollbar(ScrollRegion::Help)) => {
+                                    app.help_scroll = if up {
+                                        app.help_scroll.saturating_sub(SCROLL_STEP)
+                                    } else {
+                                        app.help_scroll.saturating_add(SCROLL_STEP)
+                                    };
+                                }
+                                _ => {}
+                            }
                         }
-                    }
-                    KeyCode::Char('l') => {
-                        navigate_into_directory(app, session).await;
-                    }
-                    KeyCode::Char('h') => {
-                        navigate_parent_directory(app, session).await;
-                    },
-                    KeyCode::Char('r') => {
-                        app.local_entries = local_list(&app.local_cwd);
-
-                        if app.connected {
-                            let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
-                            let result = match (&mut app.ftp_session, variant_opt) {
-                                (Some(ftp), Some(Protocol::Ftp)) => {
-                                    ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
+                        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                            let now = Instant::now();
+                            let is_double = last_click
+                                .map(|(lx, ly, t)| {
+                                    lx == mx
+                                        && ly == my
+                                        && now.duration_since(t) < Duration::from_millis(300)
+                                })
+                                .unwrap_or(false);
+                            last_click = Some((mx, my, now));
+                            match hit_test(&app_layout, mx, my) {
+                                Some(Region::List(pane)) if !app.any_modal_open() => {
+                                    app.focus = match pane {
+                                        Pane::Local => FocusPane::Local,
+                                        Pane::Remote => FocusPane::Remote,
+                                    };
+                                    let (list_rect, offset, len) = match pane {
+                                        Pane::Local => (
+                                            app_layout.local_list,
+                                            app_layout.local_list_offset,
+                                            app.local_entries.len(),
+                                        ),
+                                        Pane::Remote => (
+                                            app_layout.remote_list,
+                                            app_layout.remote_list_offset,
+                                            app.remote_entries.len(),
+                                        ),
+                                    };
+                                    let content_top = list_rect.y + 1; // top border
+                                    if my >= content_top {
+                                        let row = (my - content_top) as usize;
+                                        let idx = offset + row;
+                                        if idx < len {
+                                            match pane {
+                                                Pane::Local => app.selected_local = idx,
+                                                Pane::Remote => app.selected_remote = idx,
+                                            }
+                                            if is_double {
+                                                last_click = None;
+                                                navigate_into_directory(app, session).await;
+                                            }
+                                        }
+                                    }
                                 }
-                                (Some(ftp), Some(Protocol::Ftps)) => {
-                                    ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
+                                Some(Region::Control(ControlId::QcProtocol)) => {
+                                    reduce(app, Action::QuickConnectSetProtocolNext);
                                 }
-                                (Some(_), _) => {
-                                    reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
-                                    Ok(Vec::new())
+                                Some(Region::Control(ControlId::BookmarkRow(i))) => {
+                                    app.selected_bookmark =
+                                        i.min(app.bookmarks.len().saturating_sub(1));
+                                    if is_double {
+                                        last_click = None;
+                                        if let Some(bm) =
+                                            app.bookmarks.get(app.selected_bookmark).cloned()
+                                        {
+                                            let bm = hydrate_password_from_keyring(
+                                                app,
+                                                bm,
+                                                "bookmark-load",
+                                            );
+                                            reduce(app, Action::QuickConnectSetFromBookmark(bm));
+                                            reduce(app, Action::ToggleBookmarks);
+                                            reduce(app, Action::ToggleQuickConnect);
+                                        }
+                                    }
                                 }
-                                (None, _) => session.list_dir(&app.remote_cwd).await,
-                            };
-                            match result {
-                                Ok(entries) if !entries.is_empty() => {
-                                    reduce(app, Action::SetRemoteEntries(entries));
-                                    reduce(app, Action::SetStatus("Refreshed local + remote listing".to_string()));
+                                Some(Region::Scrollbar(sr)) => {
+                                    let allow = match sr {
+                                        ScrollRegion::Help => true,
+                                        _ => !app.any_modal_open(),
+                                    };
+                                    if allow {
+                                        drag = Some(sr);
+                                        apply_scrollbar_drag(app, &app_layout, sr, my);
+                                    }
                                 }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    reduce(app, Action::SetStatus(format!("Remote refresh failed: {err}")));
+                                Some(Region::Field(fid)) => {
+                                    if let Some(fr) =
+                                        app_layout.fields.iter().find(|f| f.id == fid).copied()
+                                    {
+                                        match fid {
+                                            FieldId::Prompt => {
+                                                let len = app.prompt_value.len();
+                                                let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                                app.prompt_value.begin_drag(idx);
+                                                drag_field = Some(fid);
+                                            }
+                                            _ => {
+                                                if let Some(qf) = qc_field_for(fid) {
+                                                    app.quick_connect_field = qf;
+                                                    reduce(app, Action::QuickConnectSyncField);
+                                                    let len = app.qc_field.len();
+                                                    let idx =
+                                                        dd_ftp_ui::char_index_at(&fr, mx, len);
+                                                    reduce(
+                                                        app,
+                                                        Action::QuickConnectBeginSelect(idx),
+                                                    );
+                                                    drag_field = Some(fid);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                            if let Some(sr) = drag {
+                                apply_scrollbar_drag(app, &app_layout, sr, my);
+                            }
+                            if let Some(fid) = drag_field {
+                                if let Some(fr) =
+                                    app_layout.fields.iter().find(|f| f.id == fid).copied()
+                                {
+                                    match fid {
+                                        FieldId::Prompt if app.show_prompt => {
+                                            let len = app.prompt_value.len();
+                                            let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                            app.prompt_value.extend_drag(idx);
+                                        }
+                                        FieldId::Prompt => {}
+                                        _ if app.show_quick_connect => {
+                                            let len = app.qc_field.len();
+                                            let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                            reduce(app, Action::QuickConnectExtendSelect(idx));
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
-                        } else {
-                            reduce(app, Action::SetStatus("Refreshed local listing".to_string()));
                         }
-                    }
-                    KeyCode::Char('b') => {
-                        reduce(app, Action::SelectNextBookmark);
-                    }
-                    KeyCode::Char('B') => {
-                        save_quick_connect_bookmark(app);
-                    }
-                    KeyCode::Char('o') => {
-                        reduce(app, Action::ToggleQuickConnect);
-                    }
-                    KeyCode::Char('m') => {
-                        reduce(app, Action::ToggleBookmarks);
-                    }
-                    KeyCode::Char('c') => {
-                        if app.connected {
-                            disconnect_session(app, session).await;
-                        } else {
-                            let mut info = selected_or_quick_connect(app);
-                            if info.password.is_none() {
-                                if let Ok(Some(secret)) = SecretStore::load_password(
-                                    &info.name,
-                                    &info.username,
-                                    &info.host,
-                                    info.port,
-                                ) {
-                                    info.password = Some(secret);
-                                }
-                            }
-                            connect_with_info(app, session, info).await;
+                        MouseEventKind::Up(_) => {
+                            drag = None;
+                            drag_field = None;
                         }
+                        _ => {}
                     }
-                    KeyCode::Char('u') => {
-                        if !app.connected {
-                            reduce(app, Action::SetStatus("Not connected".to_string()));
-                            continue;
-                        }
-
-                        let selected = app.local_entries.get(app.selected_local).cloned();
-                        if let Some(local) = selected {
-                            if local.kind == dd_ftp_core::EntryKind::Directory {
-                                reduce(app, Action::SetStatus("Select a local file to upload".to_string()));
-                                continue;
-                            }
-
-                            let remote_target = format!("{}/{}", app.remote_cwd.trim_end_matches('/'), local.name);
-                            let job = TransferJob::new(local.path, remote_target, TransferDirection::Upload);
-                            reduce(app, Action::QueueTransfer(job));
-                        }
-                    }
-                    KeyCode::Char('d') => {
-                        if !app.connected {
-                            reduce(app, Action::SetStatus("Not connected".to_string()));
-                            continue;
-                        }
-
-                        let selected = app.remote_entries.get(app.selected_remote).cloned();
-                        if let Some(remote) = selected {
-                            if remote.kind == dd_ftp_core::EntryKind::Directory {
-                                reduce(app, Action::SetStatus("Select a remote file to download".to_string()));
-                                continue;
-                            }
-
-                            let local_target = format!("{}/{}", app.local_cwd.trim_end_matches('/'), remote.name);
-                            let job = TransferJob::new(local_target, remote.path, TransferDirection::Download);
-                            reduce(app, Action::QueueTransfer(job));
-                        }
-                    }
-                    KeyCode::Char('x') => {
-                        reduce(app, Action::SetStatus("Worker auto-processes queue".to_string()));
-                    }
-                    KeyCode::Char('X') => {
-                        reduce(app, Action::ClearPendingTransfers);
-                    }
-                    KeyCode::Char('R') => {
-                        reduce(app, Action::RetryLastFailed);
-                    }
-                    KeyCode::Char('C') => {
-                        if app.worker_running {
-                            app.worker_cancel_requested = true;
-                            for flag in &cancel_flags {
-                                flag.store(true, Ordering::Relaxed);
-                            }
-                            reduce(app, Action::SetStatus("Cancel requested for active transfers".to_string()));
-                        } else {
-                            reduce(app, Action::SetStatus("No active transfer to cancel".to_string()));
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
-            Event::Mouse(mouse) => {
-                if mouse.kind == MouseEventKind::Moved {
-                    app.mouse_pos = Some((mouse.column, mouse.row));
-                }
-            }
-            _ => {}
         }
     }
 }
+
+fn qc_field_for(fid: dd_ftp_ui::FieldId) -> Option<QuickConnectField> {
+    use dd_ftp_ui::FieldId::*;
+    Some(match fid {
+        QcName => QuickConnectField::Name,
+        QcHost => QuickConnectField::Host,
+        QcPort => QuickConnectField::Port,
+        QcUsername => QuickConnectField::Username,
+        QcPassword => QuickConnectField::Password,
+        QcPrivateKey => QuickConnectField::PrivateKey,
+        QcPath => QuickConnectField::Path,
+        Prompt => return None,
+    })
+}
+
+fn apply_scrollbar_drag(
+    app: &mut AppState,
+    layout: &dd_ftp_ui::LayoutMap,
+    sr: dd_ftp_ui::ScrollRegion,
+    my: u16,
+) {
+    let track = match sr {
+        ScrollRegion::ListLocal => layout.local_scrollbar,
+        ScrollRegion::ListRemote => layout.remote_scrollbar,
+        ScrollRegion::Queue => layout.queue_scrollbar,
+        ScrollRegion::Help => layout.help_scrollbar.unwrap_or_default(),
+    };
+    if track.height == 0 {
+        return;
+    }
+    let rel = my
+        .saturating_sub(track.y)
+        .min(track.height.saturating_sub(1));
+    let denom = track.height.saturating_sub(1).max(1) as f32;
+    let frac = rel as f32 / denom;
+    match sr {
+        ScrollRegion::ListLocal => {
+            let n = app.local_entries.len().saturating_sub(1);
+            app.selected_local = (frac * n as f32).round() as usize;
+        }
+        ScrollRegion::ListRemote => {
+            let n = app.remote_entries.len().saturating_sub(1);
+            app.selected_remote = (frac * n as f32).round() as usize;
+        }
+        ScrollRegion::Queue => {
+            let n = app.queue.pending.len()
+                + app.queue.active.len()
+                + app.queue.completed.len()
+                + app.queue.failed.len()
+                + app.queue.cancelled.len();
+            app.queue_scroll = (frac * n as f32).round() as usize;
+        }
+        ScrollRegion::Help => {
+            app.help_scroll = (frac * track.height as f32).round() as usize;
+        }
+    }
 }
 
 async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) {
@@ -614,7 +1012,10 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
                 if entry.kind == dd_ftp_core::EntryKind::Directory {
                     app.local_cwd = entry.path;
                     app.local_entries = local_list(&app.local_cwd);
-                    reduce(app, Action::SetStatus(format!("Local cwd: {}", app.local_cwd)));
+                    reduce(
+                        app,
+                        Action::SetStatus(format!("Local cwd: {}", app.local_cwd)),
+                    );
                 }
             }
         }
@@ -644,14 +1045,23 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
                     match result {
                         Ok(entries) => {
                             reduce(app, Action::SetRemoteEntries(entries));
-                            reduce(app, Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)));
+                            reduce(
+                                app,
+                                Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)),
+                            );
                         }
                         Err(err) => {
-                            reduce(app, Action::SetStatus(format!("Remote enter failed: {err}")));
+                            reduce(
+                                app,
+                                Action::SetStatus(format!("Remote enter failed: {err}")),
+                            );
                         }
                     }
                 } else {
-                    reduce(app, Action::SetStatus(format!("'{}' is not a directory", entry.name)));
+                    reduce(
+                        app,
+                        Action::SetStatus(format!("'{}' is not a directory", entry.name)),
+                    );
                 }
             }
         }
@@ -670,7 +1080,10 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
 
             app.local_cwd = parent;
             app.local_entries = local_list(&app.local_cwd);
-            reduce(app, Action::SetStatus(format!("Local cwd: {}", app.local_cwd)));
+            reduce(
+                app,
+                Action::SetStatus(format!("Local cwd: {}", app.local_cwd)),
+            );
         }
         dd_ftp_app::FocusPane::Remote => {
             if !app.connected {
@@ -696,10 +1109,16 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
             match result {
                 Ok(entries) => {
                     reduce(app, Action::SetRemoteEntries(entries));
-                    reduce(app, Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)));
+                    reduce(
+                        app,
+                        Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)),
+                    );
                 }
                 Err(err) => {
-                    reduce(app, Action::SetStatus(format!("Remote parent failed: {err}")));
+                    reduce(
+                        app,
+                        Action::SetStatus(format!("Remote parent failed: {err}")),
+                    );
                 }
             }
         }
@@ -725,7 +1144,11 @@ enum WorkerMessage {
     Done(WorkerResult),
 }
 
-async fn handle_worker_result(app: &mut AppState, session: &mut SftpSession, mut msg: WorkerResult) {
+async fn handle_worker_result(
+    app: &mut AppState,
+    session: &mut SftpSession,
+    mut msg: WorkerResult,
+) {
     if app.worker_active_count == 0 {
         app.worker_cancel_requested = false;
     }
@@ -787,19 +1210,31 @@ async fn disconnect_session(app: &mut AppState, session: &mut SftpSession) {
 
 async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: ConnectionInfo) {
     if info.name.trim().is_empty() {
-        reduce(app, Action::SetStatus("Connect failed: label/name is required".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Connect failed: label/name is required".to_string()),
+        );
         return;
     }
     if info.host.trim().is_empty() {
-        reduce(app, Action::SetStatus("Connect failed: host is required".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Connect failed: host is required".to_string()),
+        );
         return;
     }
     if info.username.trim().is_empty() {
-        reduce(app, Action::SetStatus("Connect failed: username is required".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Connect failed: username is required".to_string()),
+        );
         return;
     }
     if info.port == 0 {
-        reduce(app, Action::SetStatus("Connect failed: port must be > 0".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Connect failed: port must be > 0".to_string()),
+        );
         return;
     }
 
@@ -818,23 +1253,23 @@ async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: 
             reduce(app, Action::SetConnected(true));
             reduce(app, Action::SetRemoteEntries(entries));
             app.active_connection = Some(info.clone());
-            reduce(app, Action::SetStatus(format!(
-                "Connected via {:?} to {} as {} (cwd: {})",
-                info.protocol,
-                info.host,
-                info.username,
-                app.remote_cwd
-            )));
+            reduce(
+                app,
+                Action::SetStatus(format!(
+                    "Connected via {:?} to {} as {} (cwd: {})",
+                    info.protocol, info.host, info.username, app.remote_cwd
+                )),
+            );
         }
         Err(err) => {
             reduce(app, Action::SetConnected(false));
-            reduce(app, Action::SetStatus(format!(
-                "Connect failed for {}@{}:{} via {:?} -> {err}",
-                info.username,
-                info.host,
-                info.port,
-                info.protocol
-            )));
+            reduce(
+                app,
+                Action::SetStatus(format!(
+                    "Connect failed for {}@{}:{} via {:?} -> {err}",
+                    info.username, info.host, info.port, info.protocol
+                )),
+            );
         }
     }
 }
@@ -855,7 +1290,9 @@ async fn connect_and_list_by_protocol(
             let variant = match info.protocol {
                 Protocol::Ftp => FtpVariant::Ftp,
                 Protocol::Ftps => FtpVariant::Ftps,
-                Protocol::Sftp => unreachable!("connect_and_list_by_protocol called with Sftp protocol"),
+                Protocol::Sftp => {
+                    unreachable!("connect_and_list_by_protocol called with Sftp protocol")
+                }
             };
             let mut unified = UnifiedFtpSession::new();
             unified.connect(variant, info.clone()).await?;
@@ -911,7 +1348,9 @@ fn run_keyring_health_check(app: &mut AppState) {
         Ok(_) => {
             reduce(
                 app,
-                Action::SetStatus("Keyring backend detected: password persistence enabled".to_string()),
+                Action::SetStatus(
+                    "Keyring backend detected: password persistence enabled".to_string(),
+                ),
             );
         }
         Err(err) => {
@@ -941,13 +1380,9 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
     }
 
     let secret_status = if let Some(password) = info.password.as_deref() {
-        if let Err(err) = SecretStore::save_password(
-            &info.name,
-            &info.username,
-            &info.host,
-            info.port,
-            password,
-        ) {
+        if let Err(err) =
+            SecretStore::save_password(&info.name, &info.username, &info.host, info.port, password)
+        {
             let msg = format!("Save secret failed: {err}");
             reduce(app, Action::SetStatus(msg.clone()));
             reduce(app, Action::ShowError(msg));
@@ -995,7 +1430,10 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
                 );
             }
             Err(err) => {
-                reduce(app, Action::SetStatus(format!("Save bookmark failed: {err}")));
+                reduce(
+                    app,
+                    Action::SetStatus(format!("Save bookmark failed: {err}")),
+                );
             }
         }
     } else {
@@ -1015,7 +1453,10 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
                 );
             }
             Err(err) => {
-                reduce(app, Action::SetStatus(format!("Save bookmark failed: {err}")));
+                reduce(
+                    app,
+                    Action::SetStatus(format!("Save bookmark failed: {err}")),
+                );
             }
         }
     }
@@ -1029,12 +1470,20 @@ fn delete_selected_bookmark(app: &mut AppState) {
     }
 
     if app.selected_bookmark >= cfg.sites.len() {
-        reduce(app, Action::SetStatus("Invalid bookmark selection".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Invalid bookmark selection".to_string()),
+        );
         return;
     }
 
     let removed = cfg.sites.remove(app.selected_bookmark);
-    let _ = SecretStore::delete_password(&removed.name, &removed.username, &removed.host, removed.port);
+    let _ = SecretStore::delete_password(
+        &removed.name,
+        &removed.username,
+        &removed.host,
+        removed.port,
+    );
 
     if let Some(default_idx) = cfg.default_site {
         cfg.default_site = if cfg.sites.is_empty() {
@@ -1051,10 +1500,16 @@ fn delete_selected_bookmark(app: &mut AppState) {
     match SiteManager::save_to_default_path(&cfg) {
         Ok(_) => {
             reduce(app, Action::SetBookmarks(cfg.sites));
-            reduce(app, Action::SetStatus(format!("Deleted bookmark: {}", removed.name)));
+            reduce(
+                app,
+                Action::SetStatus(format!("Deleted bookmark: {}", removed.name)),
+            );
         }
         Err(err) => {
-            reduce(app, Action::SetStatus(format!("Delete bookmark failed: {err}")));
+            reduce(
+                app,
+                Action::SetStatus(format!("Delete bookmark failed: {err}")),
+            );
         }
     }
 }
@@ -1062,12 +1517,18 @@ fn delete_selected_bookmark(app: &mut AppState) {
 fn set_default_bookmark(app: &mut AppState) {
     let mut cfg = SiteManager::load_or_default().unwrap_or_default();
     if cfg.sites.is_empty() {
-        reduce(app, Action::SetStatus("No bookmarks to set as default".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("No bookmarks to set as default".to_string()),
+        );
         return;
     }
 
     if app.selected_bookmark >= cfg.sites.len() {
-        reduce(app, Action::SetStatus("Invalid bookmark selection".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Invalid bookmark selection".to_string()),
+        );
         return;
     }
 
@@ -1080,7 +1541,10 @@ fn set_default_bookmark(app: &mut AppState) {
     match SiteManager::save_to_default_path(&cfg) {
         Ok(_) => {
             reduce(app, Action::SetBookmarks(cfg.sites));
-            reduce(app, Action::SetStatus("Default bookmark updated".to_string()));
+            reduce(
+                app,
+                Action::SetStatus("Default bookmark updated".to_string()),
+            );
         }
         Err(err) => {
             reduce(app, Action::SetStatus(format!("Set default failed: {err}")));
@@ -1210,7 +1674,10 @@ fn get_selected_entry(app: &AppState) -> Option<dd_ftp_core::FileEntry> {
 
 async fn create_file(app: &mut AppState, _session: &mut SftpSession, name: &str) {
     if name.is_empty() {
-        reduce(app, Action::SetStatus("Cannot create file: empty name".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Cannot create file: empty name".to_string()),
+        );
         return;
     }
 
@@ -1223,7 +1690,10 @@ async fn create_file(app: &mut AppState, _session: &mut SftpSession, name: &str)
                     reduce(app, Action::SetStatus(format!("Created file: {}", name)));
                 }
                 Err(err) => {
-                    reduce(app, Action::SetStatus(format!("Failed to create file: {}", err)));
+                    reduce(
+                        app,
+                        Action::SetStatus(format!("Failed to create file: {}", err)),
+                    );
                 }
             }
         }
@@ -1242,7 +1712,10 @@ async fn create_file(app: &mut AppState, _session: &mut SftpSession, name: &str)
                     dd_ftp_core::TransferDirection::Upload,
                 );
                 reduce(app, Action::QueueTransfer(job));
-                reduce(app, Action::SetStatus(format!("Queued file creation: {}", name)));
+                reduce(
+                    app,
+                    Action::SetStatus(format!("Queued file creation: {}", name)),
+                );
                 // Clean up temp file
                 let _ = std::fs::remove_file(&temp_file);
             }
@@ -1253,7 +1726,10 @@ async fn create_file(app: &mut AppState, _session: &mut SftpSession, name: &str)
 
 async fn create_folder(app: &mut AppState, _session: &mut SftpSession, name: &str) {
     if name.is_empty() {
-        reduce(app, Action::SetStatus("Cannot create folder: empty name".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Cannot create folder: empty name".to_string()),
+        );
         return;
     }
 
@@ -1266,7 +1742,10 @@ async fn create_folder(app: &mut AppState, _session: &mut SftpSession, name: &st
                     reduce(app, Action::SetStatus(format!("Created folder: {}", name)));
                 }
                 Err(err) => {
-                    reduce(app, Action::SetStatus(format!("Failed to create folder: {}", err)));
+                    reduce(
+                        app,
+                        Action::SetStatus(format!("Failed to create folder: {}", err)),
+                    );
                 }
             }
         }
@@ -1277,7 +1756,10 @@ async fn create_folder(app: &mut AppState, _session: &mut SftpSession, name: &st
             }
             let path = format!("{}/{}", app.remote_cwd.trim_end_matches('/'), name);
             // Remote folder creation not yet implemented
-            reduce(app, Action::SetStatus(format!("Remote folder creation not implemented: {}", path)));
+            reduce(
+                app,
+                Action::SetStatus(format!("Remote folder creation not implemented: {}", path)),
+            );
         }
         _ => {}
     }
@@ -1285,7 +1767,10 @@ async fn create_folder(app: &mut AppState, _session: &mut SftpSession, name: &st
 
 async fn rename_item(app: &mut AppState, _session: &mut SftpSession, target: &str, new_name: &str) {
     if new_name.is_empty() {
-        reduce(app, Action::SetStatus("Cannot rename: empty name".to_string()));
+        reduce(
+            app,
+            Action::SetStatus("Cannot rename: empty name".to_string()),
+        );
         return;
     }
 
@@ -1308,7 +1793,13 @@ async fn rename_item(app: &mut AppState, _session: &mut SftpSession, target: &st
                 return;
             }
             // Remote rename not yet implemented
-            reduce(app, Action::SetStatus(format!("Remote rename not implemented: {} -> {}", target, new_name)));
+            reduce(
+                app,
+                Action::SetStatus(format!(
+                    "Remote rename not implemented: {} -> {}",
+                    target, new_name
+                )),
+            );
         }
         _ => {}
     }
@@ -1316,12 +1807,16 @@ async fn rename_item(app: &mut AppState, _session: &mut SftpSession, target: &st
 
 async fn delete_item(app: &mut AppState, _session: &mut SftpSession, target: &str) {
     let is_dir = match app.focus {
-        dd_ftp_app::FocusPane::Local => {
-            app.local_entries.get(app.selected_local).map(|e| e.kind == dd_ftp_core::EntryKind::Directory).unwrap_or(false)
-        }
-        dd_ftp_app::FocusPane::Remote => {
-            app.remote_entries.get(app.selected_remote).map(|e| e.kind == dd_ftp_core::EntryKind::Directory).unwrap_or(false)
-        }
+        dd_ftp_app::FocusPane::Local => app
+            .local_entries
+            .get(app.selected_local)
+            .map(|e| e.kind == dd_ftp_core::EntryKind::Directory)
+            .unwrap_or(false),
+        dd_ftp_app::FocusPane::Remote => app
+            .remote_entries
+            .get(app.selected_remote)
+            .map(|e| e.kind == dd_ftp_core::EntryKind::Directory)
+            .unwrap_or(false),
         _ => false,
     };
 
@@ -1334,9 +1829,15 @@ async fn delete_item(app: &mut AppState, _session: &mut SftpSession, target: &st
                 std::path::PathBuf::from(target)
             };
             let target_str = target_path.to_string_lossy().to_string();
-            
-            reduce(app, Action::SetStatus(format!("DEBUG: Deleting '{}' (is_dir={})", target_str, is_dir)));
-            
+
+            reduce(
+                app,
+                Action::SetStatus(format!(
+                    "DEBUG: Deleting '{}' (is_dir={})",
+                    target_str, is_dir
+                )),
+            );
+
             let result = if is_dir {
                 std::fs::remove_dir(&target_path)
             } else {
@@ -1348,7 +1849,10 @@ async fn delete_item(app: &mut AppState, _session: &mut SftpSession, target: &st
                     reduce(app, Action::SetStatus(format!("Deleted: {}", target_str)));
                 }
                 Err(err) => {
-                    reduce(app, Action::SetStatus(format!("Failed to delete '{}': {}", target_str, err)));
+                    reduce(
+                        app,
+                        Action::SetStatus(format!("Failed to delete '{}': {}", target_str, err)),
+                    );
                 }
             }
         }
@@ -1358,7 +1862,10 @@ async fn delete_item(app: &mut AppState, _session: &mut SftpSession, target: &st
                 return;
             }
             // Remote delete not yet implemented
-            reduce(app, Action::SetStatus(format!("Remote delete not implemented: {}", target)));
+            reduce(
+                app,
+                Action::SetStatus(format!("Remote delete not implemented: {}", target)),
+            );
         }
         _ => {}
     }

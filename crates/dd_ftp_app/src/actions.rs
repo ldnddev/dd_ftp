@@ -17,6 +17,13 @@ pub enum Action {
     QuickConnectPrevField,
     QuickConnectInput(char),
     QuickConnectBackspace,
+    QuickConnectSyncField,
+    QuickConnectBeginSelect(usize),
+    QuickConnectExtendSelect(usize),
+    QuickConnectMoveCursor {
+        dir: i32,
+        shift: bool,
+    },
     QuickConnectSetProtocolNext,
     QuickConnectSetProtocolPrev,
     QuickConnectSetFromBookmark(ConnectionInfo),

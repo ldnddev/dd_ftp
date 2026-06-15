@@ -11,9 +11,45 @@ use ratatui::{
     Frame,
 };
 
+use crate::layout::{ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap};
 use crate::theme::{load_theme_with_source, Theme};
 
-pub fn render(frame: &mut Frame, app: &AppState) {
+fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec<Span<'static>> {
+    let display: Vec<char> = if masked {
+        std::iter::repeat_n('*', tf.len()).collect()
+    } else {
+        tf.value.chars().collect()
+    };
+    let sel = tf.selected_range();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, ch) in display.iter().enumerate() {
+        let selected = sel.is_some_and(|(lo, hi)| i >= lo && i < hi);
+        let mut style = if selected {
+            Style::default().fg(t.input_text_focus).bg(t.selection)
+        } else {
+            Style::default().fg(t.input_text_focus)
+        };
+        if i == tf.cursor {
+            // block caret over this char: no extra column, so hit-testing stays aligned
+            style = style
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::RAPID_BLINK);
+        }
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    if tf.cursor >= display.len() {
+        spans.push(Span::styled(
+            "█".to_string(),
+            Style::default()
+                .fg(t.cursor)
+                .add_modifier(Modifier::RAPID_BLINK),
+        ));
+    }
+    spans
+}
+
+pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
+    *map = LayoutMap::default();
     let loaded = load_theme_with_source();
     let t = loaded.theme;
 
@@ -74,6 +110,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     let content_area = vertical[2];
     let queue_area = vertical[3];
     let status_area = vertical[4];
+    map.queue = queue_area;
 
     frame.render_widget(
         Block::default().style(Style::default().bg(t.body_background)),
@@ -98,6 +135,8 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(content_rows[1]);
+    map.local_list = panes[0];
+    map.remote_list = panes[1];
 
     let filter_match = |name: &str| {
         if app.filter_pattern.is_empty() {
@@ -251,7 +290,9 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     remote_state.select(Some(app.selected_remote));
 
     frame.render_stateful_widget(local, panes[0], &mut local_state);
+    map.local_list_offset = local_state.offset();
     frame.render_stateful_widget(remote, panes[1], &mut remote_state);
+    map.remote_list_offset = remote_state.offset();
 
     render_scrollbar(
         frame,
@@ -271,6 +312,24 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         t.scrollbar_hover,
         app.mouse_pos,
     );
+    map.local_scrollbar = Rect {
+        x: panes[0].x + panes[0].width.saturating_sub(1),
+        y: panes[0].y,
+        width: 1,
+        height: panes[0].height,
+    };
+    map.remote_scrollbar = Rect {
+        x: panes[1].x + panes[1].width.saturating_sub(1),
+        y: panes[1].y,
+        width: 1,
+        height: panes[1].height,
+    };
+    map.queue_scrollbar = Rect {
+        x: queue_area.x + queue_area.width.saturating_sub(1),
+        y: queue_area.y,
+        width: 1,
+        height: queue_area.height,
+    };
 
     if app.show_compare {
         render_compare_view(frame, content_area, app, &t);
@@ -507,6 +566,14 @@ pub fn render(frame: &mut Frame, app: &AppState) {
                 app.mouse_pos,
             );
         }
+
+        map.help = Some(area);
+        map.help_scrollbar = Some(Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: area.y,
+            width: 1,
+            height: area.height,
+        });
     }
 
     if app.show_quick_connect {
@@ -623,11 +690,15 @@ pub fn render(frame: &mut Frame, app: &AppState) {
                     t.input_text_default
                 };
 
-                let input_content = if focused {
+                let input_content = if focused && *field != QuickConnectField::Protocol {
+                    let masked = *field == QuickConnectField::Password;
+                    Line::from(render_field_line(&app.qc_field, masked, &t))
+                } else if focused {
+                    // Protocol focused: show its value with a trailing caret as before
                     Line::from(vec![
                         Span::styled(value.clone(), Style::default().fg(text_color)),
                         Span::styled(
-                            "█",
+                            "█".to_string(),
                             Style::default()
                                 .fg(t.cursor)
                                 .add_modifier(Modifier::RAPID_BLINK),
@@ -650,6 +721,33 @@ pub fn render(frame: &mut Frame, app: &AppState) {
                     );
 
                 frame.render_widget(input, cols[col_idx]);
+
+                let cell = cols[col_idx];
+                match field {
+                    QuickConnectField::Protocol => {
+                        map.controls.push(ControlRegion {
+                            id: ControlId::QcProtocol,
+                            area: cell,
+                        });
+                    }
+                    other => {
+                        let fid = match other {
+                            QuickConnectField::Name => FieldId::QcName,
+                            QuickConnectField::Host => FieldId::QcHost,
+                            QuickConnectField::Port => FieldId::QcPort,
+                            QuickConnectField::Username => FieldId::QcUsername,
+                            QuickConnectField::Password => FieldId::QcPassword,
+                            QuickConnectField::PrivateKey => FieldId::QcPrivateKey,
+                            QuickConnectField::Path => FieldId::QcPath,
+                            QuickConnectField::Protocol => unreachable!(),
+                        };
+                        map.fields.push(FieldRegion {
+                            id: fid,
+                            area: cell,
+                            text_x: cell.x + 1,
+                        });
+                    }
+                }
             }
         }
 
@@ -728,6 +826,27 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             t.scrollbar_hover,
             app.mouse_pos,
         );
+
+        // Record one ControlRegion per bookmark row. Each bookmark occupies one
+        // line (line0 = "Bookmarks", line1 = blank, then bookmarks starting at
+        // line2 with border offset +1 = y + 3 + i). Wrap{trim:true} could shift
+        // rows for very long names; this is the accepted single-line approximation.
+        if !app.bookmarks.is_empty() {
+            for i in 0..app.bookmarks.len() {
+                let y = area.y.saturating_add(3 + i as u16);
+                if y < area.y + area.height.saturating_sub(1) {
+                    map.controls.push(ControlRegion {
+                        id: ControlId::BookmarkRow(i),
+                        area: Rect {
+                            x: area.x + 1,
+                            y,
+                            width: area.width.saturating_sub(2),
+                            height: 1,
+                        },
+                    });
+                }
+            }
+        }
     }
 
     if app.show_theme_debug {
@@ -830,16 +949,9 @@ pub fn render(frame: &mut Frame, app: &AppState) {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(t.input_text_focus)),
-            Span::styled(&app.prompt_value, Style::default().fg(t.input_text_focus)),
-            Span::styled(
-                "█",
-                Style::default()
-                    .fg(t.cursor)
-                    .add_modifier(Modifier::RAPID_BLINK),
-            ),
-        ]));
+        let mut prompt_spans = vec![Span::styled("> ", Style::default().fg(t.input_text_focus))];
+        prompt_spans.extend(render_field_line(&app.prompt_value, false, &t));
+        lines.push(Line::from(prompt_spans));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "Enter to confirm | Esc to cancel",
@@ -861,6 +973,23 @@ pub fn render(frame: &mut Frame, app: &AppState) {
             );
 
         frame.render_widget(modal, area);
+
+        let has_target_line =
+            app.prompt_type == Some(dd_ftp_app::PromptType::Delete) && app.prompt_target.is_some();
+        let input_line_offset =
+            1 /* message */ + if has_target_line { 1 } else { 0 } + 1 /* blank */;
+        let prompt_input_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1 + input_line_offset as u16,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        // hitbox starts at the modal inner edge (area.x+1); text_x adds the 2-col "> " prefix
+        map.fields.push(FieldRegion {
+            id: FieldId::Prompt,
+            area: prompt_input_area,
+            text_x: area.x + 3,
+        });
     }
 
     if let Some(toast) = &app.toast {

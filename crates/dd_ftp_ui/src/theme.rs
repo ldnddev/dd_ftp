@@ -24,6 +24,7 @@ pub struct Theme {
     pub cursor: Color,
     pub scrollbar: Color,
     pub scrollbar_hover: Color,
+    pub selection: Color,
     pub success: Color,
     pub warning: Color,
     pub error: Color,
@@ -56,6 +57,7 @@ impl Default for Theme {
             cursor: Color::Rgb(0x6e, 0xc8, 0xff),
             scrollbar: Color::Rgb(0x2a, 0x2d, 0x31),
             scrollbar_hover: Color::Rgb(0x6e, 0xc8, 0xff),
+            selection: Color::Rgb(0x20, 0x60, 0xa0),
             success: Color::Rgb(0x82, 0xe0, 0xaa),
             warning: Color::Rgb(0xf5, 0xc4, 0x69),
             error: Color::Rgb(0xe5, 0x73, 0x73),
@@ -94,6 +96,7 @@ struct ThemeColors {
     cursor: Option<String>,
     scrollbar: Option<String>,
     scrollbar_hover: Option<String>,
+    selection: Option<String>,
     success: String,
     warning: String,
     error: String,
@@ -215,6 +218,7 @@ fn parse_theme(content: &str) -> anyhow::Result<ThemeFile> {
             cursor: map.get("cursor").cloned(),
             scrollbar: map.get("scrollbar").cloned(),
             scrollbar_hover: map.get("scrollbar_hover").cloned(),
+            selection: map.get("selection").cloned(),
             success: get("success")?,
             warning: get("warning")?,
             error: get("error")?,
@@ -276,6 +280,11 @@ fn map_theme(tf: ThemeFile) -> Theme {
             .as_deref()
             .and_then(parse_hex)
             .unwrap_or(Theme::default().scrollbar_hover),
+        selection: c
+            .selection
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(Theme::default().selection),
         success: parse_hex(&c.success).unwrap_or(Theme::default().success),
         warning: parse_hex(&c.warning).unwrap_or(Theme::default().warning),
         error: parse_hex(&c.error).unwrap_or(Theme::default().error),

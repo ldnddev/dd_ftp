@@ -55,6 +55,13 @@ async fn main() -> Result<()> {
         &mut app,
         Action::SetStatus(format!("Theme loaded: {}", theme_loaded.source.label())),
     );
+    // Theme may override header taglines via `header_quotes`.
+    if !theme_loaded.header_quotes.is_empty() {
+        app.header_copy = dd_ftp_app::random_header_copy_from(&theme_loaded.header_quotes);
+    }
+    if let Some(w) = theme_loaded.warning {
+        app.toast = Some(dd_ftp_app::Toast::warning(w));
+    }
 
     if let Ok(cfg) = SiteManager::load_or_default() {
         if !cfg.sites.is_empty() {

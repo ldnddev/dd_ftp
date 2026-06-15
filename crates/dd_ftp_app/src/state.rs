@@ -1,7 +1,46 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use dd_ftp_core::{ConnectionInfo, FileEntry};
 use dd_ftp_transfer::TransferQueue;
 
 use crate::{TextField, Toast};
+
+/// Built-in header taglines used when the theme supplies no `header_quotes`.
+pub const DEFAULT_HEADER_QUOTES: [&str; 5] = [
+    "Moving bytes so you don't have to.",
+    "Remote files, local comfort.",
+    "Drag, drop, transfer, repeat.",
+    "Your packets are in good hands.",
+    "Now serving: the whole filesystem.",
+];
+
+/// Time-seeded (XOR PID) index: stable within a run, varies per launch.
+fn header_seed() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as usize)
+        .unwrap_or(0)
+        ^ std::process::id() as usize
+}
+
+/// Pick a random built-in header tagline once per launch (LDNDDEV TUI standard).
+pub fn random_header_copy() -> String {
+    DEFAULT_HEADER_QUOTES[header_seed() % DEFAULT_HEADER_QUOTES.len()].to_string()
+}
+
+/// Pick a random tagline from a theme-supplied `header_quotes` list, falling
+/// back to the built-in list when empty.
+pub fn random_header_copy_from(quotes: &[String]) -> String {
+    let pool: Vec<&str> = quotes
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if pool.is_empty() {
+        return random_header_copy();
+    }
+    pool[header_seed() % pool.len()].to_string()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
@@ -68,6 +107,7 @@ pub struct AppState {
     pub selected_local: usize,
     pub selected_remote: usize,
     pub focus: FocusPane,
+    pub header_copy: String,
     pub show_help: bool,
     pub show_theme_debug: bool,
     pub help_scroll: usize,
@@ -162,6 +202,7 @@ impl Default for AppState {
             selected_local: 0,
             selected_remote: 0,
             focus: FocusPane::Local,
+            header_copy: random_header_copy(),
             show_help: false,
             show_theme_debug: false,
             help_scroll: 0,

@@ -22,6 +22,10 @@ impl Toast {
         Self::new(message, ToastLevel::Info)
     }
 
+    pub fn warning(message: String) -> Self {
+        Self::new(message, ToastLevel::Warning)
+    }
+
     pub fn error(message: String) -> Self {
         Self::new(message, ToastLevel::Error)
     }

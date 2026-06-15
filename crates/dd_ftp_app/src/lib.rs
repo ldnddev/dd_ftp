@@ -6,6 +6,8 @@ pub mod toast;
 
 pub use actions::Action;
 pub use reducer::reduce;
-pub use state::{AppState, FocusPane, PromptType, QuickConnectField};
+pub use state::{
+    random_header_copy, random_header_copy_from, AppState, FocusPane, PromptType, QuickConnectField,
+};
 pub use text_field::TextField;
 pub use toast::{Toast, ToastLevel};

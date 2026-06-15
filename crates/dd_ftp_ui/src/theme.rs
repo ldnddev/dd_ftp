@@ -37,40 +37,50 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
+            // Canonical LDNDDEV TUI Visual Standard v1 tokens.
             base_background: Color::Rgb(0x0f, 0x11, 0x14),
-            body_background: Color::Rgb(0x1a, 0x1c, 0x1f),
-            modal_background: Color::Rgb(0x2a, 0x2d, 0x31),
+            body_background: Color::Rgb(0x2a, 0x2d, 0x31),
+            modal_background: Color::Rgb(0x1c, 0x1e, 0x21),
             text_primary: Color::Rgb(0xf5, 0xf6, 0xf7),
             text_secondary: Color::Rgb(0x9e, 0xa3, 0xaa),
-            text_labels: Color::Rgb(0x9e, 0xa3, 0xaa),
-            text_labels_active: Color::Rgb(0x6e, 0xc8, 0xff),
-            text_active_focus: Color::Rgb(0x6e, 0xc8, 0xff),
-            modal_labels: Color::Rgb(0xf5, 0xf6, 0xf7),
+            text_labels: Color::Rgb(0xff, 0xaf, 0x46),
+            text_labels_active: Color::Rgb(0x64, 0xb4, 0xf5),
+            text_active_focus: Color::Rgb(0x64, 0xb4, 0xf5),
+            modal_labels: Color::Rgb(0x64, 0xb4, 0xf5),
             modal_text: Color::Rgb(0xf5, 0xf6, 0xf7),
-            selected_background: Color::Rgb(0x2a, 0x2d, 0x31),
-            border_default: Color::Rgb(0x2a, 0x2d, 0x31),
-            border_active: Color::Rgb(0x6e, 0xc8, 0xff),
-            input_border_default: Color::Rgb(0x5a, 0xb4, 0xf5),
-            input_border_focus: Color::Rgb(0x8c, 0xc8, 0xff),
-            input_text_default: Color::Rgb(0x5a, 0xb4, 0xf5),
-            input_text_focus: Color::Rgb(0x8c, 0xc8, 0xff),
-            cursor: Color::Rgb(0x6e, 0xc8, 0xff),
-            scrollbar: Color::Rgb(0x2a, 0x2d, 0x31),
-            scrollbar_hover: Color::Rgb(0x6e, 0xc8, 0xff),
+            selected_background: Color::Rgb(0x0f, 0x11, 0x14),
+            border_default: Color::Rgb(0xf5, 0xf6, 0xf7),
+            border_active: Color::Rgb(0x64, 0xb4, 0xf5),
+            input_border_default: Color::Rgb(0xf5, 0xf6, 0xf7),
+            input_border_focus: Color::Rgb(0x64, 0xb4, 0xf5),
+            input_text_default: Color::Rgb(0xf5, 0xf6, 0xf7),
+            input_text_focus: Color::Rgb(0x64, 0xb4, 0xf5),
+            cursor: Color::Rgb(0x64, 0xb4, 0xf5),
+            scrollbar: Color::Rgb(0xff, 0xa0, 0x87),
+            scrollbar_hover: Color::Rgb(0x64, 0xb4, 0xf5),
+            // App-specific extra: distinct background for in-field text selection
+            // (drag-select). Not part of the canonical token set.
             selection: Color::Rgb(0x20, 0x60, 0xa0),
             success: Color::Rgb(0x82, 0xe0, 0xaa),
             warning: Color::Rgb(0xf5, 0xc4, 0x69),
             error: Color::Rgb(0xe5, 0x73, 0x73),
             info: Color::Rgb(0x5d, 0xad, 0xe2),
-            folder: Color::Rgb(0x5d, 0xad, 0xe2),
-            file: Color::Rgb(0xf5, 0xf6, 0xf7),
-            link: Color::Rgb(0xf5, 0xc4, 0x69),
+            folder: Color::Rgb(0x64, 0xb4, 0xf5),
+            file: Color::Rgb(0xff, 0xaf, 0x46),
+            link: Color::Rgb(0xff, 0xa0, 0x87),
         }
     }
 }
 
+/// Theme schema version this build understands (LDNDDEV TUI Visual Standard).
+pub const THEME_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Deserialize)]
 struct ThemeFile {
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default)]
+    header_quotes: Option<Vec<String>>,
     colors: ThemeColors,
 }
 
@@ -128,6 +138,14 @@ pub struct LoadedTheme {
     pub theme: Theme,
     pub source: ThemeSource,
     pub path: Option<PathBuf>,
+    /// Schema version declared by the loaded file (None for built-in defaults
+    /// or files missing the field).
+    pub version: Option<u32>,
+    /// Non-fatal load warning (bad version, parse fallback). Surfaced at
+    /// startup as a toast and in the F2 Credits modal.
+    pub warning: Option<String>,
+    /// Optional per-theme header tagline override. Empty = use built-in list.
+    pub header_quotes: Vec<String>,
 }
 
 pub fn load_theme() -> Theme {
@@ -150,10 +168,40 @@ pub fn load_theme_with_source() -> LoadedTheme {
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
                 if let Ok(theme_file) = parse_theme(&content) {
-                    return LoadedTheme {
-                        theme: map_theme(theme_file),
-                        source,
-                        path: Some(path),
+                    let version = theme_file.version;
+                    let header_quotes = theme_file.header_quotes.clone().unwrap_or_default();
+                    let shown = path.display().to_string();
+                    return match version {
+                        Some(v) if v == THEME_SCHEMA_VERSION => LoadedTheme {
+                            theme: map_theme(theme_file),
+                            source,
+                            path: Some(path),
+                            version,
+                            warning: None,
+                            header_quotes,
+                        },
+                        Some(v) => LoadedTheme {
+                            // Unsupported schema version: fall back to defaults.
+                            theme: Theme::default(),
+                            source,
+                            path: Some(path),
+                            version,
+                            warning: Some(format!(
+                                "theme {shown}: unsupported version {v} (expected {THEME_SCHEMA_VERSION}); using built-in defaults"
+                            )),
+                            header_quotes,
+                        },
+                        None => LoadedTheme {
+                            // Missing version: load leniently but warn.
+                            theme: map_theme(theme_file),
+                            source,
+                            path: Some(path),
+                            version,
+                            warning: Some(format!(
+                                "theme {shown}: missing 'version: {THEME_SCHEMA_VERSION}' field; loaded anyway"
+                            )),
+                            header_quotes,
+                        },
                     };
                 }
             }
@@ -164,6 +212,9 @@ pub fn load_theme_with_source() -> LoadedTheme {
         theme: Theme::default(),
         source: ThemeSource::Default,
         path: None,
+        version: None,
+        warning: None,
+        header_quotes: Vec::new(),
     }
 }
 
@@ -197,6 +248,11 @@ fn parse_theme(content: &str) -> anyhow::Result<ThemeFile> {
     };
 
     Ok(ThemeFile {
+        version: map
+            .get("version")
+            .and_then(|v| v.trim().parse::<u32>().ok()),
+        // The line-based fallback parser does not handle YAML lists.
+        header_quotes: None,
         colors: ThemeColors {
             base_background: get("base_background")?,
             body_background: get("body_background")?,

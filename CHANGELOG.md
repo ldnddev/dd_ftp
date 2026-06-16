@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-06-16
+
+### Added
+- Remote file operations now fully wired over the `RemoteSession` trait for SFTP and FTP/FTPS:
+  - rename remote files/directories
+  - delete remote files and directories (`rmdir` vs `unlink`/`rm` chosen by entry kind)
+  - create remote directories (`mkdir`)
+- New trait methods on `dd_ftp_core::RemoteSession`: `rename`, `remove_file`, `remove_dir`, `create_dir` (implemented in `SftpSession` via `ssh2`, and as inherent methods on `UnifiedFtpSession` via `async_ftp`)
+- Mouse support in input fields: click-to-position caret and click+drag text selection, with cursor and selection rendering
+- Keyboard cursor editing in input fields (arrows, Home/End, word delete, selection)
+- `TextField` cursor + selection model now backs the prompt and Quick Connect fields
+- Toast notifications and visual alignment to the shared `LDNDDEV_TUI_VISUAL_STANDARD.md` (theme tokens, layout, spacing)
+
+### Changed
+- New-item prompt: `Ctrl+n` opens a single prompt; `Tab` toggles between File and Folder (replaces `Ctrl+Shift+N`, which conflicted with terminal emulators such as WezTerm)
+- Remote create-file now uploads the staged empty file synchronously before cleanup, so the file reliably exists on the server
+- Remote create/rename/delete refresh the remote pane listing on success
+
+### Fixed
+- Remote rename was a no-op stub ("not implemented") — now performs the operation
+- Remote delete was a no-op stub — now deletes files and directories
+- Remote folder creation was a no-op stub — now creates the directory
+- Remote file creation race: the temp source file was deleted immediately after queuing, so the async worker uploaded nothing; create now completes before the temp is removed
+- Remote paths for create/rename/delete are built from `remote_cwd` + entry name (correct for FTP, whose `FileEntry.path` holds the raw `LIST` line) instead of relying on `entry.path`
+- Scrollbar drag includes cancelled jobs in the queue total; mouse-wheel list scroll is guarded behind open modals
+
 ## [v0.4.0-phase4] - 2026-04-04
 
 ### Added

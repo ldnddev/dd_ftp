@@ -11,4 +11,9 @@ pub trait RemoteSession: Send + Sync {
     async fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>>;
     async fn upload(&self, job: &TransferJob) -> Result<()>;
     async fn download(&self, job: &TransferJob) -> Result<()>;
+
+    async fn rename(&self, from: &str, to: &str) -> Result<()>;
+    async fn remove_file(&self, path: &str) -> Result<()>;
+    async fn remove_dir(&self, path: &str) -> Result<()>;
+    async fn create_dir(&self, path: &str) -> Result<()>;
 }

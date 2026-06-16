@@ -167,6 +167,38 @@ impl UnifiedFtpSession {
         }
     }
 
+    pub async fn rename(&mut self, _variant: FtpVariant, from: &str, to: &str) -> Result<()> {
+        let stream = self.stream.as_mut().context("not connected")?;
+        stream
+            .rename(from, to)
+            .await
+            .with_context(|| format!("FTP rename failed: {from} -> {to}"))
+    }
+
+    pub async fn remove_file(&mut self, _variant: FtpVariant, path: &str) -> Result<()> {
+        let stream = self.stream.as_mut().context("not connected")?;
+        stream
+            .rm(path)
+            .await
+            .with_context(|| format!("FTP delete file failed: {path}"))
+    }
+
+    pub async fn remove_dir(&mut self, _variant: FtpVariant, path: &str) -> Result<()> {
+        let stream = self.stream.as_mut().context("not connected")?;
+        stream
+            .rmdir(path)
+            .await
+            .with_context(|| format!("FTP remove directory failed: {path}"))
+    }
+
+    pub async fn create_dir(&mut self, _variant: FtpVariant, path: &str) -> Result<()> {
+        let stream = self.stream.as_mut().context("not connected")?;
+        stream
+            .mkdir(path)
+            .await
+            .with_context(|| format!("FTP create directory failed: {path}"))
+    }
+
     pub async fn upload(&mut self, _variant: FtpVariant, job: &TransferJob) -> Result<()> {
         let stream = self.stream.as_mut().context("not connected")?;
 

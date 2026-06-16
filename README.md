@@ -84,8 +84,7 @@ export DD_FTP_PATH=/
 - `C` toggle directory compare
 
 ### File operations
-- `Ctrl+n` create file
-- `Ctrl+Shift+n` create folder
+- `Ctrl+n` open new-item prompt (`Tab` toggles between file and folder)
 - `Ctrl+Alt+e` rename selected item
 - `Ctrl+Delete` delete selected item
 

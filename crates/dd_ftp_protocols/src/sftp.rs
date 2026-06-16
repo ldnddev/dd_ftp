@@ -131,6 +131,42 @@ impl SftpSession {
         Ok(out)
     }
 
+    fn rename_sync(info: &ConnectionInfo, from: &str, to: &str) -> Result<()> {
+        let session = Self::open_authenticated_session(info)?;
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
+        sftp.rename(Path::new(from), Path::new(to), None)
+            .with_context(|| format!("failed to rename remote path: {from} -> {to}"))
+    }
+
+    fn remove_file_sync(info: &ConnectionInfo, path: &str) -> Result<()> {
+        let session = Self::open_authenticated_session(info)?;
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
+        sftp.unlink(Path::new(path))
+            .with_context(|| format!("failed to delete remote file: {path}"))
+    }
+
+    fn remove_dir_sync(info: &ConnectionInfo, path: &str) -> Result<()> {
+        let session = Self::open_authenticated_session(info)?;
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
+        sftp.rmdir(Path::new(path))
+            .with_context(|| format!("failed to remove remote directory: {path}"))
+    }
+
+    fn create_dir_sync(info: &ConnectionInfo, path: &str) -> Result<()> {
+        let session = Self::open_authenticated_session(info)?;
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
+        sftp.mkdir(Path::new(path), 0o755)
+            .with_context(|| format!("failed to create remote directory: {path}"))
+    }
+
     fn upload_sync<F>(
         info: &ConnectionInfo,
         job: &TransferJob,
@@ -316,5 +352,42 @@ impl RemoteSession for SftpSession {
     async fn download(&self, job: &TransferJob) -> Result<()> {
         self.download_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
             .await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        tokio::task::spawn_blocking(move || Self::rename_sync(&info, &from, &to))
+            .await
+            .map_err(|e| anyhow!("join error during rename: {e}"))?
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<()> {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let path = path.to_string();
+
+        tokio::task::spawn_blocking(move || Self::remove_file_sync(&info, &path))
+            .await
+            .map_err(|e| anyhow!("join error during remove_file: {e}"))?
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<()> {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let path = path.to_string();
+
+        tokio::task::spawn_blocking(move || Self::remove_dir_sync(&info, &path))
+            .await
+            .map_err(|e| anyhow!("join error during remove_dir: {e}"))?
+    }
+
+    async fn create_dir(&self, path: &str) -> Result<()> {
+        let info = self.info.as_ref().context("not connected")?.clone();
+        let path = path.to_string();
+
+        tokio::task::spawn_blocking(move || Self::create_dir_sync(&info, &path))
+            .await
+            .map_err(|e| anyhow!("join error during create_dir: {e}"))?
     }
 }

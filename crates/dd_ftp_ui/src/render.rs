@@ -546,8 +546,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             Line::from("  B -> save current quick-connect as bookmark"),
             Line::from(""),
             Line::from("File Operations"),
-            Line::from("  Ctrl+n -> create new file"),
-            Line::from("  Ctrl+Shift+n -> create new folder"),
+            Line::from("  Ctrl+n -> new file/folder (Tab toggles)"),
             Line::from("  Ctrl+Alt+e -> rename selected item"),
             Line::from("  Ctrl+Delete -> delete selected item"),
             Line::from(""),
@@ -993,6 +992,21 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         prompt_spans.extend(render_field_line(&app.prompt_value, false, &t));
         lines.push(Line::from(prompt_spans));
         lines.push(Line::from(""));
+        match app.prompt_type {
+            Some(dd_ftp_app::PromptType::CreateFile) => {
+                lines.push(Line::from(vec![Span::styled(
+                    "Tab: switch to Folder",
+                    Style::default().fg(t.text_secondary),
+                )]));
+            }
+            Some(dd_ftp_app::PromptType::CreateFolder) => {
+                lines.push(Line::from(vec![Span::styled(
+                    "Tab: switch to File",
+                    Style::default().fg(t.text_secondary),
+                )]));
+            }
+            _ => {}
+        }
         lines.push(Line::from(vec![Span::styled(
             "Enter to confirm | Esc to cancel",
             Style::default().fg(t.warning),

@@ -671,6 +671,7 @@ async fn run(
                                 }
                                 connect_off_thread(
                                     app,
+                                    session,
                                     &mut io,
                                     info,
                                     &mut cancel_flags,
@@ -739,6 +740,7 @@ async fn run(
                                     }
                                     connect_off_thread(
                                         app,
+                                        session,
                                         &mut io,
                                         bm,
                                         &mut cancel_flags,
@@ -909,6 +911,7 @@ async fn run(
                                 let info = selected_or_quick_connect(app);
                                 connect_off_thread(
                                     app,
+                                    session,
                                     &mut io,
                                     info,
                                     &mut cancel_flags,
@@ -1522,6 +1525,13 @@ fn take_parked_ftp(park: &Arc<Mutex<Option<UnifiedFtpSession>>>) -> Option<Unifi
     park.lock().ok().and_then(|mut g| g.take())
 }
 
+fn drop_ui_sessions(app: &mut AppState, session: &mut SftpSession, io: &mut IoState) {
+    io.sftp = SftpSession::default();
+    *session = SftpSession::default();
+    let _ = take_parked_ftp(&io.ftp_park);
+    app.ftp_session = None;
+}
+
 fn accept_host_key(io: &mut IoState) {
     if let Some(InFlight::HostKey { generation, reply }) = io.in_flight.take() {
         let _ = reply.send(true);
@@ -1605,6 +1615,7 @@ fn handle_io_message(
                     );
                 }
                 Err(err) => {
+                    drop_ui_sessions(app, session, io);
                     reduce(app, Action::SetConnected(false));
                     reduce(app, Action::ShowError(err.to_string()));
                 }
@@ -1856,6 +1867,7 @@ async fn disconnect_session(
 
 async fn connect_off_thread(
     app: &mut AppState,
+    session: &mut SftpSession,
     io: &mut IoState,
     info: ConnectionInfo,
     cancel_flags: &mut Vec<Arc<AtomicBool>>,
@@ -1893,11 +1905,12 @@ async fn connect_off_thread(
         return;
     }
 
-    let supersede = app.connected
-        || app.worker_active_count > 0
-        || !app.queue.active.is_empty()
-        || !worker_handles.is_empty();
-    if supersede {
+    if app.connected || app.ftp_session.is_some() {
+        disconnect_session(app, session, io, cancel_flags, worker_handles).await;
+    }
+    let leftover_workers =
+        app.worker_active_count > 0 || !app.queue.active.is_empty() || !worker_handles.is_empty();
+    if leftover_workers {
         bump_generation_drop_workers(app, io, cancel_flags, worker_handles).await;
     } else {
         bump_generation(io);
@@ -2031,6 +2044,8 @@ fn enqueue_entry(
     if drain_busy(io) {
         return;
     }
+    // User-facing u/d/Enter: clear cancel so spawn may run. Drain enqueue does not.
+    app.worker_cancel_requested = false;
     if entry.kind == dd_ftp_core::EntryKind::Directory {
         start_scan(app, io, entry, direction);
         return;
@@ -2174,16 +2189,27 @@ fn remote_basename(path: &str) -> String {
 fn enqueue_pending_file(app: &mut AppState, file: PendingFile) {
     let mut job = TransferJob::new(file.local_path, file.remote_path, file.direction);
     job.size_bytes = file.size_bytes;
-    reduce(app, Action::QueueTransfer(job));
+    // Drain enqueue must not clear worker_cancel_requested (QueueTransfer does).
+    app.queue.enqueue(job);
+    reduce(
+        app,
+        Action::SetStatus(format!("Queue: {} pending", app.queue.pending.len())),
+    );
 }
 
 fn maybe_resume_drain(app: &mut AppState, io: &mut IoState) {
+    if app.worker_cancel_requested {
+        return;
+    }
     if !io.pending_scan.is_empty() {
         drain_scan_next(app, io);
     }
 }
 
 fn drain_scan_next(app: &mut AppState, io: &mut IoState) {
+    if app.worker_cancel_requested {
+        return;
+    }
     if io_busy(io) {
         return;
     }
@@ -2242,6 +2268,9 @@ fn handle_drain_list_result(
     io: &mut IoState,
     result: Result<Vec<FileEntry>, anyhow::Error>,
 ) {
+    if app.worker_cancel_requested {
+        return;
+    }
     let Some(file) = io.pending_scan.front().cloned() else {
         return;
     };
@@ -2335,6 +2364,9 @@ fn handle_drain_mkdir_result(
     io: &mut IoState,
     result: Result<(), anyhow::Error>,
 ) {
+    if app.worker_cancel_requested {
+        return;
+    }
     match drain_mkdir_outcome(result) {
         Ok(()) => {
             io.mkdir_queue.pop_front();
@@ -2373,6 +2405,9 @@ fn handle_drain_mkdir_result(
 }
 
 fn drain_mkdir_next(app: &mut AppState, io: &mut IoState) {
+    if app.worker_cancel_requested {
+        return;
+    }
     let Some(path) = io.mkdir_queue.front().cloned() else {
         if let Some(file) = io.pending_scan.pop_front() {
             enqueue_pending_file(app, file);
@@ -4192,5 +4227,47 @@ mod worker_gate_tests {
     fn accept_worker_msg_same_generation() {
         assert!(accept_worker_msg(4, 4));
         assert!(!accept_worker_msg(5, 4));
+    }
+
+    fn pending_upload(local: &str, remote: &str) -> PendingFile {
+        PendingFile {
+            local_path: local.to_string(),
+            remote_path: remote.to_string(),
+            direction: TransferDirection::Upload,
+            size_bytes: Some(1),
+        }
+    }
+
+    #[test]
+    fn drain_enqueue_does_not_clear_worker_cancel_requested() {
+        let mut app = AppState {
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        enqueue_pending_file(&mut app, pending_upload("/tmp/a.txt", "/pub/a.txt"));
+        assert!(
+            app.worker_cancel_requested,
+            "drain enqueue must not resume spawn"
+        );
+        assert_eq!(app.queue.pending.len(), 1);
+        assert_eq!(app.queue.pending[0].remote_path, "/pub/a.txt");
+    }
+
+    #[test]
+    fn drain_scan_next_returns_while_cancel_requested() {
+        let mut app = AppState {
+            connected: true,
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        let (mut io, _rx) = test_io();
+        io.pending_scan
+            .push_back(pending_upload("/tmp/a.txt", "/pub/a.txt"));
+        drain_scan_next(&mut app, &mut io);
+        assert_eq!(io.pending_scan.len(), 1);
+        assert!(
+            app.queue.pending.is_empty(),
+            "cancel must not auto-enqueue the rest of a folder drain"
+        );
     }
 }

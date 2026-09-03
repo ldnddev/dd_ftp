@@ -5,6 +5,17 @@ use dd_ftp_transfer::TransferQueue;
 
 use crate::{TextField, Toast};
 
+/// How to place `selected_*` after a listing or filter change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectPolicy {
+    /// Keep the previously selected *name* if it is still visible; else clamp.
+    PreserveName,
+    /// Keep the numeric index, clamp to `visible_len.saturating_sub(1)`.
+    Clamp,
+    /// Select 0 (first visible row: `.` locally, or the first real entry remotely).
+    Reset,
+}
+
 /// Built-in header taglines used when the theme supplies no `header_quotes`.
 pub const DEFAULT_HEADER_QUOTES: [&str; 5] = [
     "Moving bytes so you don't have to.",
@@ -209,6 +220,32 @@ impl AppState {
     pub fn is_choice_prompt(&self) -> bool {
         matches!(self.prompt_kind, Some(PromptKind::Choice(_)))
     }
+
+    pub fn entry_visible(name: &str, pattern: &str) -> bool {
+        pattern.is_empty() || name.to_lowercase().contains(&pattern.to_lowercase())
+    }
+
+    pub fn visible_local(&self) -> Vec<&FileEntry> {
+        self.local_entries
+            .iter()
+            .filter(|e| Self::entry_visible(&e.name, &self.filter_pattern))
+            .collect()
+    }
+
+    pub fn visible_remote(&self) -> Vec<&FileEntry> {
+        self.remote_entries
+            .iter()
+            .filter(|e| Self::entry_visible(&e.name, &self.filter_pattern))
+            .collect()
+    }
+
+    pub fn selected_local_entry(&self) -> Option<&FileEntry> {
+        self.visible_local().get(self.selected_local).copied()
+    }
+
+    pub fn selected_remote_entry(&self) -> Option<&FileEntry> {
+        self.visible_remote().get(self.selected_remote).copied()
+    }
 }
 
 impl Default for AppState {
@@ -252,5 +289,65 @@ impl Default for AppState {
             queue: TransferQueue::default(),
             ftp_session: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod visible_tests {
+    use super::*;
+    use crate::{reduce, Action};
+    use dd_ftp_core::{EntryKind, FileEntry};
+
+    fn fe(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: name.to_string(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    #[test]
+    fn visible_local_table() {
+        struct Case {
+            pattern: &'static str,
+            want: &'static [&'static str],
+        }
+        let entries = vec![fe("a"), fe("Foo"), fe("afoo"), fe("bar")];
+        let cases = [
+            Case {
+                pattern: "",
+                want: &["a", "Foo", "afoo", "bar"],
+            },
+            Case {
+                pattern: "foo",
+                want: &["Foo", "afoo"],
+            },
+        ];
+        for case in cases {
+            let s = AppState {
+                local_entries: entries.clone(),
+                filter_pattern: case.pattern.to_string(),
+                ..Default::default()
+            };
+            let names: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, case.want, "pattern {:?}", case.pattern);
+        }
+    }
+
+    #[test]
+    fn visible_local_selection_clamps_when_pattern_shrinks_list_to_one() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b"), fe("c")],
+            selected_local: 2,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::FilterInput('a'));
+        assert_eq!(s.visible_local().len(), 1);
+        assert_eq!(s.selected_local, 0);
+        assert_eq!(s.selected_local_entry().map(|e| e.name.as_str()), Some("a"));
     }
 }

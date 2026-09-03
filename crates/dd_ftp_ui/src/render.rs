@@ -82,6 +82,13 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         } else {
             t.base_background
         };
+        let (visible, total) = match app.focus {
+            FocusPane::Local | FocusPane::Queue => {
+                (app.visible_local().len(), app.local_entries.len())
+            }
+            FocusPane::Remote => (app.visible_remote().len(), app.remote_entries.len()),
+        };
+        let count = format!("  ({visible}/{total})");
         let filter = Paragraph::new(Line::from(vec![
             Span::styled(" Filter: ", Style::default().fg(t.text_labels)),
             Span::styled(&app.filter_pattern, Style::default().fg(t.input_text_focus)),
@@ -91,6 +98,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     .fg(t.cursor)
                     .add_modifier(Modifier::RAPID_BLINK),
             ),
+            Span::styled(count, Style::default().fg(t.text_secondary)),
         ]))
         .style(Style::default().bg(filter_bg));
         frame.render_widget(filter, vertical[1]);
@@ -171,19 +179,10 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     map.local_list = panes[0];
     map.remote_list = panes[1];
 
-    let filter_match = |name: &str| {
-        if app.filter_pattern.is_empty() {
-            true
-        } else {
-            name.to_lowercase()
-                .contains(&app.filter_pattern.to_lowercase())
-        }
-    };
-
-    let local_items: Vec<ListItem> = app
-        .local_entries
-        .iter()
-        .filter(|e| filter_match(&e.name))
+    let local_visible = app.visible_local();
+    let local_visible_len = local_visible.len();
+    let local_items: Vec<ListItem> = local_visible
+        .into_iter()
         .map(|e| {
             let color = match e.kind {
                 dd_ftp_core::EntryKind::Directory => t.folder,
@@ -201,10 +200,10 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             ))
         })
         .collect();
-    let remote_items: Vec<ListItem> = app
-        .remote_entries
-        .iter()
-        .filter(|e| filter_match(&e.name))
+    let remote_visible = app.visible_remote();
+    let remote_visible_len = remote_visible.len();
+    let remote_items: Vec<ListItem> = remote_visible
+        .into_iter()
         .map(|e| {
             let color = match e.kind {
                 dd_ftp_core::EntryKind::Directory => t.folder,
@@ -331,7 +330,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         frame,
         panes[0],
         app.selected_local,
-        app.local_entries.len(),
+        local_visible_len,
         t.scrollbar,
         t.scrollbar_hover,
         app.mouse_pos,
@@ -340,7 +339,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         frame,
         panes[1],
         app.selected_remote,
-        app.remote_entries.len(),
+        remote_visible_len,
         t.scrollbar,
         t.scrollbar_hover,
         app.mouse_pos,

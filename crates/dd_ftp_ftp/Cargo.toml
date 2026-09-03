@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 async_ftp.workspace = true
 chrono.workspace = true
 dd_ftp_core = { path = "../dd_ftp_core" }

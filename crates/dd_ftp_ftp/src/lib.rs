@@ -11,8 +11,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, TransferJob};
+use dd_ftp_core::{
+    ConnectionInfo, CoreError, EntryKind, FileEntry, ProgressCb, Protocol, RemoteSession,
+    TransferJob,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_rustls::rustls::{client::ServerName, ClientConfig, OwnedTrustAnchor, RootCertStore};
 use uuid::Uuid;
@@ -29,6 +33,7 @@ pub enum FtpVariant {
 pub struct UnifiedFtpSession {
     stream: Option<async_ftp::FtpStream>,
     info: Option<ConnectionInfo>,
+    variant: Option<FtpVariant>,
 }
 
 impl std::fmt::Debug for UnifiedFtpSession {
@@ -50,6 +55,15 @@ impl UnifiedFtpSession {
         Self {
             stream: None,
             info: None,
+            variant: None,
+        }
+    }
+
+    fn variant_from_info(info: &ConnectionInfo) -> Result<FtpVariant> {
+        match info.protocol {
+            Protocol::Ftp => Ok(FtpVariant::Ftp),
+            Protocol::Ftps => Ok(FtpVariant::Ftps),
+            Protocol::Sftp => bail!("UnifiedFtpSession cannot connect via SFTP"),
         }
     }
 
@@ -111,7 +125,8 @@ impl UnifiedFtpSession {
         Ok(secure)
     }
 
-    pub async fn connect(&mut self, variant: FtpVariant, info: ConnectionInfo) -> Result<()> {
+    pub async fn connect(&mut self, info: ConnectionInfo) -> Result<()> {
+        let variant = Self::variant_from_info(&info)?;
         let mut stream = match variant {
             FtpVariant::Ftp => Self::login_stream(&info).await?,
             FtpVariant::Ftps => Self::login_secure_stream(&info).await?,
@@ -124,6 +139,7 @@ impl UnifiedFtpSession {
 
         self.stream = Some(stream);
         self.info = Some(info);
+        self.variant = Some(variant);
         Ok(())
     }
 
@@ -132,10 +148,11 @@ impl UnifiedFtpSession {
             stream.quit().await.ok();
         }
         self.info = None;
+        self.variant = None;
         Ok(())
     }
 
-    pub async fn list_dir(&mut self, _variant: FtpVariant, path: &str) -> Result<Vec<FileEntry>> {
+    pub async fn list_dir(&mut self, path: &str) -> Result<Vec<FileEntry>> {
         let stream = self.stream.as_mut().context("not connected")?;
 
         stream
@@ -151,7 +168,7 @@ impl UnifiedFtpSession {
         Ok(parse_list_entries(path, entries))
     }
 
-    pub async fn rename(&mut self, _variant: FtpVariant, from: &str, to: &str) -> Result<()> {
+    pub async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         let stream = self.stream.as_mut().context("not connected")?;
         stream
             .rename(from, to)
@@ -159,7 +176,7 @@ impl UnifiedFtpSession {
             .with_context(|| format!("FTP rename failed: {from} -> {to}"))
     }
 
-    pub async fn remove_file(&mut self, _variant: FtpVariant, path: &str) -> Result<()> {
+    pub async fn remove_file(&mut self, path: &str) -> Result<()> {
         let stream = self.stream.as_mut().context("not connected")?;
         stream
             .rm(path)
@@ -167,7 +184,7 @@ impl UnifiedFtpSession {
             .with_context(|| format!("FTP delete file failed: {path}"))
     }
 
-    pub async fn remove_dir(&mut self, _variant: FtpVariant, path: &str) -> Result<()> {
+    pub async fn remove_dir(&mut self, path: &str) -> Result<()> {
         let stream = self.stream.as_mut().context("not connected")?;
         stream
             .rmdir(path)
@@ -175,7 +192,7 @@ impl UnifiedFtpSession {
             .with_context(|| format!("FTP remove directory failed: {path}"))
     }
 
-    pub async fn create_dir(&mut self, _variant: FtpVariant, path: &str) -> Result<()> {
+    pub async fn create_dir(&mut self, path: &str) -> Result<()> {
         let stream = self.stream.as_mut().context("not connected")?;
         stream
             .mkdir(path)
@@ -183,14 +200,18 @@ impl UnifiedFtpSession {
             .with_context(|| format!("FTP create directory failed: {path}"))
     }
 
-    pub async fn upload(&mut self, _variant: FtpVariant, job: &TransferJob) -> Result<()> {
+    pub async fn upload(&mut self, job: &TransferJob) -> Result<()> {
         self.upload_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
             .await
     }
 
-    pub async fn download(&mut self, _variant: FtpVariant, job: &TransferJob) -> Result<()> {
+    pub async fn download(&mut self, job: &TransferJob) -> Result<()> {
         self.download_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
             .await
+    }
+
+    pub async fn set_permissions(&mut self, _path: &str, _mode: u32) -> Result<()> {
+        Err(anyhow::Error::from(CoreError::Unsupported("chmod")))
     }
 
     pub async fn upload_with_progress<F>(
@@ -276,6 +297,67 @@ impl UnifiedFtpSession {
             })
             .await
             .with_context(|| format!("FTP download failed from {remote_path}"))
+    }
+}
+
+#[async_trait]
+impl RemoteSession for UnifiedFtpSession {
+    async fn connect(&mut self, info: ConnectionInfo) -> Result<()> {
+        UnifiedFtpSession::connect(self, info).await
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        UnifiedFtpSession::disconnect(self).await
+    }
+
+    async fn list_dir(&mut self, path: &str) -> Result<Vec<FileEntry>> {
+        UnifiedFtpSession::list_dir(self, path).await
+    }
+
+    async fn upload(&mut self, job: &TransferJob) -> Result<()> {
+        UnifiedFtpSession::upload(self, job).await
+    }
+
+    async fn download(&mut self, job: &TransferJob) -> Result<()> {
+        UnifiedFtpSession::download(self, job).await
+    }
+
+    async fn upload_with_progress(
+        &mut self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: ProgressCb,
+    ) -> Result<()> {
+        UnifiedFtpSession::upload_with_progress(self, job, cancel, on_progress).await
+    }
+
+    async fn download_with_progress(
+        &mut self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: ProgressCb,
+    ) -> Result<()> {
+        UnifiedFtpSession::download_with_progress(self, job, cancel, on_progress).await
+    }
+
+    async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        UnifiedFtpSession::rename(self, from, to).await
+    }
+
+    async fn remove_file(&mut self, path: &str) -> Result<()> {
+        UnifiedFtpSession::remove_file(self, path).await
+    }
+
+    async fn remove_dir(&mut self, path: &str) -> Result<()> {
+        UnifiedFtpSession::remove_dir(self, path).await
+    }
+
+    async fn create_dir(&mut self, path: &str) -> Result<()> {
+        UnifiedFtpSession::create_dir(self, path).await
+    }
+
+    async fn set_permissions(&mut self, path: &str, mode: u32) -> Result<()> {
+        UnifiedFtpSession::set_permissions(self, path, mode).await
     }
 }
 

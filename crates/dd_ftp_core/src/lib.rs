@@ -5,6 +5,7 @@ pub mod traits;
 pub mod transfer;
 
 pub use connection::{ConnectionInfo, Protocol};
+pub use error::CoreError;
 pub use filesystem::{EntryKind, FileEntry};
-pub use traits::RemoteSession;
+pub use traits::{ProgressCb, RemoteSession};
 pub use transfer::{TransferDirection, TransferJob, TransferStatus};

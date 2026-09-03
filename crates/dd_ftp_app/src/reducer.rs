@@ -261,6 +261,38 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ClearError => {
             state.toast = None;
         }
+        Action::SetFocus(pane) => {
+            state.set_focus(pane);
+        }
+        Action::SelectIndex { pane, index } => match pane {
+            FocusPane::Local => {
+                let last = state.visible_local().len().saturating_sub(1);
+                state.selected_local = index.min(last);
+            }
+            FocusPane::Remote => {
+                let last = state.visible_remote().len().saturating_sub(1);
+                state.selected_remote = index.min(last);
+            }
+            FocusPane::Queue => {}
+        },
+        Action::HelpScroll(delta) => {
+            if delta < 0 {
+                state.help_scroll = state
+                    .help_scroll
+                    .saturating_sub(delta.unsigned_abs() as usize);
+            } else {
+                state.help_scroll = state.help_scroll.saturating_add(delta as usize);
+            }
+        }
+        Action::QueueScroll(delta) => {
+            if delta < 0 {
+                state.queue_scroll = state
+                    .queue_scroll
+                    .saturating_sub(delta.unsigned_abs() as usize);
+            } else {
+                state.queue_scroll = state.queue_scroll.saturating_add(delta as usize);
+            }
+        }
         Action::FocusNextPane => {
             let next = match state.focus {
                 FocusPane::Local => FocusPane::Remote,
@@ -841,6 +873,299 @@ mod worker_flag_tests {
         );
         assert_eq!(s.worker_active_count, 0);
         assert!(!s.worker_running);
+        assert!(s.worker_cancel_requested);
+    }
+}
+
+#[cfg(test)]
+mod reduce_table_tests {
+    use super::*;
+    use crate::{AppState, SelectPolicy};
+    use dd_ftp_core::{EntryKind, FileEntry, TransferDirection, TransferJob, TransferStatus};
+
+    fn fe(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: name.to_string(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    fn job(local: &str, remote: &str) -> TransferJob {
+        TransferJob::new(local, remote, TransferDirection::Upload)
+    }
+
+    #[test]
+    fn set_local_entries_policies() {
+        struct Case {
+            name: &'static str,
+            initial: &'static [&'static str],
+            selected: usize,
+            next: &'static [&'static str],
+            policy: SelectPolicy,
+            want_name: &'static str,
+            want_idx: usize,
+        }
+        let cases = [
+            Case {
+                name: "preserve_name",
+                initial: &["a", "keep", "z"],
+                selected: 1,
+                next: &["new", "keep", "z"],
+                policy: SelectPolicy::PreserveName,
+                want_name: "keep",
+                want_idx: 1,
+            },
+            Case {
+                name: "reset",
+                initial: &["a", "b"],
+                selected: 1,
+                next: &["x", "y", "z"],
+                policy: SelectPolicy::Reset,
+                want_name: "x",
+                want_idx: 0,
+            },
+            Case {
+                name: "clamp",
+                initial: &["a", "b", "c"],
+                selected: 2,
+                next: &["only"],
+                policy: SelectPolicy::Clamp,
+                want_name: "only",
+                want_idx: 0,
+            },
+        ];
+        for case in cases {
+            let mut s = AppState {
+                local_entries: case.initial.iter().map(|n| fe(n)).collect(),
+                selected_local: case.selected,
+                ..Default::default()
+            };
+            reduce(
+                &mut s,
+                Action::SetLocalEntries {
+                    entries: case.next.iter().map(|n| fe(n)).collect(),
+                    select: case.policy,
+                },
+            );
+            assert_eq!(s.selected_local, case.want_idx, "{}", case.name);
+            assert_eq!(
+                s.selected_local_entry().unwrap().name,
+                case.want_name,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn set_remote_entries_policies() {
+        struct Case {
+            name: &'static str,
+            initial: &'static [&'static str],
+            selected: usize,
+            next: &'static [&'static str],
+            policy: SelectPolicy,
+            want_name: &'static str,
+            want_idx: usize,
+        }
+        let cases = [
+            Case {
+                name: "preserve_name",
+                initial: &["a", "keep", "z"],
+                selected: 1,
+                next: &["new", "keep", "z"],
+                policy: SelectPolicy::PreserveName,
+                want_name: "keep",
+                want_idx: 1,
+            },
+            Case {
+                name: "reset",
+                initial: &["a", "b"],
+                selected: 1,
+                next: &["x", "y", "z"],
+                policy: SelectPolicy::Reset,
+                want_name: "x",
+                want_idx: 0,
+            },
+            Case {
+                name: "clamp",
+                initial: &["a", "b", "c"],
+                selected: 2,
+                next: &["only"],
+                policy: SelectPolicy::Clamp,
+                want_name: "only",
+                want_idx: 0,
+            },
+        ];
+        for case in cases {
+            let mut s = AppState {
+                remote_entries: case.initial.iter().map(|n| fe(n)).collect(),
+                selected_remote: case.selected,
+                ..Default::default()
+            };
+            reduce(
+                &mut s,
+                Action::SetRemoteEntries {
+                    entries: case.next.iter().map(|n| fe(n)).collect(),
+                    select: case.policy,
+                },
+            );
+            assert_eq!(s.selected_remote, case.want_idx, "{}", case.name);
+            assert_eq!(
+                s.selected_remote_entry().unwrap().name,
+                case.want_name,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn select_up_down_at_bounds() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b"), fe("c")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::SelectUp);
+        assert_eq!(s.selected_local, 0);
+        reduce(&mut s, Action::SelectDown);
+        reduce(&mut s, Action::SelectDown);
+        reduce(&mut s, Action::SelectDown);
+        assert_eq!(s.selected_local, 2);
+        reduce(&mut s, Action::SelectDown);
+        assert_eq!(s.selected_local, 2);
+
+        s.focus = FocusPane::Remote;
+        s.remote_entries = vec![fe("r0"), fe("r1")];
+        s.selected_remote = 0;
+        reduce(&mut s, Action::SelectUp);
+        assert_eq!(s.selected_remote, 0);
+        reduce(&mut s, Action::SelectDown);
+        reduce(&mut s, Action::SelectDown);
+        assert_eq!(s.selected_remote, 1);
+    }
+
+    #[test]
+    fn toggle_filter_clears_pattern() {
+        let mut s = AppState {
+            filter_pattern: "foo".into(),
+            show_filter: true,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleFilter);
+        assert!(!s.show_filter);
+        assert!(s.filter_pattern.is_empty());
+    }
+
+    #[test]
+    fn queue_transfer_increments_pending_and_clears_cancel() {
+        let mut s = AppState {
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/a", "/pub/a")));
+        assert_eq!(s.queue.pending.len(), 1);
+        assert!(!s.worker_cancel_requested);
+    }
+
+    #[test]
+    fn set_connected_true_does_not_clear_cancel_flag() {
+        let mut s = AppState {
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::SetConnected(true));
+        assert!(s.connected);
+        assert!(s.worker_cancel_requested);
+    }
+
+    #[test]
+    fn mark_transfer_completed_moves_active() {
+        let mut s = AppState::default();
+        let j = job("/tmp/a", "/pub/a");
+        reduce(&mut s, Action::QueueTransfer(j.clone()));
+        let started = s.queue.start_next().expect("started");
+        assert_eq!(s.queue.active.len(), 1);
+        reduce(&mut s, Action::MarkTransferCompleted(started));
+        assert!(s.queue.active.is_empty());
+        assert_eq!(s.queue.completed.len(), 1);
+        assert_eq!(s.queue.completed[0].status, TransferStatus::Completed);
+    }
+
+    #[test]
+    fn update_transfer_progress_writes_active_bytes() {
+        let mut s = AppState::default();
+        let j = job("/tmp/a", "/pub/a");
+        reduce(&mut s, Action::QueueTransfer(j));
+        let started = s.queue.start_next().expect("started");
+        reduce(
+            &mut s,
+            Action::UpdateTransferProgress {
+                job_id: started.id,
+                transferred_bytes: 42,
+                size_bytes: Some(100),
+            },
+        );
+        assert_eq!(s.queue.active[0].transferred_bytes, 42);
+        assert_eq!(s.queue.active[0].size_bytes, Some(100));
+    }
+
+    #[test]
+    fn clear_pending_transfers_empties_pending() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/a", "/pub/a")));
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/b", "/pub/b")));
+        reduce(&mut s, Action::ClearPendingTransfers);
+        assert!(s.queue.pending.is_empty());
+    }
+
+    #[test]
+    fn show_error_sets_toast_and_status() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ShowError("boom".into()));
+        assert!(s.toast.is_some());
+        assert!(s.status.contains("boom"));
+    }
+
+    #[test]
+    fn set_focus_updates_focus_and_last_file_pane() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::SetFocus(FocusPane::Remote));
+        assert_eq!(s.focus, FocusPane::Remote);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+        reduce(&mut s, Action::SetFocus(FocusPane::Queue));
+        assert_eq!(s.focus, FocusPane::Queue);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+    }
+
+    #[test]
+    fn toggle_compare_flips() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleCompare);
+        assert!(s.show_compare);
+        reduce(&mut s, Action::ToggleCompare);
+        assert!(!s.show_compare);
+    }
+
+    #[test]
+    fn set_worker_view_copies_counters() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::SetWorkerView {
+                active_count: 2,
+                running: true,
+                cancel_requested: true,
+            },
+        );
+        assert_eq!(s.worker_active_count, 2);
+        assert!(s.worker_running);
         assert!(s.worker_cancel_requested);
     }
 }

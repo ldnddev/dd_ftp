@@ -201,7 +201,6 @@ pub struct AppState {
     pub toast: Option<Toast>,
     pub queue_scroll: usize,
     pub queue: TransferQueue,
-    pub ftp_session: Option<dd_ftp_ftp::UnifiedFtpSession>,
     /// Host-key ChoicePrompt fields. Oneshot is not stored here.
     pub host_key: Option<HostKeyView>,
     /// Overwrite ChoicePrompt fields. pending_scan on the CLI run stack is source of truth.
@@ -345,7 +344,6 @@ impl Default for AppState {
             toast: None,
             queue_scroll: 0,
             queue: TransferQueue::default(),
-            ftp_session: None,
             host_key: None,
             overwrite: None,
         }

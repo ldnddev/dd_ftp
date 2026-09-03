@@ -180,9 +180,10 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     let local_visible = app.visible_local();
     let local_visible_len = local_visible.len();
     let local_row_width = panes[0].width.saturating_sub(4) as usize;
+    let local_cols = meta_columns(local_row_width.saturating_sub(6));
     let local_items: Vec<ListItem> = local_visible
         .into_iter()
-        .map(|e| file_list_item(e, local_row_width, &t))
+        .map(|e| file_list_item(e, local_row_width, local_cols, &t))
         .collect();
     let remote_visible = if app.connected {
         app.visible_remote()
@@ -191,9 +192,10 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     };
     let remote_visible_len = remote_visible.len();
     let remote_row_width = panes[1].width.saturating_sub(4) as usize;
+    let remote_cols = meta_columns(remote_row_width.saturating_sub(6));
     let remote_items: Vec<ListItem> = remote_visible
         .into_iter()
-        .map(|e| file_list_item(e, remote_row_width, &t))
+        .map(|e| file_list_item(e, remote_row_width, remote_cols, &t))
         .collect();
 
     let local_style = if app.focus == FocusPane::Local {
@@ -1206,7 +1208,55 @@ fn inner_list_rect(area: Rect) -> Rect {
     }
 }
 
-fn file_list_item(entry: &dd_ftp_core::FileEntry, width: usize, t: &Theme) -> ListItem<'static> {
+#[derive(Debug, Clone, Copy)]
+struct MetaColumns {
+    size: bool,
+    date: bool,
+    perms: bool,
+}
+
+const SIZE_COL: usize = 5;
+const DATE_COL: usize = 16;
+const PERMS_COL: usize = 4;
+const META_GAP: usize = 2;
+
+fn meta_columns(max_width: usize) -> MetaColumns {
+    let size_w = META_GAP + SIZE_COL;
+    let date_w = META_GAP + DATE_COL;
+    let perms_w = META_GAP + PERMS_COL;
+    if max_width >= size_w + date_w + perms_w {
+        MetaColumns {
+            size: true,
+            date: true,
+            perms: true,
+        }
+    } else if max_width >= size_w + date_w {
+        MetaColumns {
+            size: true,
+            date: true,
+            perms: false,
+        }
+    } else if max_width >= size_w {
+        MetaColumns {
+            size: true,
+            date: false,
+            perms: false,
+        }
+    } else {
+        MetaColumns {
+            size: false,
+            date: false,
+            perms: false,
+        }
+    }
+}
+
+fn file_list_item(
+    entry: &dd_ftp_core::FileEntry,
+    width: usize,
+    cols: MetaColumns,
+    t: &Theme,
+) -> ListItem<'static> {
     let color = match entry.kind {
         dd_ftp_core::EntryKind::Directory => t.folder,
         dd_ftp_core::EntryKind::Symlink => t.link,
@@ -1217,7 +1267,7 @@ fn file_list_item(entry: &dd_ftp_core::FileEntry, width: usize, t: &Theme) -> Li
     } else {
         "  "
     };
-    let meta = entry_meta(entry, width.saturating_sub(6));
+    let meta = entry_meta(entry, cols);
     let meta_len = meta.chars().count();
     let name_max = width
         .saturating_sub(prefix.chars().count() + meta_len)
@@ -1235,30 +1285,27 @@ fn file_list_item(entry: &dd_ftp_core::FileEntry, width: usize, t: &Theme) -> Li
     ]))
 }
 
-fn entry_meta(entry: &dd_ftp_core::FileEntry, max_width: usize) -> String {
-    let size = format!("{:>5}", format_size(entry.size));
-    let date = entry
-        .modified
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_default();
-    let date_f = format!("{date:>16}");
-    let with_perms = if let Some(p) = entry.permissions.as_ref() {
-        format!("  {size}  {date_f}  {p}")
-    } else {
-        String::new()
-    };
-    if !with_perms.is_empty() && with_perms.chars().count() <= max_width {
-        return with_perms;
+fn entry_meta(entry: &dd_ftp_core::FileEntry, cols: MetaColumns) -> String {
+    let mut meta = String::new();
+    if cols.size {
+        meta.push_str(&format!(
+            "  {:>width$}",
+            format_size(entry.size),
+            width = SIZE_COL
+        ));
     }
-    let with_date = format!("  {size}  {date_f}");
-    if with_date.chars().count() <= max_width {
-        return with_date;
+    if cols.date {
+        let date = entry
+            .modified
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        meta.push_str(&format!("  {date:>width$}", width = DATE_COL));
     }
-    let size_only = format!("  {size}");
-    if size_only.chars().count() <= max_width {
-        return size_only;
+    if cols.perms {
+        let perms = entry.permissions.as_deref().unwrap_or("");
+        meta.push_str(&format!("  {perms:<width$}", width = PERMS_COL));
     }
-    String::new()
+    meta
 }
 
 fn format_size(bytes: u64) -> String {
@@ -1442,4 +1489,44 @@ fn render_compare_view(frame: &mut Frame, area: Rect, app: &AppState, t: &Theme)
         );
 
     frame.render_widget(compare_block, area);
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use dd_ftp_core::{EntryKind, FileEntry};
+
+    fn entry(name: &str, size: u64, perms: Option<&str>) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            path: name.into(),
+            kind: EntryKind::File,
+            size,
+            modified: None,
+            permissions: perms.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn size_and_date_columns_align_with_and_without_perms() {
+        let cols = MetaColumns {
+            size: true,
+            date: true,
+            perms: true,
+        };
+        let with = entry_meta(&entry("a.bin", 1234, Some("644")), cols);
+        let without = entry_meta(&entry(".", 0, None), cols);
+        assert_eq!(with.chars().count(), without.chars().count());
+        assert_eq!(&with[..7], "   1.2K");
+        assert_eq!(&without[..7], "      0");
+        assert_eq!(&with[7..25], &without[7..25]);
+    }
+
+    #[test]
+    fn meta_columns_drop_suffix_from_pane_width() {
+        assert!(meta_columns(31).perms);
+        assert!(meta_columns(25).date && !meta_columns(25).perms);
+        assert!(meta_columns(7).size && !meta_columns(7).date);
+        assert!(!meta_columns(6).size);
+    }
 }

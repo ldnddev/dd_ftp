@@ -711,9 +711,12 @@ async fn run(
                                         );
                                     }
                                     Err(err) => {
-                                        let msg = format!("Remote refresh failed: {err}");
-                                        reduce(app, Action::SetStatus(msg.clone()));
-                                        reduce(app, Action::ShowError(msg));
+                                        reduce(
+                                            app,
+                                            Action::ShowError(format!(
+                                                "Remote refresh failed: {err}"
+                                            )),
+                                        );
                                     }
                                 }
                             } else {
@@ -1088,9 +1091,10 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
                             );
                         }
                         Err(err) => {
-                            let msg = format!("Remote enter failed: {err}");
-                            reduce(app, Action::SetStatus(msg.clone()));
-                            reduce(app, Action::ShowError(msg));
+                            reduce(
+                                app,
+                                Action::ShowError(format!("Remote enter failed: {err}")),
+                            );
                         }
                     }
                 } else {
@@ -1150,9 +1154,10 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
                     );
                 }
                 Err(err) => {
-                    let msg = format!("Remote parent failed: {err}");
-                    reduce(app, Action::SetStatus(msg.clone()));
-                    reduce(app, Action::ShowError(msg));
+                    reduce(
+                        app,
+                        Action::ShowError(format!("Remote parent failed: {err}")),
+                    );
                 }
             }
         }
@@ -1170,9 +1175,7 @@ async fn list_remote(
         (Some(ftp), Some(Protocol::Ftp)) => ftp.list_dir(FtpVariant::Ftp, path).await,
         (Some(ftp), Some(Protocol::Ftps)) => ftp.list_dir(FtpVariant::Ftps, path).await,
         (Some(_), _) => {
-            let msg = "Unknown FTP variant".to_string();
-            reduce(app, Action::SetStatus(msg.clone()));
-            reduce(app, Action::ShowError(msg));
+            reduce(app, Action::ShowError("Unknown FTP variant".to_string()));
             Ok(Vec::new())
         }
         (None, _) => session.list_dir(path).await,
@@ -1192,9 +1195,7 @@ async fn relist_remote(app: &mut AppState, session: &mut SftpSession) {
             );
         }
         Err(err) => {
-            let msg = format!("Remote list failed: {err}");
-            reduce(app, Action::SetStatus(msg.clone()));
-            reduce(app, Action::ShowError(msg));
+            reduce(app, Action::ShowError(format!("Remote list failed: {err}")));
         }
     }
 }
@@ -1265,9 +1266,7 @@ async fn handle_worker_result(
                         );
                     }
                     Err(err) => {
-                        let msg = format!("Remote list failed: {err}");
-                        reduce(app, Action::SetStatus(msg.clone()));
-                        reduce(app, Action::ShowError(msg));
+                        reduce(app, Action::ShowError(format!("Remote list failed: {err}")));
                     }
                 }
             }
@@ -1275,9 +1274,7 @@ async fn handle_worker_result(
         Err(err) => {
             msg.job.last_error = Some(err.to_string());
             reduce(app, Action::MarkTransferFailed(msg.job));
-            let text = format!("Transfer failed: {err}");
-            reduce(app, Action::SetStatus(text.clone()));
-            reduce(app, Action::ShowError(text));
+            reduce(app, Action::ShowError(format!("Transfer failed: {err}")));
         }
     }
 }
@@ -1364,12 +1361,13 @@ async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: 
         }
         Err(err) => {
             reduce(app, Action::SetConnected(false));
-            let text = format!(
-                "Connect failed for {}@{}:{} via {:?} -> {err}",
-                info.username, info.host, info.port, info.protocol
+            reduce(
+                app,
+                Action::ShowError(format!(
+                    "Connect failed for {}@{}:{} via {:?} -> {err}",
+                    info.username, info.host, info.port, info.protocol
+                )),
             );
-            reduce(app, Action::SetStatus(text.clone()));
-            reduce(app, Action::ShowError(text));
         }
     }
 }

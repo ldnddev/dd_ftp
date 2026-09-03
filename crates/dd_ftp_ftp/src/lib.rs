@@ -253,7 +253,7 @@ fn parse_list_entries(base_path: &str, lines: Vec<String>) -> Vec<FileEntry> {
 
 fn parse_list_line(base_path: &str, line: &str) -> Option<FileEntry> {
     let line = line.trim();
-    if line.is_empty() {
+    if line.is_empty() || is_total_header(line) {
         return None;
     }
 
@@ -313,6 +313,17 @@ fn parse_unparsed_list_line(base_path: &str, line: &str) -> FileEntry {
         modified: None,
         permissions: None,
     }
+}
+
+fn is_total_header(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return false;
+    };
+    first.eq_ignore_ascii_case("total") && second.parse::<u64>().is_ok()
 }
 
 fn extract_filename_from_list_line(line: &str) -> String {
@@ -492,6 +503,23 @@ mod parse_list_tests {
         assert_eq!(e.size, 0);
         assert!(e.modified.is_none());
         assert!(e.permissions.is_none());
+    }
+
+    #[test]
+    fn parse_list_entries_skips_total_header() {
+        let entries = parse_list_entries(
+            "/pub",
+            vec![
+                "total 64".into(),
+                "Total 128".into(),
+                "-rw-r--r-- 1 user group 1 Jan  2 12:00 a.txt".into(),
+            ],
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "a.txt");
+        assert!(entries
+            .iter()
+            .all(|e| !e.name.to_lowercase().starts_with("total")));
     }
 
     #[test]

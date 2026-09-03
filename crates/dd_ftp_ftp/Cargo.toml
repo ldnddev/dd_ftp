@@ -12,4 +12,5 @@ chrono.workspace = true
 dd_ftp_core = { path = "../dd_ftp_core" }
 tokio.workspace = true
 tokio-rustls.workspace = true
+uuid.workspace = true
 webpki-roots.workspace = true

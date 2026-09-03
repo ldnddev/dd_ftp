@@ -32,6 +32,7 @@ use dd_ftp_protocols::SftpSession;
 use dd_ftp_storage::{SecretStore, SiteManager};
 use dd_ftp_ui::{hit_test, ControlId, FieldId, Pane, Region, ScrollRegion};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const SCROLL_STEP: usize = 3;
@@ -110,6 +111,7 @@ async fn run(
         in_flight: None,
         io_tx,
         ftp_park: Arc::new(Mutex::new(None)),
+        sftp: SftpSession::default(),
         list_select: SelectPolicy::PreserveName,
         list_ok_status: None,
         list_err_prefix: "Remote list failed".to_string(),
@@ -122,6 +124,7 @@ async fn run(
         mkdir_queue: VecDeque::new(),
     };
     let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
+    let mut worker_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut last_click: Option<(u16, u16, Instant)> = None;
     let mut drag: Option<dd_ftp_ui::ScrollRegion> = None;
     let mut drag_field: Option<dd_ftp_ui::FieldId> = None;
@@ -134,10 +137,14 @@ async fn run(
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 WorkerMessage::Progress {
+                    generation,
                     job_id,
                     transferred_bytes,
                     size_bytes,
                 } => {
+                    if !accept_worker_msg(io.generation, generation) {
+                        continue;
+                    }
                     reduce(
                         app,
                         Action::UpdateTransferProgress {
@@ -147,7 +154,10 @@ async fn run(
                         },
                     );
                 }
-                WorkerMessage::Done(result) => {
+                WorkerMessage::Done { generation, result } => {
+                    if !accept_worker_msg(io.generation, generation) {
+                        continue;
+                    }
                     app.worker_active_count = app.worker_active_count.saturating_sub(1);
                     app.worker_running = app.worker_active_count > 0;
                     cancel_flags.retain(|f| !Arc::ptr_eq(f, &result.cancel_flag));
@@ -161,17 +171,19 @@ async fn run(
         }
 
         // Start background workers for queued transfers up to max concurrency.
-        while app.connected
-            && app.worker_active_count < app.worker_max_concurrency
-            && !app.queue.pending.is_empty()
-        {
+        while should_spawn(
+            app.connected,
+            app.worker_cancel_requested,
+            app.worker_active_count,
+            app.worker_max_concurrency,
+            app.queue.pending.len(),
+        ) {
             let Some(job) = app.queue.start_next() else {
                 break;
             };
 
             app.worker_active_count += 1;
             app.worker_running = true;
-            app.worker_cancel_requested = false;
             reduce(
                 app,
                 Action::SetStatus(format!(
@@ -196,8 +208,9 @@ async fn run(
             let tx_clone = tx.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             cancel_flags.push(cancel.clone());
+            let generation = io.generation;
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut worker_session = SftpSession::default();
                 let protocol = info.protocol.clone();
 
@@ -210,6 +223,7 @@ async fn run(
                                     let tx_progress = tx_clone.clone();
                                     move |job_id: Uuid, transferred, size| {
                                         let _ = tx_progress.send(WorkerMessage::Progress {
+                                            generation,
                                             job_id,
                                             transferred_bytes: transferred,
                                             size_bytes: size,
@@ -243,24 +257,48 @@ async fn run(
                             Protocol::Ftp => FtpVariant::Ftp,
                             Protocol::Ftps => FtpVariant::Ftps,
                             Protocol::Sftp => {
-                                let _ = tx_clone.send(WorkerMessage::Done(WorkerResult {
-                                    job,
-                                    outcome: Err(anyhow::anyhow!("Unexpected SFTP in FTP worker")),
-                                    was_cancelled: false,
-                                    cancel_flag: cancel,
-                                }));
+                                let _ = tx_clone.send(WorkerMessage::Done {
+                                    generation,
+                                    result: WorkerResult {
+                                        job,
+                                        outcome: Err(anyhow::anyhow!(
+                                            "Unexpected SFTP in FTP worker"
+                                        )),
+                                        was_cancelled: false,
+                                        cancel_flag: cancel,
+                                    },
+                                });
                                 return;
                             }
                         };
 
                         match unified.connect(variant, info.clone()).await {
                             Ok(_) => {
+                                let progress_tx = {
+                                    let tx_progress = tx_clone.clone();
+                                    move |job_id: Uuid, transferred, size| {
+                                        let _ = tx_progress.send(WorkerMessage::Progress {
+                                            generation,
+                                            job_id,
+                                            transferred_bytes: transferred,
+                                            size_bytes: size,
+                                        });
+                                    }
+                                };
                                 let result = match job.direction {
                                     TransferDirection::Upload => {
-                                        unified.upload(variant, &job).await
+                                        unified
+                                            .upload_with_progress(&job, cancel.clone(), progress_tx)
+                                            .await
                                     }
                                     TransferDirection::Download => {
-                                        unified.download(variant, &job).await
+                                        unified
+                                            .download_with_progress(
+                                                &job,
+                                                cancel.clone(),
+                                                progress_tx,
+                                            )
+                                            .await
                                     }
                                 };
                                 unified.disconnect().await.ok();
@@ -271,13 +309,17 @@ async fn run(
                     }
                 };
 
-                let _ = tx_clone.send(WorkerMessage::Done(WorkerResult {
-                    job,
-                    outcome,
-                    was_cancelled: cancel.load(Ordering::Relaxed),
-                    cancel_flag: cancel,
-                }));
+                let _ = tx_clone.send(WorkerMessage::Done {
+                    generation,
+                    result: WorkerResult {
+                        job,
+                        outcome,
+                        was_cancelled: cancel.load(Ordering::Relaxed),
+                        cancel_flag: cancel,
+                    },
+                });
             });
+            worker_handles.push(handle);
         }
 
         if event::poll(Duration::from_millis(150))? {
@@ -408,7 +450,16 @@ async fn run(
                                 reduce(app, Action::CancelPrompt);
                             }
                             KeyCode::Char('y') | KeyCode::Char('Y') => match kind {
-                                ChoicePromptKind::ConfirmQuit => return Ok(()),
+                                ChoicePromptKind::ConfirmQuit => {
+                                    bump_generation_drop_workers(
+                                        app,
+                                        &mut io,
+                                        &mut cancel_flags,
+                                        &mut worker_handles,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
                                 ChoicePromptKind::ConfirmDelete => {
                                     let target = app.prompt_target.clone();
                                     reduce(app, Action::ConfirmPrompt);
@@ -430,7 +481,16 @@ async fn run(
                                 ChoicePromptKind::Overwrite => {}
                             },
                             KeyCode::Char('q') => match kind {
-                                ChoicePromptKind::ConfirmQuit => return Ok(()),
+                                ChoicePromptKind::ConfirmQuit => {
+                                    bump_generation_drop_workers(
+                                        app,
+                                        &mut io,
+                                        &mut cancel_flags,
+                                        &mut worker_handles,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
                                 ChoicePromptKind::HostKey => {
                                     reject_host_key(&mut io);
                                     reduce(app, Action::CancelPrompt);
@@ -609,7 +669,14 @@ async fn run(
                                         info.password = Some(secret);
                                     }
                                 }
-                                connect_off_thread(app, &mut io, info);
+                                connect_off_thread(
+                                    app,
+                                    &mut io,
+                                    info,
+                                    &mut cancel_flags,
+                                    &mut worker_handles,
+                                )
+                                .await;
                                 reduce(app, Action::ToggleQuickConnect);
                             }
                             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -651,7 +718,14 @@ async fn run(
                                     app.bookmarks.get(app.selected_bookmark).cloned()
                                 {
                                     if app.connected {
-                                        disconnect_session(app, session, &mut io).await;
+                                        disconnect_session(
+                                            app,
+                                            session,
+                                            &mut io,
+                                            &mut cancel_flags,
+                                            &mut worker_handles,
+                                        )
+                                        .await;
                                     }
                                     if bm.password.is_none() {
                                         if let Ok(Some(secret)) = SecretStore::load_password(
@@ -663,7 +737,14 @@ async fn run(
                                             bm.password = Some(secret);
                                         }
                                     }
-                                    connect_off_thread(app, &mut io, bm);
+                                    connect_off_thread(
+                                        app,
+                                        &mut io,
+                                        bm,
+                                        &mut cancel_flags,
+                                        &mut worker_handles,
+                                    )
+                                    .await;
                                     reduce(app, Action::ToggleBookmarks);
                                 }
                             }
@@ -816,10 +897,24 @@ async fn run(
                         }
                         KeyCode::Char('c') => {
                             if app.connected {
-                                disconnect_session(app, session, &mut io).await;
+                                disconnect_session(
+                                    app,
+                                    session,
+                                    &mut io,
+                                    &mut cancel_flags,
+                                    &mut worker_handles,
+                                )
+                                .await;
                             } else {
                                 let info = selected_or_quick_connect(app);
-                                connect_off_thread(app, &mut io, info);
+                                connect_off_thread(
+                                    app,
+                                    &mut io,
+                                    info,
+                                    &mut cancel_flags,
+                                    &mut worker_handles,
+                                )
+                                .await;
                             }
                         }
                         KeyCode::Char('u') => {
@@ -1238,11 +1333,29 @@ struct WorkerResult {
 #[derive(Debug)]
 enum WorkerMessage {
     Progress {
+        generation: u64,
         job_id: Uuid,
         transferred_bytes: u64,
         size_bytes: Option<u64>,
     },
-    Done(WorkerResult),
+    Done {
+        generation: u64,
+        result: WorkerResult,
+    },
+}
+
+fn should_spawn(
+    connected: bool,
+    cancel_requested: bool,
+    active: usize,
+    max: usize,
+    pending_len: usize,
+) -> bool {
+    connected && !cancel_requested && active < max && pending_len > 0
+}
+
+fn accept_worker_msg(current: u64, msg_gen: u64) -> bool {
+    current == msg_gen
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1330,6 +1443,7 @@ struct IoState {
     in_flight: Option<InFlight>,
     io_tx: mpsc::UnboundedSender<IoMessage>,
     ftp_park: Arc<Mutex<Option<UnifiedFtpSession>>>,
+    sftp: SftpSession,
     list_select: SelectPolicy,
     list_ok_status: Option<String>,
     list_err_prefix: String,
@@ -1365,6 +1479,43 @@ fn clear_scan_state(io: &mut IoState) {
 fn bump_generation(io: &mut IoState) {
     io.generation = io.generation.wrapping_add(1);
     clear_scan_state(io);
+}
+
+async fn wait_worker_handles(handles: &mut Vec<JoinHandle<()>>) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        for handle in handles.drain(..) {
+            let _ = handle.await;
+        }
+    })
+    .await;
+    handles.clear();
+}
+
+async fn bump_generation_drop_workers(
+    app: &mut AppState,
+    io: &mut IoState,
+    cancel_flags: &mut Vec<Arc<AtomicBool>>,
+    worker_handles: &mut Vec<JoinHandle<()>>,
+) {
+    bump_generation(io);
+    for flag in cancel_flags.iter() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    reduce(
+        app,
+        Action::SetWorkerView {
+            active_count: 0,
+            running: false,
+            cancel_requested: true,
+        },
+    );
+    let active = std::mem::take(&mut app.queue.active);
+    for job in active {
+        reduce(app, Action::MarkTransferCancelled(job));
+    }
+    reduce(app, Action::ClearPendingTransfers);
+    wait_worker_handles(worker_handles).await;
+    cancel_flags.clear();
 }
 
 fn take_parked_ftp(park: &Arc<Mutex<Option<UnifiedFtpSession>>>) -> Option<UnifiedFtpSession> {
@@ -1408,6 +1559,7 @@ fn handle_io_message(
                     session: sftp,
                     entries,
                 }) => {
+                    io.sftp = sftp.clone();
                     *session = sftp;
                     app.ftp_session = None;
                     reduce(app, Action::SetConnected(true));
@@ -1432,6 +1584,7 @@ fn handle_io_message(
                     session: ftp,
                     entries,
                 }) => {
+                    io.sftp = SftpSession::default();
                     *session = SftpSession::default();
                     app.ftp_session = Some(ftp);
                     reduce(app, Action::SetConnected(true));
@@ -1633,14 +1786,7 @@ fn handle_worker_result(
     io: &mut IoState,
     mut msg: WorkerResult,
 ) {
-    if app.worker_active_count == 0 {
-        app.worker_cancel_requested = false;
-    }
-
     if app.worker_cancel_requested || msg.was_cancelled {
-        if app.worker_active_count == 0 {
-            app.worker_cancel_requested = false;
-        }
         msg.job.last_error = Some("Cancelled by user".to_string());
         reduce(app, Action::MarkTransferCancelled(msg.job));
         return;
@@ -1677,12 +1823,18 @@ fn handle_worker_result(
     }
 }
 
-async fn disconnect_session(app: &mut AppState, session: &mut SftpSession, io: &mut IoState) {
+async fn disconnect_session(
+    app: &mut AppState,
+    session: &mut SftpSession,
+    io: &mut IoState,
+    cancel_flags: &mut Vec<Arc<AtomicBool>>,
+    worker_handles: &mut Vec<JoinHandle<()>>,
+) {
     if let Some(InFlight::HostKey { reply, .. }) = io.in_flight.take() {
         let _ = reply.send(false);
     }
     io.in_flight = None;
-    bump_generation(io);
+    bump_generation_drop_workers(app, io, cancel_flags, worker_handles).await;
     reduce(app, Action::CancelPrompt);
     let _ = take_parked_ftp(&io.ftp_park);
     if let Some(mut ftp) = app.ftp_session.take() {
@@ -1690,12 +1842,9 @@ async fn disconnect_session(app: &mut AppState, session: &mut SftpSession, io: &
     }
     match session.disconnect().await {
         Ok(_) => {
+            io.sftp = SftpSession::default();
             reduce(app, Action::Disconnect);
             app.remote_entries.clear();
-            app.queue.active.clear();
-            app.worker_running = false;
-            app.worker_active_count = 0;
-            app.worker_cancel_requested = false;
             app.active_connection = None;
             reduce(app, Action::SetStatus("Disconnected".to_string()));
         }
@@ -1705,7 +1854,13 @@ async fn disconnect_session(app: &mut AppState, session: &mut SftpSession, io: &
     }
 }
 
-fn connect_off_thread(app: &mut AppState, io: &mut IoState, info: ConnectionInfo) {
+async fn connect_off_thread(
+    app: &mut AppState,
+    io: &mut IoState,
+    info: ConnectionInfo,
+    cancel_flags: &mut Vec<Arc<AtomicBool>>,
+    worker_handles: &mut Vec<JoinHandle<()>>,
+) {
     if io_busy(io) {
         return;
     }
@@ -1738,7 +1893,15 @@ fn connect_off_thread(app: &mut AppState, io: &mut IoState, info: ConnectionInfo
         return;
     }
 
-    bump_generation(io);
+    let supersede = app.connected
+        || app.worker_active_count > 0
+        || !app.queue.active.is_empty()
+        || !worker_handles.is_empty();
+    if supersede {
+        bump_generation_drop_workers(app, io, cancel_flags, worker_handles).await;
+    } else {
+        bump_generation(io);
+    }
     let gen = io.generation;
     io.in_flight = Some(InFlight::Connect { generation: gen });
 
@@ -2468,7 +2631,8 @@ async fn walk_remote_files(
     let mut stack = vec![(remote_root, local_root)];
     match info.protocol {
         Protocol::Sftp => {
-            let session = SftpSession::with_info(info);
+            let mut session = SftpSession::default();
+            session.connect(info).await?;
             while let Some((remote_dir, local_dir)) = stack.pop() {
                 let entries = session.list_dir(&remote_dir).await?;
                 push_remote_entries(
@@ -2577,7 +2741,7 @@ fn request_list(
 
     let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
     let ftp = app.ftp_session.take();
-    let sftp_info = app.active_connection.clone();
+    let sftp = io.sftp.clone();
     let io_tx = io.io_tx.clone();
     let park = io.ftp_park.clone();
 
@@ -2589,10 +2753,7 @@ fn request_list(
                 (Some(f), Some(Protocol::Ftp)) => f.list_dir(FtpVariant::Ftp, &path).await,
                 (Some(f), Some(Protocol::Ftps)) => f.list_dir(FtpVariant::Ftps, &path).await,
                 (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
-                (None, _) => {
-                    let info = sftp_info.ok_or_else(|| anyhow::anyhow!("not connected"))?;
-                    SftpSession::with_info(info).list_dir(&path).await
-                }
+                (None, _) => sftp.list_dir(&path).await,
             }
         })
         .await
@@ -2617,15 +2778,12 @@ fn request_fs(app: &mut AppState, io: &mut IoState, kind: FsKind, path: String) 
     }
     io.drain_mkdir = true;
     begin_fs(app, io, kind, true, format!("Creating folder: {path}"));
-    spawn_remote_fs(app, io, kind, move |mut ftp, variant, info| async move {
+    spawn_remote_fs(app, io, kind, move |mut ftp, variant, sftp| async move {
         let result = match (&mut ftp, variant) {
             (Some(f), Some(Protocol::Ftp)) => f.create_dir(FtpVariant::Ftp, &path).await,
             (Some(f), Some(Protocol::Ftps)) => f.create_dir(FtpVariant::Ftps, &path).await,
             (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
-            (None, _) => match info {
-                Some(info) => SftpSession::with_info(info).create_dir(&path).await,
-                None => Err(anyhow::anyhow!("not connected")),
-            },
+            (None, _) => sftp.create_dir(&path).await,
         };
         (ftp, result)
     });
@@ -3113,9 +3271,7 @@ fn spawn_local_fs(io: &IoState, kind: FsKind, work: impl FnOnce() -> Result<()> 
 
 fn spawn_remote_fs<F, Fut>(app: &mut AppState, io: &IoState, kind: FsKind, work: F)
 where
-    F: FnOnce(Option<UnifiedFtpSession>, Option<Protocol>, Option<ConnectionInfo>) -> Fut
-        + Send
-        + 'static,
+    F: FnOnce(Option<UnifiedFtpSession>, Option<Protocol>, SftpSession) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = (Option<UnifiedFtpSession>, Result<()>)> + Send,
 {
     let gen = io.generation;
@@ -3123,9 +3279,9 @@ where
     let park = io.ftp_park.clone();
     let ftp = app.ftp_session.take();
     let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
-    let sftp_info = app.active_connection.clone();
+    let sftp = io.sftp.clone();
     tokio::spawn(async move {
-        let (ftp, result) = work(ftp, variant_opt, sftp_info).await;
+        let (ftp, result) = work(ftp, variant_opt, sftp).await;
         if let Some(f) = ftp {
             if let Ok(mut g) = park.lock() {
                 *g = Some(f);
@@ -3187,7 +3343,7 @@ fn create_file(app: &mut AppState, io: &mut IoState, name: &str) {
                 app,
                 io,
                 FsKind::CreateFile,
-                move |mut ftp, variant, info| async move {
+                move |mut ftp, variant, sftp| async move {
                     let result = async {
                         std::fs::File::create(&temp_file)?;
                         let job = TransferJob::new(
@@ -3201,10 +3357,7 @@ fn create_file(app: &mut AppState, io: &mut IoState, name: &str) {
                                 f.upload(FtpVariant::Ftps, &job).await
                             }
                             (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
-                            (None, _) => {
-                                let info = info.ok_or_else(|| anyhow::anyhow!("not connected"))?;
-                                SftpSession::with_info(info).upload(&job).await
-                            }
+                            (None, _) => sftp.upload(&job).await,
                         };
                         let _ = std::fs::remove_file(&temp_file);
                         r
@@ -3265,7 +3418,7 @@ fn create_folder(app: &mut AppState, io: &mut IoState, name: &str) {
                 app,
                 io,
                 FsKind::CreateFolder,
-                move |mut ftp, variant, info| async move {
+                move |mut ftp, variant, sftp| async move {
                     let result = match (&mut ftp, variant) {
                         (Some(f), Some(Protocol::Ftp)) => {
                             f.create_dir(FtpVariant::Ftp, &path).await
@@ -3274,10 +3427,7 @@ fn create_folder(app: &mut AppState, io: &mut IoState, name: &str) {
                             f.create_dir(FtpVariant::Ftps, &path).await
                         }
                         (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
-                        (None, _) => match info {
-                            Some(info) => SftpSession::with_info(info).create_dir(&path).await,
-                            None => Err(anyhow::anyhow!("not connected")),
-                        },
+                        (None, _) => sftp.create_dir(&path).await,
                     };
                     (ftp, result)
                 },
@@ -3362,7 +3512,7 @@ fn rename_item(app: &mut AppState, io: &mut IoState, _target: &str, new_name: &s
                 app,
                 io,
                 FsKind::Rename,
-                move |mut ftp, variant, info| async move {
+                move |mut ftp, variant, sftp| async move {
                     let result = match (&mut ftp, variant) {
                         (Some(f), Some(Protocol::Ftp)) => {
                             f.rename(FtpVariant::Ftp, &from, &to).await
@@ -3371,10 +3521,7 @@ fn rename_item(app: &mut AppState, io: &mut IoState, _target: &str, new_name: &s
                             f.rename(FtpVariant::Ftps, &from, &to).await
                         }
                         (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
-                        (None, _) => match info {
-                            Some(info) => SftpSession::with_info(info).rename(&from, &to).await,
-                            None => Err(anyhow::anyhow!("not connected")),
-                        },
+                        (None, _) => sftp.rename(&from, &to).await,
                     };
                     (ftp, result)
                 },
@@ -3458,7 +3605,7 @@ fn delete_item(app: &mut AppState, io: &mut IoState, target: &str) {
                 app,
                 io,
                 FsKind::Delete,
-                move |mut ftp, variant, info| async move {
+                move |mut ftp, variant, sftp| async move {
                     let result = match (&mut ftp, variant) {
                         (Some(f), Some(Protocol::Ftp)) => {
                             if is_dir {
@@ -3475,17 +3622,13 @@ fn delete_item(app: &mut AppState, io: &mut IoState, target: &str) {
                             }
                         }
                         (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
-                        (None, _) => match info {
-                            Some(info) => {
-                                let s = SftpSession::with_info(info);
-                                if is_dir {
-                                    s.remove_dir(&path).await
-                                } else {
-                                    s.remove_file(&path).await
-                                }
+                        (None, _) => {
+                            if is_dir {
+                                sftp.remove_dir(&path).await
+                            } else {
+                                sftp.remove_file(&path).await
                             }
-                            None => Err(anyhow::anyhow!("not connected")),
-                        },
+                        }
                     };
                     (ftp, result)
                 },
@@ -3704,6 +3847,7 @@ fn test_io() -> (IoState, mpsc::UnboundedReceiver<IoMessage>) {
             in_flight: None,
             io_tx,
             ftp_park: Arc::new(Mutex::new(None)),
+            sftp: SftpSession::default(),
             list_select: SelectPolicy::PreserveName,
             list_ok_status: None,
             list_err_prefix: "Remote list failed".to_string(),
@@ -4027,5 +4171,26 @@ mod scan_tests {
         assert_eq!(names, vec!["ok.txt".to_string()]);
         assert!(!files.iter().any(|f| f.local_path.contains("/loop/")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod worker_gate_tests {
+    use super::*;
+
+    #[test]
+    fn should_spawn_false_when_cancel_requested() {
+        assert!(!should_spawn(true, true, 0, 2, 3));
+    }
+
+    #[test]
+    fn should_spawn_true_when_idle_with_pending() {
+        assert!(should_spawn(true, false, 0, 2, 3));
+    }
+
+    #[test]
+    fn accept_worker_msg_same_generation() {
+        assert!(accept_worker_msg(4, 4));
+        assert!(!accept_worker_msg(5, 4));
     }
 }

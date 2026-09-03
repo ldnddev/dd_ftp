@@ -4,8 +4,8 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -27,10 +27,19 @@ pub struct HostKeyOffer {
     pub changed: bool,
 }
 
-#[derive(Default)]
+/// Authenticated SFTP handle. `ssh2::Session` is not Sync; ops serialize on the mutex
+/// and run in `spawn_blocking`. UI reuses `inner`; workers open their own session.
+#[derive(Clone, Default)]
 pub struct SftpSession {
-    connected: bool,
+    inner: Option<Arc<Mutex<Session>>>,
     info: Option<ConnectionInfo>,
+    reconnect_count: Arc<AtomicUsize>,
+}
+
+fn lock_session(inner: &Arc<Mutex<Session>>) -> Result<std::sync::MutexGuard<'_, Session>> {
+    inner
+        .lock()
+        .map_err(|_| anyhow!("sftp session lock poisoned"))
 }
 
 /// TCP connect with an explicit timeout after DNS resolution.
@@ -214,22 +223,42 @@ fn verify_host_key(
 }
 
 impl SftpSession {
-    /// Info-only handle. PR 4 reconnects per call; PR 6 fills a persistent inner.
+    /// Info-only handle without a live socket. Call `connect` to fill `inner`.
     pub fn with_info(info: ConnectionInfo) -> Self {
         Self {
-            connected: true,
+            inner: None,
             info: Some(info),
+            reconnect_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    fn open_authenticated_session(info: &ConnectionInfo) -> Result<Session> {
-        Self::open_authenticated_session_with_handler(info, None)
+    #[cfg(test)]
+    pub fn reconnect_count(&self) -> usize {
+        self.reconnect_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn install_connected_inner_for_test(&mut self) {
+        self.reconnect_count.fetch_add(1, Ordering::SeqCst);
+        self.inner = Some(Arc::new(Mutex::new(
+            Session::new().expect("ssh2 session for test inner"),
+        )));
+        self.info = Some(ConnectionInfo::default());
+    }
+
+    fn open_authenticated_session(
+        info: &ConnectionInfo,
+        reconnect_count: &Arc<AtomicUsize>,
+    ) -> Result<Session> {
+        Self::open_authenticated_session_with_handler(info, None, reconnect_count)
     }
 
     fn open_authenticated_session_with_handler(
         info: &ConnectionInfo,
         mut on_challenge: Option<Box<dyn FnOnce(HostKeyOffer) -> bool + Send>>,
+        reconnect_count: &Arc<AtomicUsize>,
     ) -> Result<Session> {
+        reconnect_count.fetch_add(1, Ordering::SeqCst);
         let tcp = tcp_connect(info.host.as_str(), info.port, TCP_CONNECT_TIMEOUT)
             .with_context(|| format!("tcp connect failed: {}:{}", info.host, info.port))?;
 
@@ -294,8 +323,7 @@ impl SftpSession {
         }
     }
 
-    fn list_dir_sync(info: &ConnectionInfo, path: &str) -> Result<Vec<FileEntry>> {
-        let session = Self::open_authenticated_session(info)?;
+    fn list_dir_sync(session: &Session, path: &str) -> Result<Vec<FileEntry>> {
         let sftp = session
             .sftp()
             .context("failed to initialize sftp subsystem")?;
@@ -339,8 +367,7 @@ impl SftpSession {
         Ok(out)
     }
 
-    fn rename_sync(info: &ConnectionInfo, from: &str, to: &str) -> Result<()> {
-        let session = Self::open_authenticated_session(info)?;
+    fn rename_sync(session: &Session, from: &str, to: &str) -> Result<()> {
         let sftp = session
             .sftp()
             .context("failed to initialize sftp subsystem")?;
@@ -348,8 +375,7 @@ impl SftpSession {
             .with_context(|| format!("failed to rename remote path: {from} -> {to}"))
     }
 
-    fn remove_file_sync(info: &ConnectionInfo, path: &str) -> Result<()> {
-        let session = Self::open_authenticated_session(info)?;
+    fn remove_file_sync(session: &Session, path: &str) -> Result<()> {
         let sftp = session
             .sftp()
             .context("failed to initialize sftp subsystem")?;
@@ -357,8 +383,7 @@ impl SftpSession {
             .with_context(|| format!("failed to delete remote file: {path}"))
     }
 
-    fn remove_dir_sync(info: &ConnectionInfo, path: &str) -> Result<()> {
-        let session = Self::open_authenticated_session(info)?;
+    fn remove_dir_sync(session: &Session, path: &str) -> Result<()> {
         let sftp = session
             .sftp()
             .context("failed to initialize sftp subsystem")?;
@@ -366,8 +391,7 @@ impl SftpSession {
             .with_context(|| format!("failed to remove remote directory: {path}"))
     }
 
-    fn create_dir_sync(info: &ConnectionInfo, path: &str) -> Result<()> {
-        let session = Self::open_authenticated_session(info)?;
+    fn create_dir_sync(session: &Session, path: &str) -> Result<()> {
         let sftp = session
             .sftp()
             .context("failed to initialize sftp subsystem")?;
@@ -376,7 +400,7 @@ impl SftpSession {
     }
 
     fn upload_sync<F>(
-        info: &ConnectionInfo,
+        session: &Session,
         job: &TransferJob,
         cancel: Arc<AtomicBool>,
         mut on_progress: F,
@@ -384,7 +408,6 @@ impl SftpSession {
     where
         F: FnMut(u64, Option<u64>) + Send + 'static,
     {
-        let session = Self::open_authenticated_session(info)?;
         let sftp = session
             .sftp()
             .context("failed to initialize sftp subsystem")?;
@@ -419,7 +442,7 @@ impl SftpSession {
     }
 
     fn download_sync<F>(
-        info: &ConnectionInfo,
+        session: &Session,
         job: &TransferJob,
         cancel: Arc<AtomicBool>,
         mut on_progress: F,
@@ -427,7 +450,6 @@ impl SftpSession {
     where
         F: FnMut(u64, Option<u64>) + Send + 'static,
     {
-        let session = Self::open_authenticated_session(info)?;
         let sftp = session
             .sftp()
             .context("failed to initialize sftp subsystem")?;
@@ -476,7 +498,7 @@ impl SftpSession {
     where
         F: Fn(Uuid, u64, Option<u64>) + Send + Sync + 'static,
     {
-        let info = self.info.as_ref().context("not connected")?.clone();
+        let inner = self.inner.clone().context("not connected")?;
         let job = job.clone();
         let on_progress = Arc::new(on_progress);
 
@@ -488,7 +510,8 @@ impl SftpSession {
                     on_progress(job_id, transferred, size);
                 }
             };
-            Self::upload_sync(&info, &job, cancel, on_progress_closure)
+            let session = lock_session(&inner)?;
+            Self::upload_sync(&session, &job, cancel, on_progress_closure)
         })
         .await
         .map_err(|e| anyhow!("join error during upload_with_progress: {e}"))?
@@ -503,7 +526,7 @@ impl SftpSession {
     where
         F: Fn(Uuid, u64, Option<u64>) + Send + Sync + 'static,
     {
-        let info = self.info.as_ref().context("not connected")?.clone();
+        let inner = self.inner.clone().context("not connected")?;
         let job = job.clone();
         let on_progress = Arc::new(on_progress);
 
@@ -515,7 +538,8 @@ impl SftpSession {
                     on_progress(job_id, transferred, size);
                 }
             };
-            Self::download_sync(&info, &job, cancel, on_progress_closure)
+            let session = lock_session(&inner)?;
+            Self::download_sync(&session, &job, cancel, on_progress_closure)
         })
         .await
         .map_err(|e| anyhow!("join error during download_with_progress: {e}"))?
@@ -532,13 +556,18 @@ impl SftpSession {
         F: FnOnce(HostKeyOffer) -> bool + Send + 'static,
     {
         let probe_info = info.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::open_authenticated_session_with_handler(&probe_info, Some(Box::new(handler)))
+        let reconnect_count = Arc::clone(&self.reconnect_count);
+        let session = tokio::task::spawn_blocking(move || {
+            Self::open_authenticated_session_with_handler(
+                &probe_info,
+                Some(Box::new(handler)),
+                &reconnect_count,
+            )
         })
         .await
         .map_err(|e| anyhow!("join error during connect: {e}"))??;
 
-        self.connected = true;
+        self.inner = Some(Arc::new(Mutex::new(session)));
         self.info = Some(info);
         Ok(())
     }
@@ -548,30 +577,36 @@ impl SftpSession {
 impl RemoteSession for SftpSession {
     async fn connect(&mut self, info: ConnectionInfo) -> Result<()> {
         let probe_info = info.clone();
+        let reconnect_count = Arc::clone(&self.reconnect_count);
 
-        tokio::task::spawn_blocking(move || Self::open_authenticated_session(&probe_info))
-            .await
-            .map_err(|e| anyhow!("join error during connect: {e}"))??;
+        let session = tokio::task::spawn_blocking(move || {
+            Self::open_authenticated_session(&probe_info, &reconnect_count)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during connect: {e}"))??;
 
-        self.connected = true;
+        self.inner = Some(Arc::new(Mutex::new(session)));
         self.info = Some(info);
 
         Ok(())
     }
 
     async fn disconnect(&mut self) -> Result<()> {
-        self.connected = false;
+        self.inner = None;
         self.info = None;
         Ok(())
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>> {
-        let info = self.info.as_ref().context("not connected")?.clone();
+        let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
-        tokio::task::spawn_blocking(move || Self::list_dir_sync(&info, &path))
-            .await
-            .map_err(|e| anyhow!("join error during list_dir: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            let session = lock_session(&inner)?;
+            Self::list_dir_sync(&session, &path)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during list_dir: {e}"))?
     }
 
     async fn upload(&self, job: &TransferJob) -> Result<()> {
@@ -585,40 +620,52 @@ impl RemoteSession for SftpSession {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let info = self.info.as_ref().context("not connected")?.clone();
+        let inner = self.inner.clone().context("not connected")?;
         let from = from.to_string();
         let to = to.to_string();
 
-        tokio::task::spawn_blocking(move || Self::rename_sync(&info, &from, &to))
-            .await
-            .map_err(|e| anyhow!("join error during rename: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            let session = lock_session(&inner)?;
+            Self::rename_sync(&session, &from, &to)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during rename: {e}"))?
     }
 
     async fn remove_file(&self, path: &str) -> Result<()> {
-        let info = self.info.as_ref().context("not connected")?.clone();
+        let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
-        tokio::task::spawn_blocking(move || Self::remove_file_sync(&info, &path))
-            .await
-            .map_err(|e| anyhow!("join error during remove_file: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            let session = lock_session(&inner)?;
+            Self::remove_file_sync(&session, &path)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during remove_file: {e}"))?
     }
 
     async fn remove_dir(&self, path: &str) -> Result<()> {
-        let info = self.info.as_ref().context("not connected")?.clone();
+        let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
-        tokio::task::spawn_blocking(move || Self::remove_dir_sync(&info, &path))
-            .await
-            .map_err(|e| anyhow!("join error during remove_dir: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            let session = lock_session(&inner)?;
+            Self::remove_dir_sync(&session, &path)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during remove_dir: {e}"))?
     }
 
     async fn create_dir(&self, path: &str) -> Result<()> {
-        let info = self.info.as_ref().context("not connected")?.clone();
+        let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
-        tokio::task::spawn_blocking(move || Self::create_dir_sync(&info, &path))
-            .await
-            .map_err(|e| anyhow!("join error during create_dir: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            let session = lock_session(&inner)?;
+            Self::create_dir_sync(&session, &path)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during create_dir: {e}"))?
     }
 }
 
@@ -738,6 +785,34 @@ mod host_key_tests {
             start.elapsed() < Duration::from_secs(2),
             "connect_timeout should return within ~2s, took {:?}",
             start.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod persistent_session_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inner_is_some_after_connect() {
+        let mut s = SftpSession::default();
+        assert!(s.inner.is_none());
+        s.install_connected_inner_for_test();
+        assert!(s.inner.is_some());
+        assert_eq!(s.reconnect_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_count_stays_1_across_two_list_dirs() {
+        let mut s = SftpSession::default();
+        s.install_connected_inner_for_test();
+        assert_eq!(s.reconnect_count(), 1);
+        let _ = s.list_dir("/").await;
+        let _ = s.list_dir("/pub").await;
+        assert_eq!(
+            s.reconnect_count(),
+            1,
+            "list_dir must reuse inner and not call open_authenticated_session"
         );
     }
 }

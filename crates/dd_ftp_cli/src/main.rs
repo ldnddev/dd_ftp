@@ -459,7 +459,7 @@ async fn run(
                                 );
                                 reduce(app, Action::CancelPrompt);
                                 if renaming {
-                                    apply_overwrite_choice(app, &mut io, OverwriteChoice::Skip);
+                                    show_overwrite_prompt(app, &io);
                                 }
                             }
                             KeyCode::Tab => {
@@ -496,8 +496,10 @@ async fn run(
                                         }
                                         TextPromptKind::OverwriteRename => {
                                             let new_name = app.prompt_value.value.clone();
-                                            reduce(app, Action::ConfirmPrompt);
-                                            apply_overwrite_rename(app, &mut io, &new_name);
+                                            if apply_overwrite_rename(app, &mut io, &new_name) {
+                                                reduce(app, Action::ConfirmPrompt);
+                                                drain_scan_next(app, &mut io);
+                                            }
                                         }
                                     }
                                 }
@@ -1454,6 +1456,7 @@ fn handle_io_message(
                     reduce(app, Action::ShowError(err.to_string()));
                 }
             }
+            maybe_resume_drain(app, io);
         }
         IoMessage::ListDone {
             generation,
@@ -1479,6 +1482,10 @@ fn handle_io_message(
             if io.drain_list {
                 io.drain_list = false;
                 handle_drain_list_result(app, io, result);
+                return;
+            }
+            if !io.pending_scan.is_empty() {
+                maybe_resume_drain(app, io);
                 return;
             }
             match result {
@@ -1526,7 +1533,9 @@ fn handle_io_message(
                 Ok(()) => {
                     let status = io.fs_ok_status.clone();
                     reduce(app, Action::SetStatus(status));
-                    if io.fs_remote {
+                    if !io.pending_scan.is_empty() {
+                        maybe_resume_drain(app, io);
+                    } else if io.fs_remote {
                         if app.connected {
                             relist_remote(app, io);
                         }
@@ -1542,6 +1551,7 @@ fn handle_io_message(
                 }
                 Err(err) => {
                     reduce(app, Action::ShowError(format!("{err}")));
+                    maybe_resume_drain(app, io);
                 }
             }
         }
@@ -1653,7 +1663,7 @@ fn handle_worker_result(
                     select: SelectPolicy::PreserveName,
                 },
             );
-            if app.connected {
+            if app.connected && io.pending_scan.is_empty() {
                 io.list_ok_status = None;
                 io.list_err_prefix = "Remote list failed".to_string();
                 list_remote(app, io, app.remote_cwd.clone(), SelectPolicy::PreserveName);
@@ -2004,6 +2014,12 @@ fn enqueue_pending_file(app: &mut AppState, file: PendingFile) {
     reduce(app, Action::QueueTransfer(job));
 }
 
+fn maybe_resume_drain(app: &mut AppState, io: &mut IoState) {
+    if !io.pending_scan.is_empty() {
+        drain_scan_next(app, io);
+    }
+}
+
 fn drain_scan_next(app: &mut AppState, io: &mut IoState) {
     if io_busy(io) {
         return;
@@ -2127,12 +2143,36 @@ fn apply_drain_conflict(
     }
 }
 
+fn is_already_exists_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(ioe) = cause.downcast_ref::<std::io::Error>() {
+            if ioe.kind() == std::io::ErrorKind::AlreadyExists {
+                return true;
+            }
+        }
+    }
+    let msg = err.to_string().to_lowercase();
+    msg.contains("already exists")
+        || msg.contains("file exists")
+        || msg.contains("directory exists")
+        || msg.contains("folder exists")
+        || msg.contains("file exist")
+}
+
+fn drain_mkdir_outcome(result: Result<(), anyhow::Error>) -> Result<(), anyhow::Error> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_already_exists_error(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 fn handle_drain_mkdir_result(
     app: &mut AppState,
     io: &mut IoState,
     result: Result<(), anyhow::Error>,
 ) {
-    match result {
+    match drain_mkdir_outcome(result) {
         Ok(()) => {
             io.mkdir_queue.pop_front();
             if io.mkdir_queue.is_empty() {
@@ -2250,9 +2290,10 @@ fn apply_overwrite_choice(app: &mut AppState, io: &mut IoState, choice: Overwrit
     }
 }
 
-fn apply_overwrite_rename(app: &mut AppState, io: &mut IoState, new_name: &str) {
+/// Apply a rename dest. `false` keeps the rename prompt open and the file at front.
+fn apply_overwrite_rename(app: &mut AppState, io: &mut IoState, new_name: &str) -> bool {
     let Some(mut file) = io.pending_scan.front().cloned() else {
-        return;
+        return true;
     };
     match file.direction {
         TransferDirection::Upload => {
@@ -2261,9 +2302,7 @@ fn apply_overwrite_rename(app: &mut AppState, io: &mut IoState, new_name: &str) 
                 Ok(p) => file.remote_path = p,
                 Err(_) => {
                     reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    io.pending_scan.pop_front();
-                    drain_scan_next(app, io);
-                    return;
+                    return false;
                 }
             }
         }
@@ -2276,9 +2315,7 @@ fn apply_overwrite_rename(app: &mut AppState, io: &mut IoState, new_name: &str) 
                 Ok(p) => file.local_path = p.to_string_lossy().to_string(),
                 Err(_) => {
                     reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    io.pending_scan.pop_front();
-                    drain_scan_next(app, io);
-                    return;
+                    return false;
                 }
             }
         }
@@ -2286,7 +2323,7 @@ fn apply_overwrite_rename(app: &mut AppState, io: &mut IoState, new_name: &str) 
     if let Some(front) = io.pending_scan.front_mut() {
         *front = file;
     }
-    drain_scan_next(app, io);
+    true
 }
 
 fn start_scan(
@@ -2390,11 +2427,21 @@ fn walk_local_files(root: &Path, remote_root: &str) -> anyhow::Result<Vec<Pendin
             if name_str == "." || name_str == ".." {
                 continue;
             }
-            let meta = match entry.metadata() {
+            let meta = match std::fs::symlink_metadata(entry.path()) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if meta.is_dir() {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                // Do not follow directory symlinks (cycles / escape). Skip them.
+                if std::fs::metadata(entry.path())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+            }
+            if ft.is_dir() {
                 let child_remote = safe_remote_child(&remote_dir, name_str.as_ref())?;
                 stack.push((entry.path(), child_remote));
             } else {
@@ -3898,5 +3945,87 @@ mod scan_tests {
         assert!(io.pending_scan.is_empty());
         assert_eq!(app.queue.pending.len(), 1);
         assert_eq!(app.queue.pending[0].remote_path, "/pub/kept");
+    }
+
+    #[test]
+    fn already_exists_mkdir_is_success_and_does_not_drop_file() {
+        assert!(is_already_exists_error(&anyhow::anyhow!(
+            "failed to create remote directory: File exists"
+        )));
+        assert!(is_already_exists_error(&anyhow::anyhow!(
+            "550 Directory already exists"
+        )));
+        assert!(!is_already_exists_error(&anyhow::anyhow!(
+            "permission denied"
+        )));
+        assert!(drain_mkdir_outcome(Err(anyhow::anyhow!("File exists"))).is_ok());
+        assert!(drain_mkdir_outcome(Err(anyhow::anyhow!("permission denied"))).is_err());
+
+        let mut app = AppState::default();
+        let (mut io, _rx) = test_io();
+        io.pending_scan
+            .push_back(pending_upload("/tmp/a/b/c.txt", "/pub/a/b/c.txt"));
+        io.mkdir_queue.push_back("/pub/a/b".into());
+        handle_drain_mkdir_result(&mut app, &mut io, Err(anyhow::anyhow!("File exists")));
+        assert!(
+            io.pending_scan.is_empty(),
+            "exists is success: file is enqueued, not dropped"
+        );
+        assert_eq!(app.queue.pending.len(), 1);
+        assert_eq!(app.queue.pending[0].remote_path, "/pub/a/b/c.txt");
+    }
+
+    #[test]
+    fn unsafe_overwrite_rename_keeps_file_and_prompt() {
+        let mut app = AppState {
+            connected: true,
+            local_cwd: "/tmp".into(),
+            remote_cwd: "/pub".into(),
+            show_prompt: true,
+            prompt_kind: Some(PromptKind::Text(TextPromptKind::OverwriteRename)),
+            ..Default::default()
+        };
+        let (mut io, _rx) = test_io();
+        io.pending_scan
+            .push_back(pending_upload("/tmp/a.txt", "/pub/a.txt"));
+        assert!(!apply_overwrite_rename(&mut app, &mut io, ".."));
+        assert_eq!(io.pending_scan.len(), 1);
+        assert_eq!(io.pending_scan[0].remote_path, "/pub/a.txt");
+        assert!(app.show_prompt);
+        assert_eq!(
+            app.prompt_kind,
+            Some(PromptKind::Text(TextPromptKind::OverwriteRename))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_local_skips_symlink_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "dd_ftp_walk_symlink_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let real = root.join("a").join("real");
+        std::fs::create_dir_all(&real).expect("dirs");
+        std::fs::write(real.join("ok.txt"), b"ok").expect("file");
+        std::os::unix::fs::symlink("..", root.join("a").join("loop")).expect("symlink dir");
+        let files = walk_local_files(&root.join("a"), "/pub/a").expect("walk");
+        let names: Vec<_> = files
+            .iter()
+            .map(|f| {
+                Path::new(&f.local_path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec!["ok.txt".to_string()]);
+        assert!(!files.iter().any(|f| f.local_path.contains("/loop/")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

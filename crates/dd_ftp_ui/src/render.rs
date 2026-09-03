@@ -82,11 +82,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         } else {
             t.base_background
         };
-        let (visible, total) = match app.focus {
-            FocusPane::Local | FocusPane::Queue => {
-                (app.visible_local().len(), app.local_entries.len())
-            }
+        let (visible, total) = match app.filter_count_pane() {
             FocusPane::Remote => (app.visible_remote().len(), app.remote_entries.len()),
+            _ => (app.visible_local().len(), app.local_entries.len()),
         };
         let count = format!("  ({visible}/{total})");
         let filter = Paragraph::new(Line::from(vec![

@@ -130,6 +130,8 @@ pub struct AppState {
     pub selected_local: usize,
     pub selected_remote: usize,
     pub focus: FocusPane,
+    /// Last focused file pane (`Local` or `Remote`). Filter-bar counts use this when Queue is focused.
+    pub last_file_pane: FocusPane,
     pub header_copy: String,
     pub show_help: bool,
     pub show_theme_debug: bool,
@@ -246,6 +248,20 @@ impl AppState {
     pub fn selected_remote_entry(&self) -> Option<&FileEntry> {
         self.visible_remote().get(self.selected_remote).copied()
     }
+
+    pub fn set_focus(&mut self, pane: FocusPane) {
+        if pane != FocusPane::Queue {
+            self.last_file_pane = pane;
+        }
+        self.focus = pane;
+    }
+
+    pub fn filter_count_pane(&self) -> FocusPane {
+        match self.focus {
+            FocusPane::Local | FocusPane::Remote => self.focus,
+            FocusPane::Queue => self.last_file_pane,
+        }
+    }
 }
 
 impl Default for AppState {
@@ -259,6 +275,7 @@ impl Default for AppState {
             selected_local: 0,
             selected_remote: 0,
             focus: FocusPane::Local,
+            last_file_pane: FocusPane::Local,
             header_copy: random_header_copy(),
             show_help: false,
             show_theme_debug: false,
@@ -349,5 +366,19 @@ mod visible_tests {
         assert_eq!(s.visible_local().len(), 1);
         assert_eq!(s.selected_local, 0);
         assert_eq!(s.selected_local_entry().map(|e| e.name.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn filter_count_pane_uses_last_file_pane_when_queue_focused() {
+        let mut s = AppState::default();
+        assert_eq!(s.filter_count_pane(), FocusPane::Local);
+        s.set_focus(FocusPane::Remote);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+        s.set_focus(FocusPane::Queue);
+        assert_eq!(s.focus, FocusPane::Queue);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+        assert_eq!(s.filter_count_pane(), FocusPane::Remote);
+        s.set_focus(FocusPane::Local);
+        assert_eq!(s.filter_count_pane(), FocusPane::Local);
     }
 }

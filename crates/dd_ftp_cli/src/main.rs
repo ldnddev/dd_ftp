@@ -649,15 +649,15 @@ async fn run(
                         }
                         KeyCode::Tab => reduce(app, Action::FocusNextPane),
                         KeyCode::Char('1') => {
-                            app.focus = FocusPane::Local;
+                            app.set_focus(FocusPane::Local);
                             reduce(app, Action::SetStatus("Focus: Local".to_string()));
                         }
                         KeyCode::Char('2') => {
-                            app.focus = FocusPane::Remote;
+                            app.set_focus(FocusPane::Remote);
                             reduce(app, Action::SetStatus("Focus: Remote".to_string()));
                         }
                         KeyCode::Char('3') => {
-                            app.focus = FocusPane::Queue;
+                            app.set_focus(FocusPane::Queue);
                             reduce(app, Action::SetStatus("Focus: Queue".to_string()));
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -771,7 +771,7 @@ async fn run(
                                 | Some(Region::Scrollbar(ScrollRegion::ListLocal))
                                     if !app.any_modal_open() =>
                                 {
-                                    app.focus = FocusPane::Local;
+                                    app.set_focus(FocusPane::Local);
                                     for _ in 0..SCROLL_STEP {
                                         reduce(
                                             app,
@@ -787,7 +787,7 @@ async fn run(
                                 | Some(Region::Scrollbar(ScrollRegion::ListRemote))
                                     if !app.any_modal_open() =>
                                 {
-                                    app.focus = FocusPane::Remote;
+                                    app.set_focus(FocusPane::Remote);
                                     for _ in 0..SCROLL_STEP {
                                         reduce(
                                             app,
@@ -828,10 +828,10 @@ async fn run(
                             last_click = Some((mx, my, now));
                             match hit_test(&app_layout, mx, my) {
                                 Some(Region::List(pane)) if !app.any_modal_open() => {
-                                    app.focus = match pane {
+                                    app.set_focus(match pane {
                                         Pane::Local => FocusPane::Local,
                                         Pane::Remote => FocusPane::Remote,
-                                    };
+                                    });
                                     let (list_rect, offset, len) = match pane {
                                         Pane::Local => (
                                             app_layout.local_list,
@@ -1837,7 +1837,13 @@ async fn create_file(app: &mut AppState, session: &mut SftpSession, name: &str) 
             let path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), name);
             match std::fs::File::create(&path) {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Created file: {}", name)));
                 }
                 Err(err) => {
@@ -1914,7 +1920,13 @@ async fn create_folder(app: &mut AppState, session: &mut SftpSession, name: &str
             let path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), name);
             match std::fs::create_dir(&path) {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Created folder: {}", name)));
                 }
                 Err(err) => {
@@ -1974,7 +1986,13 @@ async fn rename_item(app: &mut AppState, session: &mut SftpSession, target: &str
             let new_path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), new_name);
             match std::fs::rename(target, &new_path) {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Renamed to: {}", new_name)));
                 }
                 Err(err) => {
@@ -2064,7 +2082,13 @@ async fn delete_item(app: &mut AppState, session: &mut SftpSession, target: &str
             };
             match result {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Deleted: {}", target_str)));
                 }
                 Err(err) => {

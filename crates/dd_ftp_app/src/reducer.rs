@@ -251,11 +251,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.toast = None;
         }
         Action::FocusNextPane => {
-            state.focus = match state.focus {
+            let next = match state.focus {
                 FocusPane::Local => FocusPane::Remote,
                 FocusPane::Remote => FocusPane::Queue,
                 FocusPane::Queue => FocusPane::Local,
             };
+            state.set_focus(next);
         }
         Action::ToggleHelp => {
             state.show_help = !state.show_help;
@@ -599,5 +600,38 @@ mod selection_tests {
         );
         assert_eq!(s.selected_remote, 1);
         assert_eq!(s.selected_remote_entry().unwrap().name, "keep");
+    }
+
+    #[test]
+    fn focus_next_pane_remembers_last_file_pane_across_queue() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::FocusNextPane);
+        assert_eq!(s.focus, FocusPane::Remote);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+        reduce(&mut s, Action::FocusNextPane);
+        assert_eq!(s.focus, FocusPane::Queue);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+        assert_eq!(s.filter_count_pane(), FocusPane::Remote);
+        reduce(&mut s, Action::FocusNextPane);
+        assert_eq!(s.focus, FocusPane::Local);
+        assert_eq!(s.last_file_pane, FocusPane::Local);
+    }
+
+    #[test]
+    fn set_local_entries_preserve_name_clamps_when_row_vanishes() {
+        let mut s = AppState {
+            local_entries: vec![fe("keep"), fe("gone")],
+            selected_local: 1,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::SetLocalEntries {
+                entries: vec![fe("keep")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert_eq!(s.selected_local, 0);
+        assert_eq!(s.selected_local_entry().unwrap().name, "keep");
     }
 }

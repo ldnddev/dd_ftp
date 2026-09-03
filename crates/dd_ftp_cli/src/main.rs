@@ -352,8 +352,11 @@ async fn run(
                                     }
                                 }
                                 ChoicePromptKind::ConfirmBookmarkDelete => {
+                                    let name = app.prompt_target.clone();
                                     reduce(app, Action::ConfirmPrompt);
-                                    delete_selected_bookmark(app);
+                                    if let Some(name) = name {
+                                        delete_bookmark_named(app, &name);
+                                    }
                                 }
                             },
                             KeyCode::Char('q') => match kind {
@@ -463,10 +466,7 @@ async fn run(
                         && key.code == KeyCode::Delete
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        reduce(app, Action::ShowDeletePrompt);
-                        if let Some(entry) = get_selected_entry(app) {
-                            app.prompt_target = Some(entry.path.clone());
-                        }
+                        open_delete_prompt(app);
                         continue;
                     }
 
@@ -645,10 +645,7 @@ async fn run(
                             }
                         }
                         KeyCode::Delete => {
-                            reduce(app, Action::ShowDeletePrompt);
-                            if let Some(entry) = get_selected_entry(app) {
-                                app.prompt_target = Some(entry.path.clone());
-                            }
+                            open_delete_prompt(app);
                         }
                         KeyCode::Tab => reduce(app, Action::FocusNextPane),
                         KeyCode::Char('1') => {
@@ -894,6 +891,7 @@ async fn run(
                                         }
                                     }
                                 }
+                                Some(Region::Control(_)) if app.show_prompt => {}
                                 Some(Region::Control(ControlId::QcProtocol)) => {
                                     reduce(app, Action::QuickConnectSetProtocolNext);
                                 }
@@ -1576,22 +1574,22 @@ fn save_quick_connect_bookmark(app: &mut AppState) {
     }
 }
 
-fn delete_selected_bookmark(app: &mut AppState) {
+fn delete_bookmark_named(app: &mut AppState, name: &str) {
     let mut cfg = SiteManager::load_or_default().unwrap_or_default();
     if cfg.sites.is_empty() {
         reduce(app, Action::SetStatus("No bookmarks to delete".to_string()));
         return;
     }
 
-    if app.selected_bookmark >= cfg.sites.len() {
+    let Some(idx) = cfg.sites.iter().position(|s| s.name == name) else {
         reduce(
             app,
-            Action::SetStatus("Invalid bookmark selection".to_string()),
+            Action::SetStatus(format!("Bookmark not found: {name}")),
         );
         return;
-    }
+    };
 
-    let removed = cfg.sites.remove(app.selected_bookmark);
+    let removed = cfg.sites.remove(idx);
     let _ = SecretStore::delete_password(
         &removed.name,
         &removed.username,
@@ -1602,9 +1600,9 @@ fn delete_selected_bookmark(app: &mut AppState) {
     if let Some(default_idx) = cfg.default_site {
         cfg.default_site = if cfg.sites.is_empty() {
             None
-        } else if default_idx == app.selected_bookmark {
+        } else if default_idx == idx {
             Some(0)
-        } else if default_idx > app.selected_bookmark {
+        } else if default_idx > idx {
             Some(default_idx - 1)
         } else {
             Some(default_idx)
@@ -1783,6 +1781,18 @@ fn get_selected_entry(app: &AppState) -> Option<dd_ftp_core::FileEntry> {
         dd_ftp_app::FocusPane::Local => app.local_entries.get(app.selected_local).cloned(),
         dd_ftp_app::FocusPane::Remote => app.remote_entries.get(app.selected_remote).cloned(),
         _ => None,
+    }
+}
+
+fn open_delete_prompt(app: &mut AppState) {
+    if let Some(entry) = get_selected_entry(app) {
+        reduce(app, Action::ShowDeletePrompt);
+        app.prompt_target = Some(entry.path.clone());
+    } else {
+        reduce(
+            app,
+            Action::SetStatus("Nothing selected to delete".to_string()),
+        );
     }
 }
 

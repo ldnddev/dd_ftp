@@ -856,7 +856,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         lines.push(Line::from(
             "j/k move | Enter load into quick connect | c connect",
         ));
-        lines.push(Line::from("e edit | d delete | D set default | Esc close"));
+        lines.push(Line::from(
+            "e edit | d delete (confirm) | D set default | Esc close",
+        ));
 
         let modal = Paragraph::new(lines.clone())
             .style(Style::default().bg(t.modal_background).fg(t.modal_text))

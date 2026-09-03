@@ -34,6 +34,7 @@ pub(crate) enum FsKind {
     CreateFolder,
     Rename,
     Delete,
+    Chmod,
 }
 
 pub(crate) enum InFlight {
@@ -244,6 +245,7 @@ impl Runtime {
             FsKind::CreateFile | FsKind::CreateFolder => "Creating…",
             FsKind::Rename => "Renaming…",
             FsKind::Delete => "Deleting…",
+            FsKind::Chmod => "Setting permissions…",
         };
         reduce(app, Action::SetStatus(status.to_string()));
     }
@@ -826,15 +828,38 @@ pub(crate) fn connection_info_from_env() -> ConnectionInfo {
     }
 }
 
+fn pane_entries_for_transfer(app: &AppState, pane: dd_ftp_app::FocusPane) -> Vec<FileEntry> {
+    let (entries, marks, selected) = match pane {
+        dd_ftp_app::FocusPane::Local => (
+            &app.local_entries,
+            &app.marked_local,
+            app.selected_local_entry().cloned(),
+        ),
+        dd_ftp_app::FocusPane::Remote => (
+            &app.remote_entries,
+            &app.marked_remote,
+            app.selected_remote_entry().cloned(),
+        ),
+        dd_ftp_app::FocusPane::Queue => return Vec::new(),
+    };
+    if marks.is_empty() {
+        return selected.into_iter().collect();
+    }
+    entries
+        .iter()
+        .filter(|e| marks.contains(&e.path) && e.name != "." && e.name != "..")
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn queue_upload_selected(app: &mut AppState, runtime: &mut Runtime) {
     if !app.connected {
         reduce(app, Action::SetStatus("Not connected".to_string()));
         return;
     }
 
-    if let Some(local) = app.selected_local_entry().cloned() {
-        enqueue_entry(app, runtime, local, TransferDirection::Upload);
-    }
+    let entries = pane_entries_for_transfer(app, dd_ftp_app::FocusPane::Local);
+    enqueue_selected(app, runtime, entries, TransferDirection::Upload);
 }
 
 pub(crate) fn queue_download_selected(app: &mut AppState, runtime: &mut Runtime) {
@@ -843,8 +868,20 @@ pub(crate) fn queue_download_selected(app: &mut AppState, runtime: &mut Runtime)
         return;
     }
 
-    if let Some(remote) = app.selected_remote_entry().cloned() {
-        enqueue_entry(app, runtime, remote, TransferDirection::Download);
+    let entries = pane_entries_for_transfer(app, dd_ftp_app::FocusPane::Remote);
+    enqueue_selected(app, runtime, entries, TransferDirection::Download);
+}
+
+fn enqueue_selected(
+    app: &mut AppState,
+    runtime: &mut Runtime,
+    mut entries: Vec<FileEntry>,
+    direction: TransferDirection,
+) {
+    match entries.len() {
+        0 => {}
+        1 => enqueue_entry(app, runtime, entries.remove(0), direction),
+        _ => enqueue_entries(app, runtime, entries, direction),
     }
 }
 
@@ -854,10 +891,49 @@ pub(crate) fn enqueue_entry(
     entry: FileEntry,
     direction: TransferDirection,
 ) {
-    if entry.name == "." || entry.name == ".." {
+    enqueue_entries(app, runtime, vec![entry], direction);
+}
+
+fn pending_from_entry(
+    app: &AppState,
+    entry: &FileEntry,
+    direction: TransferDirection,
+) -> anyhow::Result<PendingFile> {
+    let (local_path, remote_path) = match direction {
+        TransferDirection::Upload => {
+            let remote_path = safe_remote_child(&app.remote_cwd, &entry.name)?;
+            (entry.path.clone(), remote_path)
+        }
+        TransferDirection::Download => {
+            let local_path = safe_local_child(Path::new(&app.local_cwd), &entry.name)?
+                .to_string_lossy()
+                .to_string();
+            let remote_path = safe_remote_child(&app.remote_cwd, &entry.name)?;
+            (local_path, remote_path)
+        }
+    };
+    Ok(PendingFile {
+        local_path,
+        remote_path,
+        direction,
+        size_bytes: Some(entry.size),
+    })
+}
+
+pub(crate) fn enqueue_entries(
+    app: &mut AppState,
+    runtime: &mut Runtime,
+    entries: Vec<FileEntry>,
+    direction: TransferDirection,
+) {
+    if drain_busy(runtime) {
         return;
     }
-    if drain_busy(runtime) {
+    let entries: Vec<FileEntry> = entries
+        .into_iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .collect();
+    if entries.is_empty() {
         return;
     }
     // User-facing u/d/Enter: clear cancel so spawn may run. Drain enqueue does not.
@@ -869,47 +945,28 @@ pub(crate) fn enqueue_entry(
             cancel_requested: false,
         },
     );
-    if entry.kind == dd_ftp_core::EntryKind::Directory {
-        start_scan(app, runtime, entry, direction);
-        return;
+
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for entry in entries {
+        if entry.kind == dd_ftp_core::EntryKind::Directory {
+            dirs.push(entry);
+        } else {
+            files.push(entry);
+        }
     }
 
-    let (local_path, remote_path) = match direction {
-        TransferDirection::Upload => {
-            let remote_path = match safe_remote_child(&app.remote_cwd, &entry.name) {
-                Ok(p) => p,
-                Err(_) => {
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
-                }
-            };
-            (entry.path, remote_path)
+    for file in files {
+        match pending_from_entry(app, &file, direction) {
+            Ok(pending) => runtime.pending_scan.push_back(pending),
+            Err(_) => reduce(app, Action::ShowError("path escapes directory".to_string())),
         }
-        TransferDirection::Download => {
-            let local_path = match safe_local_child(Path::new(&app.local_cwd), &entry.name) {
-                Ok(p) => p.to_string_lossy().to_string(),
-                Err(_) => {
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
-                }
-            };
-            let remote_path = match safe_remote_child(&app.remote_cwd, &entry.name) {
-                Ok(p) => p,
-                Err(_) => {
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
-                }
-            };
-            (local_path, remote_path)
-        }
-    };
+    }
 
-    runtime.pending_scan.push_back(PendingFile {
-        local_path,
-        remote_path,
-        direction,
-        size_bytes: Some(entry.size),
-    });
+    if !dirs.is_empty() {
+        start_scan_entries(app, runtime, dirs, direction);
+        return;
+    }
     drain_scan_next(app, runtime);
 }
 
@@ -1376,77 +1433,102 @@ pub(crate) fn apply_overwrite_rename(
     true
 }
 
-pub(crate) fn start_scan(
+pub(crate) fn start_scan_entries(
     app: &mut AppState,
     runtime: &mut Runtime,
-    entry: FileEntry,
+    entries: Vec<FileEntry>,
     direction: TransferDirection,
 ) {
-    if io_busy(runtime) || drain_busy(runtime) {
+    if io_busy(runtime) {
+        return;
+    }
+    let entries: Vec<FileEntry> = entries
+        .into_iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .collect();
+    if entries.is_empty() {
         return;
     }
     let gen = runtime.generation;
     runtime.in_flight = Some(InFlight::Scan { generation: gen });
-    let msg = format!("Scanning {}...", entry.name);
+    let label = if entries.len() == 1 {
+        entries[0].name.clone()
+    } else {
+        format!("{} items", entries.len())
+    };
+    let msg = format!("Scanning {label}...");
     app.toast = Some(Toast::info(msg.clone()));
     reduce(app, Action::SetStatus(msg));
 
     let io_tx = runtime.io_tx.clone();
     match direction {
         TransferDirection::Upload => {
-            let local_root = PathBuf::from(&entry.path);
-            let remote_root = match safe_remote_child(&app.remote_cwd, &entry.name) {
-                Ok(p) => p,
-                Err(_) => {
-                    runtime.in_flight = None;
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
+            let mut roots = Vec::new();
+            for entry in &entries {
+                match safe_remote_child(&app.remote_cwd, &entry.name) {
+                    Ok(remote_root) => roots.push((PathBuf::from(&entry.path), remote_root)),
+                    Err(_) => {
+                        runtime.in_flight = None;
+                        reduce(app, Action::ShowError("path escapes directory".to_string()));
+                        drain_scan_next(app, runtime);
+                        return;
+                    }
                 }
-            };
+            }
             tokio::task::spawn_blocking(move || {
-                match walk_local_files(&local_root, &remote_root) {
-                    Ok(files) => {
-                        for file in files {
-                            let _ = io_tx.send(IoMessage::ScanItem {
+                let mut all = Vec::new();
+                for (local_root, remote_root) in roots {
+                    match walk_local_files(&local_root, &remote_root) {
+                        Ok(files) => all.extend(files),
+                        Err(err) => {
+                            let _ = io_tx.send(IoMessage::ScanError {
                                 generation: gen,
-                                file,
+                                error: err.to_string(),
                             });
+                            return;
                         }
-                        let _ = io_tx.send(IoMessage::ScanDone { generation: gen });
-                    }
-                    Err(err) => {
-                        let _ = io_tx.send(IoMessage::ScanError {
-                            generation: gen,
-                            error: err.to_string(),
-                        });
                     }
                 }
+                for file in all {
+                    let _ = io_tx.send(IoMessage::ScanItem {
+                        generation: gen,
+                        file,
+                    });
+                }
+                let _ = io_tx.send(IoMessage::ScanDone { generation: gen });
             });
         }
         TransferDirection::Download => {
             let Some(info) = app.active_connection.clone() else {
                 runtime.in_flight = None;
                 reduce(app, Action::SetStatus("Not connected".to_string()));
+                drain_scan_next(app, runtime);
                 return;
             };
-            let remote_root = match safe_remote_child(&app.remote_cwd, &entry.name) {
-                Ok(p) => p,
-                Err(_) => {
-                    runtime.in_flight = None;
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
-                }
-            };
-            let local_root = match safe_local_child(Path::new(&app.local_cwd), &entry.name) {
-                Ok(p) => p,
-                Err(_) => {
-                    runtime.in_flight = None;
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
-                }
-            };
+            let mut roots = Vec::new();
+            for entry in &entries {
+                let remote_root = match safe_remote_child(&app.remote_cwd, &entry.name) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        runtime.in_flight = None;
+                        reduce(app, Action::ShowError("path escapes directory".to_string()));
+                        drain_scan_next(app, runtime);
+                        return;
+                    }
+                };
+                let local_root = match safe_local_child(Path::new(&app.local_cwd), &entry.name) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        runtime.in_flight = None;
+                        reduce(app, Action::ShowError("path escapes directory".to_string()));
+                        drain_scan_next(app, runtime);
+                        return;
+                    }
+                };
+                roots.push((remote_root, local_root));
+            }
             tokio::spawn(async move {
-                match walk_remote_files(info, remote_root, local_root, gen, io_tx.clone()).await {
+                match walk_remote_files(info, roots, gen, io_tx.clone()).await {
                     Ok(()) => {
                         let _ = io_tx.send(IoMessage::ScanDone { generation: gen });
                     }
@@ -1510,12 +1592,11 @@ pub(crate) fn walk_local_files(root: &Path, remote_root: &str) -> anyhow::Result
 
 async fn walk_remote_files(
     info: ConnectionInfo,
-    remote_root: String,
-    local_root: PathBuf,
+    roots: Vec<(String, PathBuf)>,
     generation: u64,
     tx: mpsc::UnboundedSender<IoMessage>,
 ) -> Result<()> {
-    let mut stack = vec![(remote_root, local_root)];
+    let mut stack = roots;
     match info.protocol {
         Protocol::Sftp => {
             let mut session = SftpSession::default();

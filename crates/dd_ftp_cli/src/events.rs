@@ -4,13 +4,13 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dd_ftp_app::{
-    reduce, Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField,
-    SelectPolicy, TextPromptKind,
+    parse_octal_mode, reduce, Action, AppState, ChoicePromptKind, FocusPane, PromptKind,
+    QuickConnectField, SelectPolicy, TextPromptKind,
 };
 use dd_ftp_core::ConnectionInfo;
 use dd_ftp_storage::SecretStore;
 
-use crate::session::{OverwriteChoice, Runtime};
+use crate::session::{OverwriteChoice, Runtime, SessionHandle};
 
 pub(crate) enum LoopControl {
     Continue,
@@ -245,6 +245,19 @@ pub(crate) async fn handle_key(
                             if crate::session::apply_overwrite_rename(app, runtime, &new_name) {
                                 reduce(app, Action::ConfirmPrompt);
                                 crate::session::drain_scan_next(app, runtime);
+                            }
+                        }
+                        TextPromptKind::Chmod => {
+                            let value = app.prompt_value.value.clone();
+                            let target = app.prompt_target.clone();
+                            reduce(app, Action::ConfirmPrompt);
+                            match parse_octal_mode(&value) {
+                                Ok(mode) => {
+                                    if let Some(path) = target {
+                                        crate::fs_ops::chmod(app, runtime, &path, mode);
+                                    }
+                                }
+                                Err(err) => reduce(app, Action::ShowError(err)),
                             }
                         }
                     }
@@ -563,6 +576,21 @@ pub(crate) async fn handle_key(
         KeyCode::Char('R') => {
             reduce(app, Action::RetryLastFailed);
         }
+        KeyCode::Char(' ') => {
+            reduce(app, Action::ToggleMark);
+        }
+        KeyCode::Char('p') => {
+            open_chmod_prompt(app, runtime);
+        }
+        KeyCode::Char('s') => {
+            reduce(app, Action::CycleSort);
+        }
+        KeyCode::Char('S') => {
+            reduce(app, Action::ToggleSortDir);
+        }
+        KeyCode::Char('.') => {
+            reduce(app, Action::ToggleHideDotfiles);
+        }
         _ => {}
     }
 
@@ -689,6 +717,33 @@ pub(crate) fn get_selected_entry(app: &AppState) -> Option<dd_ftp_core::FileEntr
         dd_ftp_app::FocusPane::Local => app.selected_local_entry().cloned(),
         dd_ftp_app::FocusPane::Remote => app.selected_remote_entry().cloned(),
         _ => None,
+    }
+}
+
+pub(crate) fn open_chmod_prompt(app: &mut AppState, runtime: &Runtime) {
+    if app.focus != FocusPane::Remote {
+        return;
+    }
+    match runtime.handle.as_ref() {
+        Some(SessionHandle::Sftp(_)) => {
+            if let Some(entry) = app.selected_remote_entry() {
+                if entry.name == "." || entry.name == ".." {
+                    return;
+                }
+                let mode = entry.permissions.clone().unwrap_or_default();
+                let path = entry.path.clone();
+                reduce(app, Action::ShowChmodPrompt { mode });
+                app.prompt_target = Some(path);
+            } else {
+                reduce(app, Action::SetStatus("Nothing selected".to_string()));
+            }
+        }
+        Some(SessionHandle::Ftp(_)) => {
+            reduce(app, Action::ShowError("chmod is SFTP-only".to_string()));
+        }
+        None => {
+            reduce(app, Action::SetStatus("Not connected".to_string()));
+        }
     }
 }
 

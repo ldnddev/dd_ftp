@@ -7,6 +7,27 @@ use crate::paths::safe_local_child;
 use crate::paths::safe_remote_child;
 use crate::session::{io_busy, FsKind, Runtime, SessionHandle};
 
+pub(crate) fn chmod(app: &mut AppState, runtime: &mut Runtime, path: &str, mode: u32) {
+    if io_busy(runtime) {
+        return;
+    }
+    if !app.connected {
+        reduce(app, Action::SetStatus("Not connected".to_string()));
+        return;
+    }
+    let path = path.to_string();
+    runtime.begin_fs(app, FsKind::Chmod, true, format!("chmod {:o} {path}", mode));
+    runtime.spawn_remote_fs(FsKind::Chmod, move |handle| async move {
+        let mut handle = handle;
+        let result = match &mut handle {
+            Some(SessionHandle::Sftp(s)) => s.set_permissions(&path, mode).await,
+            Some(SessionHandle::Ftp(f)) => f.set_permissions(&path, mode).await,
+            None => Err(anyhow::anyhow!("not connected")),
+        };
+        (handle, result)
+    });
+}
+
 pub(crate) fn create_file(app: &mut AppState, runtime: &mut Runtime, name: &str) {
     if io_busy(runtime) {
         return;

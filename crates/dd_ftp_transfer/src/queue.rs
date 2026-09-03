@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
 use dd_ftp_core::{TransferJob, TransferStatus};
 use uuid::Uuid;
 
@@ -8,6 +12,8 @@ pub struct TransferQueue {
     pub completed: Vec<TransferJob>,
     pub failed: Vec<TransferJob>,
     pub cancelled: Vec<TransferJob>,
+    last_progress: HashMap<Uuid, (Instant, u64)>,
+    last_speed: HashMap<Uuid, f64>,
 }
 
 impl TransferQueue {
@@ -27,21 +33,29 @@ impl TransferQueue {
         Some(job)
     }
 
+    fn clear_progress(&mut self, id: Uuid) {
+        self.last_progress.remove(&id);
+        self.last_speed.remove(&id);
+    }
+
     pub fn mark_completed(&mut self, mut job: TransferJob) {
         job.status = TransferStatus::Completed;
         self.active.retain(|j| j.id != job.id);
+        self.clear_progress(job.id);
         self.completed.push(job);
     }
 
     pub fn mark_failed(&mut self, mut job: TransferJob) {
         job.status = TransferStatus::Failed;
         self.active.retain(|j| j.id != job.id);
+        self.clear_progress(job.id);
         self.failed.push(job);
     }
 
     pub fn mark_cancelled(&mut self, mut job: TransferJob) {
         job.status = TransferStatus::Cancelled;
         self.active.retain(|j| j.id != job.id);
+        self.clear_progress(job.id);
         self.cancelled.push(job);
     }
 
@@ -55,12 +69,52 @@ impl TransferQueue {
     }
 
     pub fn update_active_progress(&mut self, job_id: Uuid, transferred: u64, size: Option<u64>) {
-        if let Some(job) = self.active.iter_mut().find(|j| j.id == job_id) {
+        self.update_active_progress_at(job_id, transferred, size, Instant::now());
+    }
+
+    pub fn update_active_progress_at(
+        &mut self,
+        job_id: Uuid,
+        transferred: u64,
+        size: Option<u64>,
+        now: Instant,
+    ) {
+        {
+            let Some(job) = self.active.iter_mut().find(|j| j.id == job_id) else {
+                return;
+            };
             job.transferred_bytes = transferred;
             if size.is_some() {
                 job.size_bytes = size;
             }
+            job.updated_at = Utc::now();
         }
+        if let Some((t0, bytes0)) = self.last_progress.get(&job_id).copied() {
+            let dt = now.saturating_duration_since(t0);
+            if dt >= Duration::from_millis(100) {
+                let delta = transferred.saturating_sub(bytes0);
+                let speed = delta as f64 / dt.as_secs_f64();
+                self.last_speed.insert(job_id, speed);
+                self.last_progress.insert(job_id, (now, transferred));
+            }
+        } else {
+            self.last_progress.insert(job_id, (now, transferred));
+        }
+    }
+
+    /// Bytes/sec and remaining time. ETA is `None` when size or speed is missing.
+    pub fn speed_and_eta(&self, job_id: Uuid) -> Option<(f64, Option<Duration>)> {
+        let speed = *self.last_speed.get(&job_id)?;
+        let job = self.active.iter().find(|j| j.id == job_id)?;
+        let eta = job.size_bytes.and_then(|size| {
+            if speed > 0.0 {
+                let remain = size.saturating_sub(job.transferred_bytes) as f64 / speed;
+                Some(Duration::from_secs_f64(remain.max(0.0)))
+            } else {
+                None
+            }
+        });
+        Some((speed, eta))
     }
 
     pub fn clear_pending(&mut self) -> usize {
@@ -179,5 +233,39 @@ mod tests {
         assert_eq!(q.pending.len(), 1);
         assert_eq!(q.pending[0].remote_path, "/pub/keep");
         assert_eq!(q.cancelled.len(), 1);
+    }
+
+    #[test]
+    fn two_progress_samples_100ms_apart_yield_speed() {
+        use std::time::Duration;
+        let mut q = TransferQueue::default();
+        q.enqueue(job("a"));
+        let started = q.start_next().unwrap();
+        let t0 = Instant::now();
+        q.update_active_progress_at(started.id, 0, Some(10_000), t0);
+        assert!(q.speed_and_eta(started.id).is_none());
+        q.update_active_progress_at(
+            started.id,
+            1_000,
+            Some(10_000),
+            t0 + Duration::from_millis(100),
+        );
+        let (speed, eta) = q.speed_and_eta(started.id).expect("speed");
+        assert!(speed > 0.0, "speed was {speed}");
+        assert!(eta.is_some());
+    }
+
+    #[test]
+    fn missing_size_eta_is_none() {
+        use std::time::Duration;
+        let mut q = TransferQueue::default();
+        q.enqueue(job("a"));
+        let started = q.start_next().unwrap();
+        let t0 = Instant::now();
+        q.update_active_progress_at(started.id, 0, None, t0);
+        q.update_active_progress_at(started.id, 1_000, None, t0 + Duration::from_millis(150));
+        let (speed, eta) = q.speed_and_eta(started.id).expect("speed");
+        assert!(speed > 0.0);
+        assert!(eta.is_none(), "missing size must not produce an ETA");
     }
 }

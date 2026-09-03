@@ -72,6 +72,16 @@ pub enum ChoicePromptKind {
     ConfirmQuit,
     ConfirmDelete,
     ConfirmBookmarkDelete,
+    HostKey,
+}
+
+/// Display-only host-key prompt. The oneshot lives in CLI `in_flight`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyView {
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +175,8 @@ pub struct AppState {
     pub queue_scroll: usize,
     pub queue: TransferQueue,
     pub ftp_session: Option<dd_ftp_ftp::UnifiedFtpSession>,
+    /// Host-key ChoicePrompt fields. Oneshot is not stored here.
+    pub host_key: Option<HostKeyView>,
 }
 
 impl AppState {
@@ -305,6 +317,7 @@ impl Default for AppState {
             queue_scroll: 0,
             queue: TransferQueue::default(),
             ftp_session: None,
+            host_key: None,
         }
     }
 }

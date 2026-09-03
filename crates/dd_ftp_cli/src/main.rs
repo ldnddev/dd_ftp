@@ -339,6 +339,7 @@ async fn run(
                         for flag in &cancel_flags {
                             flag.store(true, Ordering::Relaxed);
                         }
+                        park_pending_scan(app, &mut io);
                         reduce(
                             app,
                             Action::SetStatus("Cancel requested for active transfers".to_string()),
@@ -1757,6 +1758,10 @@ fn handle_io_message(
             if !matches_inflight {
                 return;
             }
+            if app.worker_cancel_requested {
+                enqueue_pending_file(app, file);
+                return;
+            }
             apply_scan_item(&mut io.pending_scan, file);
         }
         IoMessage::ScanDone { generation } => {
@@ -1771,6 +1776,10 @@ fn handle_io_message(
                 return;
             }
             io.in_flight = None;
+            if app.worker_cancel_requested {
+                park_pending_scan(app, io);
+                return;
+            }
             drain_scan_next(app, io);
         }
         IoMessage::ScanError { generation, error } => {
@@ -2195,6 +2204,15 @@ fn enqueue_pending_file(app: &mut AppState, file: PendingFile) {
         app,
         Action::SetStatus(format!("Queue: {} pending", app.queue.pending.len())),
     );
+}
+
+/// Move leftover scan files onto parked `queue.pending` without clearing cancel.
+fn park_pending_scan(app: &mut AppState, io: &mut IoState) {
+    while let Some(file) = io.pending_scan.pop_front() {
+        enqueue_pending_file(app, file);
+    }
+    io.mkdir_queue.clear();
+    io.overwrite_policy = OverwritePolicy::Ask;
 }
 
 fn maybe_resume_drain(app: &mut AppState, io: &mut IoState) {
@@ -4268,6 +4286,37 @@ mod worker_gate_tests {
         assert!(
             app.queue.pending.is_empty(),
             "cancel must not auto-enqueue the rest of a folder drain"
+        );
+    }
+
+    #[test]
+    fn park_pending_scan_parks_without_clearing_cancel_or_spawning() {
+        let mut app = AppState {
+            connected: true,
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        let (mut io, _rx) = test_io();
+        io.pending_scan
+            .push_back(pending_upload("/tmp/a.txt", "/pub/a.txt"));
+        io.pending_scan
+            .push_back(pending_upload("/tmp/b.txt", "/pub/b.txt"));
+        io.mkdir_queue.push_back("/pub/a".into());
+        park_pending_scan(&mut app, &mut io);
+        assert!(io.pending_scan.is_empty());
+        assert!(io.mkdir_queue.is_empty());
+        assert!(!drain_busy(&io));
+        assert_eq!(app.queue.pending.len(), 2);
+        assert!(app.worker_cancel_requested);
+        assert!(
+            !should_spawn(
+                app.connected,
+                app.worker_cancel_requested,
+                app.worker_active_count,
+                app.worker_max_concurrency,
+                app.queue.pending.len(),
+            ),
+            "parked drain files must not auto-start"
         );
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     path::{Component, Path, PathBuf},
     sync::{
@@ -19,8 +20,9 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dd_ftp_app::{
-    reduce, Action, AppState, ChoicePromptKind, FocusPane, HostKeyView, PromptKind,
-    QuickConnectField, SelectPolicy, TextPromptKind,
+    reduce, Action, AppState, ChoicePromptKind, FocusPane, HostKeyView, OverwritePolicy,
+    OverwritePrompt, PendingFile, PromptKind, QuickConnectField, SelectPolicy, TextPromptKind,
+    Toast,
 };
 use dd_ftp_core::{
     ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob,
@@ -113,6 +115,11 @@ async fn run(
         list_err_prefix: "Remote list failed".to_string(),
         fs_remote: false,
         fs_ok_status: String::new(),
+        pending_scan: VecDeque::new(),
+        overwrite_policy: OverwritePolicy::Ask,
+        drain_list: false,
+        drain_mkdir: false,
+        mkdir_queue: VecDeque::new(),
     };
     let mut cancel_flags: Vec<Arc<AtomicBool>> = Vec::new();
     let mut last_click: Option<(u16, u16, Instant)> = None;
@@ -357,6 +364,44 @@ async fn run(
                         let Some(PromptKind::Choice(kind)) = app.prompt_kind else {
                             continue;
                         };
+                        if kind == ChoicePromptKind::Overwrite {
+                            match key.code {
+                                KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
+                                    apply_overwrite_choice(app, &mut io, OverwriteChoice::Skip);
+                                }
+                                KeyCode::Char('o') | KeyCode::Char('O') => {
+                                    apply_overwrite_choice(
+                                        app,
+                                        &mut io,
+                                        OverwriteChoice::Overwrite,
+                                    );
+                                }
+                                KeyCode::Char('a') | KeyCode::Char('A') => {
+                                    apply_overwrite_choice(
+                                        app,
+                                        &mut io,
+                                        OverwriteChoice::OverwriteAll,
+                                    );
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') => {
+                                    apply_overwrite_choice(app, &mut io, OverwriteChoice::SkipAll);
+                                }
+                                KeyCode::Esc => {
+                                    apply_overwrite_choice(app, &mut io, OverwriteChoice::Abort);
+                                }
+                                KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    apply_overwrite_choice(app, &mut io, OverwriteChoice::Rename);
+                                }
+                                KeyCode::Char('q') => {
+                                    apply_overwrite_choice(app, &mut io, OverwriteChoice::Abort);
+                                    if request_quit(app) {
+                                        return Ok(());
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                                 reject_host_key(&mut io);
@@ -382,6 +427,7 @@ async fn run(
                                     accept_host_key(&mut io);
                                     reduce(app, Action::ConfirmPrompt);
                                 }
+                                ChoicePromptKind::Overwrite => {}
                             },
                             KeyCode::Char('q') => match kind {
                                 ChoicePromptKind::ConfirmQuit => return Ok(()),
@@ -406,7 +452,16 @@ async fn run(
 
                     if app.is_text_prompt() {
                         match key.code {
-                            KeyCode::Esc => reduce(app, Action::CancelPrompt),
+                            KeyCode::Esc => {
+                                let renaming = matches!(
+                                    app.prompt_kind,
+                                    Some(PromptKind::Text(TextPromptKind::OverwriteRename))
+                                );
+                                reduce(app, Action::CancelPrompt);
+                                if renaming {
+                                    apply_overwrite_choice(app, &mut io, OverwriteChoice::Skip);
+                                }
+                            }
                             KeyCode::Tab => {
                                 app.prompt_kind = match app.prompt_kind {
                                     Some(PromptKind::Text(TextPromptKind::CreateFile)) => {
@@ -438,6 +493,11 @@ async fn run(
                                             if let Some(t) = target {
                                                 rename_item(app, &mut io, &t, &new_name);
                                             }
+                                        }
+                                        TextPromptKind::OverwriteRename => {
+                                            let new_name = app.prompt_value.value.clone();
+                                            reduce(app, Action::ConfirmPrompt);
+                                            apply_overwrite_rename(app, &mut io, &new_name);
                                         }
                                     }
                                 }
@@ -658,9 +718,9 @@ async fn run(
                                     if entry.kind == dd_ftp_core::EntryKind::Directory {
                                         navigate_into_directory(app, &mut io);
                                     } else if app.focus == FocusPane::Local {
-                                        queue_upload_selected(app);
+                                        queue_upload_selected(app, &mut io);
                                     } else {
-                                        queue_download_selected(app);
+                                        queue_download_selected(app, &mut io);
                                     }
                                 }
                             }
@@ -712,6 +772,9 @@ async fn run(
                             navigate_parent_directory(app, &mut io);
                         }
                         KeyCode::Char('r') => {
+                            if drain_busy(&io) {
+                                continue;
+                            }
                             reduce(
                                 app,
                                 Action::SetLocalEntries {
@@ -758,10 +821,10 @@ async fn run(
                             }
                         }
                         KeyCode::Char('u') => {
-                            queue_upload_selected(app);
+                            queue_upload_selected(app, &mut io);
                         }
                         KeyCode::Char('d') => {
-                            queue_download_selected(app);
+                            queue_download_selected(app, &mut io);
                         }
                         KeyCode::Char('X') => {
                             reduce(app, Action::ClearPendingTransfers);
@@ -887,9 +950,11 @@ async fn run(
                                                     navigate_into_directory(app, &mut io);
                                                 } else {
                                                     match pane {
-                                                        Pane::Local => queue_upload_selected(app),
+                                                        Pane::Local => {
+                                                            queue_upload_selected(app, &mut io)
+                                                        }
                                                         Pane::Remote => {
-                                                            queue_download_selected(app)
+                                                            queue_download_selected(app, &mut io)
                                                         }
                                                     }
                                                 }
@@ -1058,6 +1123,9 @@ fn apply_scrollbar_drag(
 }
 
 fn navigate_into_directory(app: &mut AppState, io: &mut IoState) {
+    if drain_busy(io) {
+        return;
+    }
     match app.focus {
         dd_ftp_app::FocusPane::Local => {
             if let Some(entry) = app.selected_local_entry().cloned() {
@@ -1105,6 +1173,9 @@ fn navigate_into_directory(app: &mut AppState, io: &mut IoState) {
 }
 
 fn navigate_parent_directory(app: &mut AppState, io: &mut IoState) {
+    if drain_busy(io) {
+        return;
+    }
     match app.focus {
         dd_ftp_app::FocusPane::Local => {
             let parent = Path::new(&app.local_cwd)
@@ -1145,51 +1216,7 @@ fn navigate_parent_directory(app: &mut AppState, io: &mut IoState) {
 }
 
 fn list_remote(app: &mut AppState, io: &mut IoState, path: String, select: SelectPolicy) {
-    if io_busy(io) {
-        return;
-    }
-    io.list_select = select;
-    let gen = io.generation;
-    io.in_flight = Some(InFlight::List {
-        generation: gen,
-        path: path.clone(),
-    });
-    reduce(app, Action::SetStatus(format!("Listing {path}...")));
-
-    let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
-    let ftp = app.ftp_session.take();
-    let sftp_info = app.active_connection.clone();
-    let io_tx = io.io_tx.clone();
-    let park = io.ftp_park.clone();
-
-    tokio::spawn(async move {
-        let mut ftp = ftp;
-        let path_msg = path.clone();
-        let result = tokio::time::timeout(Duration::from_secs(30), async {
-            match (&mut ftp, variant_opt) {
-                (Some(f), Some(Protocol::Ftp)) => f.list_dir(FtpVariant::Ftp, &path).await,
-                (Some(f), Some(Protocol::Ftps)) => f.list_dir(FtpVariant::Ftps, &path).await,
-                (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
-                (None, _) => {
-                    let info = sftp_info.ok_or_else(|| anyhow::anyhow!("not connected"))?;
-                    SftpSession::with_info(info).list_dir(&path).await
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("list timed out")));
-
-        if let Some(f) = ftp {
-            if let Ok(mut g) = park.lock() {
-                *g = Some(f);
-            }
-        }
-        let _ = io_tx.send(IoMessage::ListDone {
-            generation: gen,
-            path: path_msg,
-            result,
-        });
-    });
+    request_list(app, io, path, select, false);
 }
 
 fn relist_remote(app: &mut AppState, io: &mut IoState) {
@@ -1216,14 +1243,6 @@ enum WorkerMessage {
     Done(WorkerResult),
 }
 
-#[allow(dead_code)]
-struct PendingFile {
-    local_path: String,
-    remote_path: String,
-    direction: TransferDirection,
-    size_bytes: Option<u64>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FsKind {
     CreateFile,
@@ -1240,7 +1259,6 @@ enum InFlight {
         generation: u64,
         path: String,
     },
-    #[allow(dead_code)]
     Scan {
         generation: u64,
     },
@@ -1292,12 +1310,17 @@ enum IoMessage {
         changed: bool,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
-    #[allow(dead_code)]
-    ScanItem { generation: u64, file: PendingFile },
-    #[allow(dead_code)]
-    ScanDone { generation: u64 },
-    #[allow(dead_code)]
-    ScanError { generation: u64, error: String },
+    ScanItem {
+        generation: u64,
+        file: PendingFile,
+    },
+    ScanDone {
+        generation: u64,
+    },
+    ScanError {
+        generation: u64,
+        error: String,
+    },
 }
 
 struct IoState {
@@ -1310,10 +1333,36 @@ struct IoState {
     list_err_prefix: String,
     fs_remote: bool,
     fs_ok_status: String,
+    pending_scan: VecDeque<PendingFile>,
+    overwrite_policy: OverwritePolicy,
+    drain_list: bool,
+    drain_mkdir: bool,
+    mkdir_queue: VecDeque<String>,
 }
 
 fn io_busy(io: &IoState) -> bool {
     io.in_flight.is_some()
+}
+
+fn drain_busy(io: &IoState) -> bool {
+    !io.pending_scan.is_empty()
+        || matches!(
+            io.in_flight,
+            Some(InFlight::Scan { .. } | InFlight::List { .. })
+        )
+}
+
+fn clear_scan_state(io: &mut IoState) {
+    io.pending_scan.clear();
+    io.overwrite_policy = OverwritePolicy::Ask;
+    io.mkdir_queue.clear();
+    io.drain_list = false;
+    io.drain_mkdir = false;
+}
+
+fn bump_generation(io: &mut IoState) {
+    io.generation = io.generation.wrapping_add(1);
+    clear_scan_state(io);
 }
 
 fn take_parked_ftp(park: &Arc<Mutex<Option<UnifiedFtpSession>>>) -> Option<UnifiedFtpSession> {
@@ -1427,6 +1476,11 @@ fn handle_io_message(
                 return;
             }
             io.in_flight = None;
+            if io.drain_list {
+                io.drain_list = false;
+                handle_drain_list_result(app, io, result);
+                return;
+            }
             match result {
                 Ok(entries) => {
                     let select = io.list_select;
@@ -1463,6 +1517,11 @@ fn handle_io_message(
                 return;
             }
             io.in_flight = None;
+            if io.drain_mkdir {
+                io.drain_mkdir = false;
+                handle_drain_mkdir_result(app, io, result);
+                return;
+            }
             match result {
                 Ok(()) => {
                     let status = io.fs_ok_status.clone();
@@ -1513,7 +1572,48 @@ fn handle_io_message(
             });
             reduce(app, Action::ShowChoicePrompt(ChoicePromptKind::HostKey));
         }
-        IoMessage::ScanItem { .. } | IoMessage::ScanDone { .. } | IoMessage::ScanError { .. } => {}
+        IoMessage::ScanItem { generation, file } => {
+            if generation != io.generation {
+                return;
+            }
+            let matches_inflight = matches!(
+                io.in_flight,
+                Some(InFlight::Scan { generation: g }) if g == generation
+            );
+            if !matches_inflight {
+                return;
+            }
+            apply_scan_item(&mut io.pending_scan, file);
+        }
+        IoMessage::ScanDone { generation } => {
+            if generation != io.generation {
+                return;
+            }
+            let matches_inflight = matches!(
+                io.in_flight,
+                Some(InFlight::Scan { generation: g }) if g == generation
+            );
+            if !matches_inflight {
+                return;
+            }
+            io.in_flight = None;
+            drain_scan_next(app, io);
+        }
+        IoMessage::ScanError { generation, error } => {
+            if generation != io.generation {
+                return;
+            }
+            let matches_inflight = matches!(
+                io.in_flight,
+                Some(InFlight::Scan { generation: g }) if g == generation
+            );
+            if !matches_inflight {
+                return;
+            }
+            io.in_flight = None;
+            clear_scan_state(io);
+            reduce(app, Action::ShowError(format!("Scan failed: {error}")));
+        }
     }
 }
 
@@ -1572,7 +1672,8 @@ async fn disconnect_session(app: &mut AppState, session: &mut SftpSession, io: &
         let _ = reply.send(false);
     }
     io.in_flight = None;
-    io.generation = io.generation.wrapping_add(1);
+    bump_generation(io);
+    reduce(app, Action::CancelPrompt);
     let _ = take_parked_ftp(&io.ftp_park);
     if let Some(mut ftp) = app.ftp_session.take() {
         let _ = ftp.disconnect().await;
@@ -1627,7 +1728,7 @@ fn connect_off_thread(app: &mut AppState, io: &mut IoState, info: ConnectionInfo
         return;
     }
 
-    io.generation = io.generation.wrapping_add(1);
+    bump_generation(io);
     let gen = io.generation;
     io.in_flight = Some(InFlight::Connect { generation: gen });
 
@@ -1723,67 +1824,764 @@ fn request_quit(app: &mut AppState) -> bool {
     }
 }
 
-fn queue_upload_selected(app: &mut AppState) {
+fn queue_upload_selected(app: &mut AppState, io: &mut IoState) {
     if !app.connected {
         reduce(app, Action::SetStatus("Not connected".to_string()));
         return;
     }
 
-    let selected = app.selected_local_entry().cloned();
-    if let Some(local) = selected {
-        if local.kind == dd_ftp_core::EntryKind::Directory {
-            reduce(
-                app,
-                Action::SetStatus("Select a local file to upload".to_string()),
-            );
-            return;
-        }
-
-        let remote_target = match safe_remote_child(&app.remote_cwd, &local.name) {
-            Ok(p) => p,
-            Err(_) => {
-                reduce(app, Action::ShowError("path escapes directory".to_string()));
-                return;
-            }
-        };
-        let job = TransferJob::new(local.path, remote_target, TransferDirection::Upload);
-        reduce(app, Action::QueueTransfer(job));
+    if let Some(local) = app.selected_local_entry().cloned() {
+        enqueue_entry(app, io, local, TransferDirection::Upload);
     }
 }
 
-fn queue_download_selected(app: &mut AppState) {
+fn queue_download_selected(app: &mut AppState, io: &mut IoState) {
     if !app.connected {
         reduce(app, Action::SetStatus("Not connected".to_string()));
         return;
     }
 
-    let selected = app.selected_remote_entry().cloned();
-    if let Some(remote) = selected {
-        if remote.kind == dd_ftp_core::EntryKind::Directory {
+    if let Some(remote) = app.selected_remote_entry().cloned() {
+        enqueue_entry(app, io, remote, TransferDirection::Download);
+    }
+}
+
+fn enqueue_entry(
+    app: &mut AppState,
+    io: &mut IoState,
+    entry: FileEntry,
+    direction: TransferDirection,
+) {
+    if entry.name == "." || entry.name == ".." {
+        return;
+    }
+    if drain_busy(io) {
+        return;
+    }
+    if entry.kind == dd_ftp_core::EntryKind::Directory {
+        start_scan(app, io, entry, direction);
+        return;
+    }
+
+    let (local_path, remote_path) = match direction {
+        TransferDirection::Upload => {
+            let remote_path = match safe_remote_child(&app.remote_cwd, &entry.name) {
+                Ok(p) => p,
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    return;
+                }
+            };
+            (entry.path, remote_path)
+        }
+        TransferDirection::Download => {
+            let local_path = match safe_local_child(Path::new(&app.local_cwd), &entry.name) {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    return;
+                }
+            };
+            let remote_path = match safe_remote_child(&app.remote_cwd, &entry.name) {
+                Ok(p) => p,
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    return;
+                }
+            };
+            (local_path, remote_path)
+        }
+    };
+
+    io.pending_scan.push_back(PendingFile {
+        local_path,
+        remote_path,
+        direction,
+        size_bytes: Some(entry.size),
+    });
+    drain_scan_next(app, io);
+}
+
+fn apply_scan_item(pending_scan: &mut VecDeque<PendingFile>, file: PendingFile) {
+    pending_scan.push_back(file);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverwriteChoice {
+    Skip,
+    Overwrite,
+    OverwriteAll,
+    SkipAll,
+    Abort,
+    Rename,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DrainEvent {
+    BeginDownload { dest_exists: bool },
+    BeginUpload,
+    UploadList { dest_exists: bool },
+    UploadParentMissing,
+    UploadParentsCreated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DrainStep {
+    ListParent(String),
+    CreateParents,
+    Enqueue,
+    Skip,
+    Prompt,
+}
+
+fn resolve_conflict(dest_exists: bool, policy: OverwritePolicy) -> DrainStep {
+    if !dest_exists {
+        DrainStep::Enqueue
+    } else {
+        match policy {
+            OverwritePolicy::Ask => DrainStep::Prompt,
+            OverwritePolicy::OverwriteAll => DrainStep::Enqueue,
+            OverwritePolicy::SkipAll => DrainStep::Skip,
+        }
+    }
+}
+
+fn drain_step(file: &PendingFile, event: DrainEvent, policy: OverwritePolicy) -> DrainStep {
+    match (file.direction, event) {
+        (TransferDirection::Download, DrainEvent::BeginDownload { dest_exists }) => {
+            resolve_conflict(dest_exists, policy)
+        }
+        (TransferDirection::Upload, DrainEvent::BeginUpload) => {
+            DrainStep::ListParent(parent_remote_path(&file.remote_path))
+        }
+        (TransferDirection::Upload, DrainEvent::UploadList { dest_exists }) => {
+            resolve_conflict(dest_exists, policy)
+        }
+        (TransferDirection::Upload, DrainEvent::UploadParentMissing) => DrainStep::CreateParents,
+        (TransferDirection::Upload, DrainEvent::UploadParentsCreated) => {
+            resolve_conflict(false, policy)
+        }
+        _ => DrainStep::Skip,
+    }
+}
+
+fn remote_mkdir_chain(cwd: &str, dest_parent: &str) -> anyhow::Result<Vec<String>> {
+    if dest_parent == cwd || dest_parent.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cwd_trim = cwd.trim_end_matches('/');
+    let prefix = if cwd_trim.is_empty() { "/" } else { cwd_trim };
+    let rel = dest_parent
+        .strip_prefix(prefix)
+        .unwrap_or(dest_parent)
+        .trim_start_matches('/');
+    if rel.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut acc = if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        prefix.to_string()
+    };
+    let mut out = Vec::new();
+    for comp in rel.split('/') {
+        if comp.is_empty() {
+            continue;
+        }
+        acc = safe_remote_child(&acc, comp)?;
+        out.push(acc.clone());
+    }
+    Ok(out)
+}
+
+fn remote_basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+fn enqueue_pending_file(app: &mut AppState, file: PendingFile) {
+    let mut job = TransferJob::new(file.local_path, file.remote_path, file.direction);
+    job.size_bytes = file.size_bytes;
+    reduce(app, Action::QueueTransfer(job));
+}
+
+fn drain_scan_next(app: &mut AppState, io: &mut IoState) {
+    if io_busy(io) {
+        return;
+    }
+    if app.is_choice_prompt()
+        || matches!(
+            app.prompt_kind,
+            Some(PromptKind::Text(TextPromptKind::OverwriteRename))
+        )
+    {
+        return;
+    }
+
+    loop {
+        let Some(file) = io.pending_scan.front().cloned() else {
+            io.overwrite_policy = OverwritePolicy::Ask;
+            io.mkdir_queue.clear();
+            return;
+        };
+        match file.direction {
+            TransferDirection::Download => {
+                let dest_exists = Path::new(&file.local_path).exists();
+                match drain_step(
+                    &file,
+                    DrainEvent::BeginDownload { dest_exists },
+                    io.overwrite_policy,
+                ) {
+                    DrainStep::Enqueue => {
+                        io.pending_scan.pop_front();
+                        enqueue_pending_file(app, file);
+                    }
+                    DrainStep::Skip => {
+                        io.pending_scan.pop_front();
+                    }
+                    DrainStep::Prompt => {
+                        show_overwrite_prompt(app, io);
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+            TransferDirection::Upload => {
+                match drain_step(&file, DrainEvent::BeginUpload, io.overwrite_policy) {
+                    DrainStep::ListParent(parent) => {
+                        request_list(app, io, parent, SelectPolicy::PreserveName, true);
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        }
+    }
+}
+
+fn handle_drain_list_result(
+    app: &mut AppState,
+    io: &mut IoState,
+    result: Result<Vec<FileEntry>, anyhow::Error>,
+) {
+    let Some(file) = io.pending_scan.front().cloned() else {
+        return;
+    };
+    let dest_name = remote_basename(&file.remote_path);
+    match result {
+        Ok(entries) => {
+            let dest_exists = entries.iter().any(|e| e.name == dest_name);
+            apply_drain_conflict(app, io, file, dest_exists);
+        }
+        Err(err) => {
+            let parent = parent_remote_path(&file.remote_path);
+            if parent == app.remote_cwd {
+                reduce(app, Action::ShowError(format!("Remote list failed: {err}")));
+                io.pending_scan.pop_front();
+                drain_scan_next(app, io);
+                return;
+            }
+            match drain_step(&file, DrainEvent::UploadParentMissing, io.overwrite_policy) {
+                DrainStep::CreateParents => match remote_mkdir_chain(&app.remote_cwd, &parent) {
+                    Ok(chain) if !chain.is_empty() => {
+                        io.mkdir_queue = chain.into();
+                        drain_mkdir_next(app, io);
+                    }
+                    Ok(_) => apply_drain_conflict(app, io, file, false),
+                    Err(_) => {
+                        reduce(app, Action::ShowError("path escapes directory".to_string()));
+                        io.pending_scan.pop_front();
+                        drain_scan_next(app, io);
+                    }
+                },
+                _ => {
+                    io.pending_scan.pop_front();
+                    drain_scan_next(app, io);
+                }
+            }
+        }
+    }
+}
+
+fn apply_drain_conflict(
+    app: &mut AppState,
+    io: &mut IoState,
+    file: PendingFile,
+    dest_exists: bool,
+) {
+    match drain_step(
+        &file,
+        DrainEvent::UploadList { dest_exists },
+        io.overwrite_policy,
+    ) {
+        DrainStep::Enqueue => {
+            io.pending_scan.pop_front();
+            enqueue_pending_file(app, file);
+            drain_scan_next(app, io);
+        }
+        DrainStep::Skip => {
+            io.pending_scan.pop_front();
+            drain_scan_next(app, io);
+        }
+        DrainStep::Prompt => show_overwrite_prompt(app, io),
+        _ => {}
+    }
+}
+
+fn handle_drain_mkdir_result(
+    app: &mut AppState,
+    io: &mut IoState,
+    result: Result<(), anyhow::Error>,
+) {
+    match result {
+        Ok(()) => {
+            io.mkdir_queue.pop_front();
+            if io.mkdir_queue.is_empty() {
+                if let Some(file) = io.pending_scan.front().cloned() {
+                    match drain_step(&file, DrainEvent::UploadParentsCreated, io.overwrite_policy) {
+                        DrainStep::Enqueue => {
+                            io.pending_scan.pop_front();
+                            enqueue_pending_file(app, file);
+                        }
+                        DrainStep::Skip => {
+                            io.pending_scan.pop_front();
+                        }
+                        DrainStep::Prompt => {
+                            show_overwrite_prompt(app, io);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                drain_scan_next(app, io);
+            } else {
+                drain_mkdir_next(app, io);
+            }
+        }
+        Err(err) => {
             reduce(
                 app,
-                Action::SetStatus("Select a remote file to download".to_string()),
+                Action::ShowError(format!("Create folder failed: {err}")),
             );
-            return;
+            io.mkdir_queue.clear();
+            io.pending_scan.pop_front();
+            drain_scan_next(app, io);
         }
-
-        let local_target = match safe_local_child(Path::new(&app.local_cwd), &remote.name) {
-            Ok(p) => p.to_string_lossy().to_string(),
-            Err(_) => {
-                reduce(app, Action::ShowError("path escapes directory".to_string()));
-                return;
-            }
-        };
-        let remote_path = match safe_remote_child(&app.remote_cwd, &remote.name) {
-            Ok(p) => p,
-            Err(_) => {
-                reduce(app, Action::ShowError("path escapes directory".to_string()));
-                return;
-            }
-        };
-        let job = TransferJob::new(local_target, remote_path, TransferDirection::Download);
-        reduce(app, Action::QueueTransfer(job));
     }
+}
+
+fn drain_mkdir_next(app: &mut AppState, io: &mut IoState) {
+    let Some(path) = io.mkdir_queue.front().cloned() else {
+        if let Some(file) = io.pending_scan.pop_front() {
+            enqueue_pending_file(app, file);
+        }
+        drain_scan_next(app, io);
+        return;
+    };
+    request_fs(app, io, FsKind::CreateFolder, path);
+}
+
+fn show_overwrite_prompt(app: &mut AppState, io: &IoState) {
+    let Some(current) = io.pending_scan.front().cloned() else {
+        return;
+    };
+    let remaining: Vec<PendingFile> = io.pending_scan.iter().skip(1).cloned().collect();
+    app.overwrite = Some(OverwritePrompt {
+        current,
+        remaining,
+        apply_all: io.overwrite_policy,
+    });
+    reduce(app, Action::ShowChoicePrompt(ChoicePromptKind::Overwrite));
+}
+
+fn apply_overwrite_choice(app: &mut AppState, io: &mut IoState, choice: OverwriteChoice) {
+    match choice {
+        OverwriteChoice::Skip => {
+            reduce(app, Action::CancelPrompt);
+            io.pending_scan.pop_front();
+            drain_scan_next(app, io);
+        }
+        OverwriteChoice::Overwrite => {
+            reduce(app, Action::CancelPrompt);
+            if let Some(file) = io.pending_scan.pop_front() {
+                enqueue_pending_file(app, file);
+            }
+            drain_scan_next(app, io);
+        }
+        OverwriteChoice::OverwriteAll => {
+            io.overwrite_policy = OverwritePolicy::OverwriteAll;
+            reduce(
+                app,
+                Action::SetOverwritePolicy(OverwritePolicy::OverwriteAll),
+            );
+            reduce(app, Action::CancelPrompt);
+            if let Some(file) = io.pending_scan.pop_front() {
+                enqueue_pending_file(app, file);
+            }
+            drain_scan_next(app, io);
+        }
+        OverwriteChoice::SkipAll => {
+            io.overwrite_policy = OverwritePolicy::SkipAll;
+            reduce(app, Action::SetOverwritePolicy(OverwritePolicy::SkipAll));
+            reduce(app, Action::CancelPrompt);
+            io.pending_scan.pop_front();
+            drain_scan_next(app, io);
+        }
+        OverwriteChoice::Abort => {
+            clear_scan_state(io);
+            reduce(app, Action::CancelPrompt);
+        }
+        OverwriteChoice::Rename => {
+            reduce(app, Action::CancelPrompt);
+            app.show_prompt = true;
+            app.prompt_kind = Some(PromptKind::Text(TextPromptKind::OverwriteRename));
+            let current_name = io
+                .pending_scan
+                .front()
+                .map(|f| match f.direction {
+                    TransferDirection::Upload => remote_basename(&f.remote_path),
+                    TransferDirection::Download => Path::new(&f.local_path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                })
+                .unwrap_or_default();
+            app.prompt_value = dd_ftp_app::TextField::from_str(&current_name);
+        }
+    }
+}
+
+fn apply_overwrite_rename(app: &mut AppState, io: &mut IoState, new_name: &str) {
+    let Some(mut file) = io.pending_scan.front().cloned() else {
+        return;
+    };
+    match file.direction {
+        TransferDirection::Upload => {
+            let parent = parent_remote_path(&file.remote_path);
+            match safe_remote_child(&parent, new_name) {
+                Ok(p) => file.remote_path = p,
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    io.pending_scan.pop_front();
+                    drain_scan_next(app, io);
+                    return;
+                }
+            }
+        }
+        TransferDirection::Download => {
+            let parent = Path::new(&file.local_path)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(&app.local_cwd));
+            match safe_local_child(&parent, new_name) {
+                Ok(p) => file.local_path = p.to_string_lossy().to_string(),
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    io.pending_scan.pop_front();
+                    drain_scan_next(app, io);
+                    return;
+                }
+            }
+        }
+    }
+    if let Some(front) = io.pending_scan.front_mut() {
+        *front = file;
+    }
+    drain_scan_next(app, io);
+}
+
+fn start_scan(
+    app: &mut AppState,
+    io: &mut IoState,
+    entry: FileEntry,
+    direction: TransferDirection,
+) {
+    if io_busy(io) || drain_busy(io) {
+        return;
+    }
+    let gen = io.generation;
+    io.in_flight = Some(InFlight::Scan { generation: gen });
+    let msg = format!("Scanning {}...", entry.name);
+    app.toast = Some(Toast::info(msg.clone()));
+    reduce(app, Action::SetStatus(msg));
+
+    let io_tx = io.io_tx.clone();
+    match direction {
+        TransferDirection::Upload => {
+            let local_root = PathBuf::from(&entry.path);
+            let remote_root = match safe_remote_child(&app.remote_cwd, &entry.name) {
+                Ok(p) => p,
+                Err(_) => {
+                    io.in_flight = None;
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    return;
+                }
+            };
+            tokio::task::spawn_blocking(move || {
+                match walk_local_files(&local_root, &remote_root) {
+                    Ok(files) => {
+                        for file in files {
+                            let _ = io_tx.send(IoMessage::ScanItem {
+                                generation: gen,
+                                file,
+                            });
+                        }
+                        let _ = io_tx.send(IoMessage::ScanDone { generation: gen });
+                    }
+                    Err(err) => {
+                        let _ = io_tx.send(IoMessage::ScanError {
+                            generation: gen,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+        TransferDirection::Download => {
+            let Some(info) = app.active_connection.clone() else {
+                io.in_flight = None;
+                reduce(app, Action::SetStatus("Not connected".to_string()));
+                return;
+            };
+            let remote_root = match safe_remote_child(&app.remote_cwd, &entry.name) {
+                Ok(p) => p,
+                Err(_) => {
+                    io.in_flight = None;
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    return;
+                }
+            };
+            let local_root = match safe_local_child(Path::new(&app.local_cwd), &entry.name) {
+                Ok(p) => p,
+                Err(_) => {
+                    io.in_flight = None;
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    return;
+                }
+            };
+            tokio::spawn(async move {
+                match walk_remote_files(info, remote_root, local_root, gen, io_tx.clone()).await {
+                    Ok(()) => {
+                        let _ = io_tx.send(IoMessage::ScanDone { generation: gen });
+                    }
+                    Err(err) => {
+                        let _ = io_tx.send(IoMessage::ScanError {
+                            generation: gen,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Local recursive walk. Reads only; never creates destination directories.
+fn walk_local_files(root: &Path, remote_root: &str) -> anyhow::Result<Vec<PendingFile>> {
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), remote_root.to_string())];
+    while let Some((local_dir, remote_dir)) = stack.pop() {
+        let rd = match std::fs::read_dir(&local_dir) {
+            Ok(rd) => rd,
+            Err(err) => anyhow::bail!("read_dir {}: {err}", local_dir.display()),
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == "." || name_str == ".." {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                let child_remote = safe_remote_child(&remote_dir, name_str.as_ref())?;
+                stack.push((entry.path(), child_remote));
+            } else {
+                let remote_path = safe_remote_child(&remote_dir, name_str.as_ref())?;
+                out.push(PendingFile {
+                    local_path: entry.path().to_string_lossy().into_owned(),
+                    remote_path,
+                    direction: TransferDirection::Upload,
+                    size_bytes: Some(meta.len()),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn walk_remote_files(
+    info: ConnectionInfo,
+    remote_root: String,
+    local_root: PathBuf,
+    generation: u64,
+    tx: mpsc::UnboundedSender<IoMessage>,
+) -> Result<()> {
+    let mut stack = vec![(remote_root, local_root)];
+    match info.protocol {
+        Protocol::Sftp => {
+            let session = SftpSession::with_info(info);
+            while let Some((remote_dir, local_dir)) = stack.pop() {
+                let entries = session.list_dir(&remote_dir).await?;
+                push_remote_entries(
+                    &mut stack,
+                    &tx,
+                    generation,
+                    &remote_dir,
+                    &local_dir,
+                    entries,
+                )?;
+            }
+            Ok(())
+        }
+        Protocol::Ftp | Protocol::Ftps => {
+            let variant = match info.protocol {
+                Protocol::Ftp => FtpVariant::Ftp,
+                Protocol::Ftps => FtpVariant::Ftps,
+                Protocol::Sftp => unreachable!("walk_remote_files Sftp in FTP branch"),
+            };
+            let mut unified = UnifiedFtpSession::new();
+            unified.connect(variant, info).await?;
+            let mut walk_err = None;
+            while let Some((remote_dir, local_dir)) = stack.pop() {
+                match unified.list_dir(variant, &remote_dir).await {
+                    Ok(entries) => {
+                        if let Err(err) = push_remote_entries(
+                            &mut stack,
+                            &tx,
+                            generation,
+                            &remote_dir,
+                            &local_dir,
+                            entries,
+                        ) {
+                            walk_err = Some(err);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        walk_err = Some(err);
+                        break;
+                    }
+                }
+            }
+            unified.disconnect().await.ok();
+            match walk_err {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+fn push_remote_entries(
+    stack: &mut Vec<(String, PathBuf)>,
+    tx: &mpsc::UnboundedSender<IoMessage>,
+    generation: u64,
+    remote_dir: &str,
+    local_dir: &Path,
+    entries: Vec<FileEntry>,
+) -> Result<()> {
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        if entry.is_dir() {
+            let child_remote = safe_remote_child(remote_dir, &entry.name)?;
+            let child_local = safe_local_child(local_dir, &entry.name)?;
+            stack.push((child_remote, child_local));
+        } else {
+            let remote_path = safe_remote_child(remote_dir, &entry.name)?;
+            let local_path = safe_local_child(local_dir, &entry.name)?;
+            let _ = tx.send(IoMessage::ScanItem {
+                generation,
+                file: PendingFile {
+                    local_path: local_path.to_string_lossy().into_owned(),
+                    remote_path,
+                    direction: TransferDirection::Download,
+                    size_bytes: Some(entry.size),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn request_list(
+    app: &mut AppState,
+    io: &mut IoState,
+    path: String,
+    select: SelectPolicy,
+    drain: bool,
+) {
+    if io_busy(io) {
+        return;
+    }
+    io.list_select = select;
+    io.drain_list = drain;
+    let gen = io.generation;
+    io.in_flight = Some(InFlight::List {
+        generation: gen,
+        path: path.clone(),
+    });
+    if !drain {
+        reduce(app, Action::SetStatus(format!("Listing {path}...")));
+    }
+
+    let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
+    let ftp = app.ftp_session.take();
+    let sftp_info = app.active_connection.clone();
+    let io_tx = io.io_tx.clone();
+    let park = io.ftp_park.clone();
+
+    tokio::spawn(async move {
+        let mut ftp = ftp;
+        let path_msg = path.clone();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            match (&mut ftp, variant_opt) {
+                (Some(f), Some(Protocol::Ftp)) => f.list_dir(FtpVariant::Ftp, &path).await,
+                (Some(f), Some(Protocol::Ftps)) => f.list_dir(FtpVariant::Ftps, &path).await,
+                (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
+                (None, _) => {
+                    let info = sftp_info.ok_or_else(|| anyhow::anyhow!("not connected"))?;
+                    SftpSession::with_info(info).list_dir(&path).await
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("list timed out")));
+
+        if let Some(f) = ftp {
+            if let Ok(mut g) = park.lock() {
+                *g = Some(f);
+            }
+        }
+        let _ = io_tx.send(IoMessage::ListDone {
+            generation: gen,
+            path: path_msg,
+            result,
+        });
+    });
+}
+
+fn request_fs(app: &mut AppState, io: &mut IoState, kind: FsKind, path: String) {
+    if io_busy(io) {
+        return;
+    }
+    io.drain_mkdir = true;
+    begin_fs(app, io, kind, true, format!("Creating folder: {path}"));
+    spawn_remote_fs(app, io, kind, move |mut ftp, variant, info| async move {
+        let result = match (&mut ftp, variant) {
+            (Some(f), Some(Protocol::Ftp)) => f.create_dir(FtpVariant::Ftp, &path).await,
+            (Some(f), Some(Protocol::Ftps)) => f.create_dir(FtpVariant::Ftps, &path).await,
+            (Some(_), _) => Err(anyhow::anyhow!("Unknown FTP variant")),
+            (None, _) => match info {
+                Some(info) => SftpSession::with_info(info).create_dir(&path).await,
+                None => Err(anyhow::anyhow!("not connected")),
+            },
+        };
+        (ftp, result)
+    });
 }
 
 fn hydrate_password_from_keyring(
@@ -2786,9 +3584,18 @@ mod path_tests {
 
     #[test]
     fn download_jobs_must_not_contain_a_list_line_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "dd_ftp_dl_path_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
         let mut app = AppState {
             connected: true,
-            local_cwd: "/tmp".into(),
+            local_cwd: dir.to_string_lossy().into_owned(),
             remote_cwd: "/pub".into(),
             remote_entries: vec![FileEntry {
                 name: "file.bin".into(),
@@ -2802,7 +3609,8 @@ mod path_tests {
             ..Default::default()
         };
 
-        queue_download_selected(&mut app);
+        let (mut io, _rx) = test_io();
+        queue_download_selected(&mut app, &mut io);
 
         let job = app.queue.pending.first().expect("download job queued");
         assert_eq!(job.remote_path, "/pub/file.bin");
@@ -2811,6 +3619,7 @@ mod path_tests {
             "download remote_path must not be a LIST line, got {}",
             job.remote_path
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2836,5 +3645,258 @@ mod path_tests {
         assert!(hello.modified.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+fn test_io() -> (IoState, mpsc::UnboundedReceiver<IoMessage>) {
+    let (io_tx, io_rx) = mpsc::unbounded_channel();
+    (
+        IoState {
+            generation: 1,
+            in_flight: None,
+            io_tx,
+            ftp_park: Arc::new(Mutex::new(None)),
+            list_select: SelectPolicy::PreserveName,
+            list_ok_status: None,
+            list_err_prefix: "Remote list failed".to_string(),
+            fs_remote: false,
+            fs_ok_status: String::new(),
+            pending_scan: VecDeque::new(),
+            overwrite_policy: OverwritePolicy::Ask,
+            drain_list: false,
+            drain_mkdir: false,
+            mkdir_queue: VecDeque::new(),
+        },
+        io_rx,
+    )
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    fn pending_upload(local: &str, remote: &str) -> PendingFile {
+        PendingFile {
+            local_path: local.to_string(),
+            remote_path: remote.to_string(),
+            direction: TransferDirection::Upload,
+            size_bytes: Some(1),
+        }
+    }
+
+    #[test]
+    fn walk_local_tree_emits_nested_and_hidden_never_dotdot() {
+        let root = std::env::temp_dir().join(format!(
+            "dd_ftp_walk_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(nested.join("c.txt"), b"hi").expect("c.txt");
+        std::fs::write(root.join("a").join(".hidden"), b"dot").expect(".hidden");
+
+        let files = walk_local_files(&root.join("a"), "/pub/a").expect("walk");
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                Path::new(&f.local_path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(files.len(), 2, "expected c.txt and .hidden, got {names:?}");
+        assert!(names.contains(&"c.txt".to_string()));
+        assert!(names.contains(&".hidden".to_string()));
+        assert!(!names.iter().any(|n| n == "." || n == ".."));
+        assert!(files.iter().any(|f| f.remote_path == "/pub/a/b/c.txt"));
+        assert!(files.iter().any(|f| f.remote_path == "/pub/a/.hidden"));
+        for f in &files {
+            for comp in Path::new(&f.remote_path).components() {
+                if let Component::Normal(name) = comp {
+                    let n = name.to_string_lossy();
+                    if n != "pub" {
+                        assert!(
+                            safe_remote_child("/pub", n.as_ref()).is_ok()
+                                || n == "a"
+                                || n == "b"
+                                || n == "c.txt"
+                                || n == ".hidden",
+                            "unsafe dest component {n}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Walk helper reads only: fixture tree is unchanged (no dest create_dir).
+        assert!(nested.join("c.txt").is_file());
+        assert!(root.join("a").join(".hidden").is_file());
+        assert!(!root.join("pub").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_item_only_appends_to_pending_scan() {
+        let mut pending = VecDeque::new();
+        let app = AppState::default();
+        let file = pending_upload("/tmp/a/b/c.txt", "/pub/a/b/c.txt");
+        apply_scan_item(&mut pending, file);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].remote_path, "/pub/a/b/c.txt");
+        assert!(
+            app.queue.pending.is_empty(),
+            "ScanItem must not enqueue; queue.pending={}",
+            app.queue.pending.len()
+        );
+    }
+
+    #[test]
+    fn nested_upload_drain_waits_for_mkdir_before_enqueue() {
+        let file = pending_upload("/tmp/a/b/c.txt", "/pub/a/b/c.txt");
+        assert_eq!(
+            drain_step(&file, DrainEvent::BeginUpload, OverwritePolicy::Ask),
+            DrainStep::ListParent("/pub/a/b".into())
+        );
+        assert_eq!(
+            drain_step(&file, DrainEvent::UploadParentMissing, OverwritePolicy::Ask),
+            DrainStep::CreateParents
+        );
+        let chain = remote_mkdir_chain("/pub", "/pub/a/b").expect("chain");
+        assert_eq!(chain, vec!["/pub/a".to_string(), "/pub/a/b".to_string()]);
+        assert_eq!(
+            drain_step(
+                &file,
+                DrainEvent::UploadParentsCreated,
+                OverwritePolicy::Ask
+            ),
+            DrainStep::Enqueue
+        );
+        assert!(matches!(
+            drain_step(
+                &file,
+                DrainEvent::UploadList { dest_exists: false },
+                OverwritePolicy::Ask
+            ),
+            DrainStep::Enqueue
+        ));
+    }
+
+    #[test]
+    fn overwrite_default_skip_and_overwrite_all_remaining() {
+        let file = pending_upload("/tmp/a.txt", "/pub/a.txt");
+        assert_eq!(
+            resolve_conflict(true, OverwritePolicy::Ask),
+            DrainStep::Prompt
+        );
+        assert_eq!(
+            drain_step(
+                &file,
+                DrainEvent::UploadList { dest_exists: true },
+                OverwritePolicy::Ask
+            ),
+            DrainStep::Prompt
+        );
+        assert_eq!(
+            drain_step(
+                &file,
+                DrainEvent::UploadList { dest_exists: true },
+                OverwritePolicy::OverwriteAll
+            ),
+            DrainStep::Enqueue
+        );
+        assert_eq!(
+            drain_step(
+                &file,
+                DrainEvent::UploadList { dest_exists: true },
+                OverwritePolicy::SkipAll
+            ),
+            DrainStep::Skip
+        );
+        assert_eq!(
+            drain_step(
+                &file,
+                DrainEvent::UploadList { dest_exists: false },
+                OverwritePolicy::SkipAll
+            ),
+            DrainStep::Enqueue
+        );
+    }
+
+    #[test]
+    fn scan_item_is_generation_stamped_and_types_exist() {
+        let file = pending_upload("/tmp/a.txt", "/pub/a.txt");
+        let msg = IoMessage::ScanItem {
+            generation: 7,
+            file: file.clone(),
+        };
+        match msg {
+            IoMessage::ScanItem { generation, file } => {
+                assert_eq!(generation, 7);
+                assert_eq!(file.remote_path, "/pub/a.txt");
+            }
+            _ => panic!("expected ScanItem"),
+        }
+        let inflight = InFlight::Scan { generation: 7 };
+        assert!(matches!(inflight, InFlight::Scan { generation: 7 }));
+        let (mut io, _rx) = test_io();
+        io.pending_scan.push_back(file);
+        assert!(!io.pending_scan.is_empty());
+        assert!(drain_busy(&io));
+    }
+
+    #[test]
+    fn safe_child_applied_to_every_walk_dest() {
+        let files = {
+            let root = std::env::temp_dir().join(format!(
+                "dd_ftp_walk_safe_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(root.join("a").join("b")).expect("dirs");
+            std::fs::write(root.join("a").join("b").join("c.txt"), b"x").expect("file");
+            let files = walk_local_files(&root.join("a"), "/pub/a").expect("walk");
+            let _ = std::fs::remove_dir_all(&root);
+            files
+        };
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].remote_path, "/pub/a/b/c.txt");
+        assert_eq!(safe_remote_child("/pub/a", "b").unwrap(), "/pub/a/b");
+        assert_eq!(
+            safe_remote_child("/pub/a/b", "c.txt").unwrap(),
+            "/pub/a/b/c.txt"
+        );
+        assert!(safe_remote_child("/pub/a", "..").is_err());
+        assert!(safe_local_child(Path::new("/tmp/pane"), "..").is_err());
+    }
+
+    #[test]
+    fn overwrite_esc_does_not_clear_queued_jobs() {
+        let mut app = AppState::default();
+        reduce(
+            &mut app,
+            Action::QueueTransfer(TransferJob::new(
+                "/tmp/kept",
+                "/pub/kept",
+                TransferDirection::Upload,
+            )),
+        );
+        let (mut io, _rx) = test_io();
+        io.pending_scan
+            .push_back(pending_upload("/tmp/conflict", "/pub/conflict"));
+        apply_overwrite_choice(&mut app, &mut io, OverwriteChoice::Abort);
+        assert!(io.pending_scan.is_empty());
+        assert_eq!(app.queue.pending.len(), 1);
+        assert_eq!(app.queue.pending[0].remote_path, "/pub/kept");
     }
 }

@@ -1,7 +1,7 @@
 use dd_ftp_core::{ConnectionInfo, FileEntry, TransferJob};
 use uuid::Uuid;
 
-use crate::{ChoicePromptKind, SelectPolicy};
+use crate::{ChoicePromptKind, OverwritePolicy, SelectPolicy};
 
 #[derive(Debug)]
 pub enum Action {
@@ -68,6 +68,7 @@ pub enum Action {
     ShowRenamePrompt,
     ShowDeletePrompt,
     ShowChoicePrompt(ChoicePromptKind),
+    SetOverwritePolicy(OverwritePolicy),
     PromptInput(char),
     PromptBackspace,
     ConfirmPrompt,

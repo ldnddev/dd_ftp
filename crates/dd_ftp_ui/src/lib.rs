@@ -7,4 +7,4 @@ pub use layout::{
     Region, ScrollRegion,
 };
 pub use render::render;
-pub use theme::{load_theme, load_theme_with_source, ThemeSource};
+pub use theme::{cached_theme, load_theme, load_theme_with_source, reload_theme, ThemeSource};

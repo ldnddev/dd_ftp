@@ -8,14 +8,14 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Wrap,
     },
     Frame,
 };
 
 use crate::layout::{ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap};
-use crate::theme::{load_theme_with_source, Theme};
+use crate::theme::{cached_theme, Theme};
 
 fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec<Span<'static>> {
     let display: Vec<char> = if masked {
@@ -53,7 +53,7 @@ fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec
 
 pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     *map = LayoutMap::default();
-    let loaded = load_theme_with_source();
+    let loaded = cached_theme();
     let t = loaded.theme;
 
     // Full app background (header + footer included)
@@ -179,45 +179,21 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
 
     let local_visible = app.visible_local();
     let local_visible_len = local_visible.len();
+    let local_row_width = panes[0].width.saturating_sub(4) as usize;
     let local_items: Vec<ListItem> = local_visible
         .into_iter()
-        .map(|e| {
-            let color = match e.kind {
-                dd_ftp_core::EntryKind::Directory => t.folder,
-                dd_ftp_core::EntryKind::Symlink => t.link,
-                _ => t.file,
-            };
-            let prefix = if e.kind == dd_ftp_core::EntryKind::Directory {
-                "> "
-            } else {
-                "  "
-            };
-            ListItem::new(Span::styled(
-                format!("{}{}", prefix, e.name),
-                Style::default().fg(color),
-            ))
-        })
+        .map(|e| file_list_item(e, local_row_width, &t))
         .collect();
-    let remote_visible = app.visible_remote();
+    let remote_visible = if app.connected {
+        app.visible_remote()
+    } else {
+        Vec::new()
+    };
     let remote_visible_len = remote_visible.len();
+    let remote_row_width = panes[1].width.saturating_sub(4) as usize;
     let remote_items: Vec<ListItem> = remote_visible
         .into_iter()
-        .map(|e| {
-            let color = match e.kind {
-                dd_ftp_core::EntryKind::Directory => t.folder,
-                dd_ftp_core::EntryKind::Symlink => t.link,
-                _ => t.file,
-            };
-            let prefix = if e.kind == dd_ftp_core::EntryKind::Directory {
-                "> "
-            } else {
-                "  "
-            };
-            ListItem::new(Span::styled(
-                format!("{}{}", prefix, e.name),
-                Style::default().fg(color),
-            ))
-        })
+        .map(|e| file_list_item(e, remote_row_width, &t))
         .collect();
 
     let local_style = if app.focus == FocusPane::Local {
@@ -279,6 +255,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                 .border_style(local_style),
         )
         .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(
             Style::default()
                 .bg(t.selected_background)
@@ -306,6 +283,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                 .border_style(remote_style),
         )
         .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(
             Style::default()
                 .bg(t.selected_background)
@@ -323,6 +301,21 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     map.local_list_offset = local_state.offset();
     frame.render_stateful_widget(remote, panes[1], &mut remote_state);
     map.remote_list_offset = remote_state.offset();
+
+    if !app.connected {
+        frame.render_widget(
+            Paragraph::new("Not connected — o Quick Connect · m Bookmarks · F1 Help")
+                .style(Style::default().fg(t.text_secondary).bg(t.body_background))
+                .wrap(Wrap { trim: true }),
+            inner_list_rect(panes[1]),
+        );
+    } else if remote_visible_len == 0 {
+        frame.render_widget(
+            Paragraph::new("empty directory")
+                .style(Style::default().fg(t.text_secondary).bg(t.body_background)),
+            inner_list_rect(panes[1]),
+        );
+    }
 
     render_scrollbar(
         frame,
@@ -1204,6 +1197,90 @@ fn format_progress(job: &TransferJob) -> String {
     }
 }
 
+fn inner_list_rect(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn file_list_item(entry: &dd_ftp_core::FileEntry, width: usize, t: &Theme) -> ListItem<'static> {
+    let color = match entry.kind {
+        dd_ftp_core::EntryKind::Directory => t.folder,
+        dd_ftp_core::EntryKind::Symlink => t.link,
+        _ => t.file,
+    };
+    let prefix = if entry.kind == dd_ftp_core::EntryKind::Directory {
+        "> "
+    } else {
+        "  "
+    };
+    let meta = entry_meta(entry, width.saturating_sub(6));
+    let meta_len = meta.chars().count();
+    let name_max = width
+        .saturating_sub(prefix.chars().count() + meta_len)
+        .max(1);
+    let name = shorten_middle(&entry.name, name_max);
+    let pad = width.saturating_sub(prefix.chars().count() + name.chars().count() + meta_len);
+    let padding = " ".repeat(pad);
+
+    ListItem::new(Line::from(vec![
+        Span::styled(format!("{prefix}{name}"), Style::default().fg(color)),
+        Span::styled(
+            format!("{padding}{meta}"),
+            Style::default().fg(t.text_secondary),
+        ),
+    ]))
+}
+
+fn entry_meta(entry: &dd_ftp_core::FileEntry, max_width: usize) -> String {
+    let size = format!("{:>5}", format_size(entry.size));
+    let date = entry
+        .modified
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    let date_f = format!("{date:>16}");
+    let with_perms = if let Some(p) = entry.permissions.as_ref() {
+        format!("  {size}  {date_f}  {p}")
+    } else {
+        String::new()
+    };
+    if !with_perms.is_empty() && with_perms.chars().count() <= max_width {
+        return with_perms;
+    }
+    let with_date = format!("  {size}  {date_f}");
+    if with_date.chars().count() <= max_width {
+        return with_date;
+    }
+    let size_only = format!("  {size}");
+    if size_only.chars().count() <= max_width {
+        return size_only;
+    }
+    String::new()
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        return bytes.to_string();
+    }
+    let (scaled, label) = if bytes >= 1024u64.pow(4) {
+        (bytes as f64 / 1024f64.powi(4), "T")
+    } else if bytes >= 1024u64.pow(3) {
+        (bytes as f64 / 1024f64.powi(3), "G")
+    } else if bytes >= 1024u64.pow(2) {
+        (bytes as f64 / 1024f64.powi(2), "M")
+    } else {
+        (bytes as f64 / 1024.0, "K")
+    };
+    if scaled >= 10.0 {
+        format!("{scaled:.0}{label}")
+    } else {
+        format!("{scaled:.1}{label}")
+    }
+}
+
 fn shorten_middle(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -1323,11 +1400,11 @@ fn render_compare_view(frame: &mut Frame, area: Rect, app: &AppState, t: &Theme)
         let a_dir = app
             .local_entries
             .iter()
-            .any(|e| e.name == a.0 || e.kind == dd_ftp_core::EntryKind::Directory);
+            .any(|e| e.name.eq_ignore_ascii_case(&a.0) && e.is_dir());
         let b_dir = app
             .local_entries
             .iter()
-            .any(|e| e.name == b.0 || e.kind == dd_ftp_core::EntryKind::Directory);
+            .any(|e| e.name.eq_ignore_ascii_case(&b.0) && e.is_dir());
         match (a_dir, b_dir) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,

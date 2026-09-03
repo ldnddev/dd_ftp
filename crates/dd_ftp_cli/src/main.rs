@@ -721,17 +721,15 @@ async fn run(
                             );
 
                             if app.connected {
-                                if !matches!(io.in_flight, Some(InFlight::List { .. })) {
-                                    io.list_ok_status =
-                                        Some("Refreshed local + remote listing".to_string());
-                                    io.list_err_prefix = "Remote refresh failed".to_string();
-                                    list_remote(
-                                        app,
-                                        &mut io,
-                                        app.remote_cwd.clone(),
-                                        SelectPolicy::PreserveName,
-                                    );
-                                }
+                                io.list_ok_status =
+                                    Some("Refreshed local + remote listing".to_string());
+                                io.list_err_prefix = "Remote refresh failed".to_string();
+                                list_remote(
+                                    app,
+                                    &mut io,
+                                    app.remote_cwd.clone(),
+                                    SelectPolicy::PreserveName,
+                                );
                             } else {
                                 reduce(
                                     app,
@@ -1084,7 +1082,7 @@ fn navigate_into_directory(app: &mut AppState, io: &mut IoState) {
                 reduce(app, Action::SetStatus("Not connected".to_string()));
                 return;
             }
-            if matches!(io.in_flight, Some(InFlight::List { .. })) {
+            if io_busy(io) {
                 return;
             }
 
@@ -1133,7 +1131,7 @@ fn navigate_parent_directory(app: &mut AppState, io: &mut IoState) {
                 reduce(app, Action::SetStatus("Not connected".to_string()));
                 return;
             }
-            if matches!(io.in_flight, Some(InFlight::List { .. })) {
+            if io_busy(io) {
                 return;
             }
 
@@ -1147,7 +1145,7 @@ fn navigate_parent_directory(app: &mut AppState, io: &mut IoState) {
 }
 
 fn list_remote(app: &mut AppState, io: &mut IoState, path: String, select: SelectPolicy) {
-    if matches!(io.in_flight, Some(InFlight::List { .. })) {
+    if io_busy(io) {
         return;
     }
     io.list_select = select;
@@ -1312,6 +1310,10 @@ struct IoState {
     list_err_prefix: String,
     fs_remote: bool,
     fs_ok_status: String,
+}
+
+fn io_busy(io: &IoState) -> bool {
+    io.in_flight.is_some()
 }
 
 fn take_parked_ftp(park: &Arc<Mutex<Option<UnifiedFtpSession>>>) -> Option<UnifiedFtpSession> {
@@ -1492,7 +1494,13 @@ fn handle_io_message(
             changed,
             reply,
         } => {
-            if generation != io.generation {
+            if generation != io.generation
+                || matches!(io.in_flight, Some(InFlight::HostKey { .. }))
+                || !matches!(
+                    io.in_flight,
+                    Some(InFlight::Connect { generation: g }) if g == generation
+                )
+            {
                 let _ = reply.send(false);
                 return;
             }
@@ -1587,10 +1595,7 @@ async fn disconnect_session(app: &mut AppState, session: &mut SftpSession, io: &
 }
 
 fn connect_off_thread(app: &mut AppState, io: &mut IoState, info: ConnectionInfo) {
-    if matches!(
-        io.in_flight,
-        Some(InFlight::Connect { .. } | InFlight::HostKey { .. })
-    ) {
+    if io_busy(io) {
         return;
     }
     if info.name.trim().is_empty() {
@@ -2290,7 +2295,7 @@ where
 }
 
 fn create_file(app: &mut AppState, io: &mut IoState, name: &str) {
-    if matches!(io.in_flight, Some(InFlight::Fs { .. })) {
+    if io_busy(io) {
         return;
     }
     match app.focus {
@@ -2369,7 +2374,7 @@ fn create_file(app: &mut AppState, io: &mut IoState, name: &str) {
 }
 
 fn create_folder(app: &mut AppState, io: &mut IoState, name: &str) {
-    if matches!(io.in_flight, Some(InFlight::Fs { .. })) {
+    if io_busy(io) {
         return;
     }
     match app.focus {
@@ -2437,12 +2442,26 @@ fn create_folder(app: &mut AppState, io: &mut IoState, name: &str) {
     }
 }
 
-fn rename_item(app: &mut AppState, io: &mut IoState, target: &str, new_name: &str) {
-    if matches!(io.in_flight, Some(InFlight::Fs { .. })) {
+fn rename_item(app: &mut AppState, io: &mut IoState, _target: &str, new_name: &str) {
+    if io_busy(io) {
         return;
     }
     match app.focus {
         dd_ftp_app::FocusPane::Local => {
+            let old_name = match app.selected_local_entry() {
+                Some(e) => e.name.clone(),
+                None => {
+                    reduce(app, Action::SetStatus("No item selected".to_string()));
+                    return;
+                }
+            };
+            let from = match safe_local_child(Path::new(&app.local_cwd), &old_name) {
+                Ok(p) => p,
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    return;
+                }
+            };
             let new_path = match safe_local_child(Path::new(&app.local_cwd), new_name) {
                 Ok(p) => p,
                 Err(_) => {
@@ -2450,7 +2469,6 @@ fn rename_item(app: &mut AppState, io: &mut IoState, target: &str, new_name: &st
                     return;
                 }
             };
-            let from = PathBuf::from(target);
             begin_fs(
                 app,
                 io,
@@ -2522,7 +2540,7 @@ fn rename_item(app: &mut AppState, io: &mut IoState, target: &str, new_name: &st
 }
 
 fn delete_item(app: &mut AppState, io: &mut IoState, target: &str) {
-    if matches!(io.in_flight, Some(InFlight::Fs { .. })) {
+    if io_busy(io) {
         return;
     }
     let is_dir = match app.focus {
@@ -2692,6 +2710,10 @@ mod path_tests {
                 ok: true,
             },
             Case {
+                name: ".",
+                ok: false,
+            },
+            Case {
                 name: "..",
                 ok: false,
             },
@@ -2727,6 +2749,10 @@ mod path_tests {
             Case {
                 name: "foo",
                 ok: true,
+            },
+            Case {
+                name: ".",
+                ok: false,
             },
             Case {
                 name: "..",

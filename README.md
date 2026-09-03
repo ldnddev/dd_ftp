@@ -34,7 +34,7 @@ Current implementation includes:
 - Theme system (`dd_ftp_theme.yml`) + F2 theme debug
 - File-type coloring and directory prefixing
 - Directory compare overlay
-- File operations (local): create file/folder, rename, delete
+- File operations (local and remote): create file/folder, rename, delete
 
 ## Environment variables (optional)
 
@@ -50,9 +50,12 @@ export DD_FTP_PATH=/
 ## Controls
 
 ### Global
-- `F1` help
-- `F2` theme debug
-- `q` quit
+- `F1` toggle help (opening closes theme debug)
+- `Esc` close current modal; when compare is on and no modal is open, close compare
+- `F2` toggle theme debug (opening closes help)
+- `q` quit (confirms if transfers are active)
+- `Ctrl+C` cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)
+- `C` toggle directory compare
 
 ### Navigation
 - `1` Local pane
@@ -63,12 +66,17 @@ export DD_FTP_PATH=/
 - `l` enter directory
 - `h` parent directory
 - `r` refresh
+- `Enter` enter directory, or queue upload (local file) / download (remote file). Queue pane: no-op.
 
 ### Connection / bookmarks
 - `o` quick connect
 - `m` bookmarks modal
 - `b` cycle bookmarks
-- `c` connect/disconnect
+- `c` connect using the quick-connect form / disconnect if already connected
+- `c` (bookmarks) connect the highlighted bookmark (disconnects first if already connected)
+- `d` (bookmarks) delete bookmark with confirm
+- `e` (bookmarks) edit bookmark
+- `D` (bookmarks) set default bookmark
 - `B` save current quick-connect as bookmark
 - `Ctrl+K` keyring health check
 
@@ -77,25 +85,35 @@ export DD_FTP_PATH=/
 - `d` queue download
 - `R` retry last failed
 - `X` clear pending queue
-- `C` cancel active transfer
+- `Ctrl+C` cancel in-flight transfers
+- `Enter` (on a file) queue upload/download
 
 ### Filters / compare
-- `/` toggle filter
+- `/` toggle filter (`Esc` closes and clears the pattern)
 - `C` toggle directory compare
+- `Esc` close compare when no modal is open
 
 ### File operations
-- `Ctrl+n` open new-item prompt (`Tab` toggles between file and folder)
-- `Ctrl+Alt+e` rename selected item
-- `Ctrl+Delete` delete selected item
+- `n` / `Ctrl+n` open new-item prompt (`Tab` toggles between file and folder)
+- `e` / `Ctrl+Alt+e` rename selected item
+- `Delete` / `Ctrl+Delete` delete selected item with confirm
+
+### Selection / sort
+- `Space` toggle multi-select mark on the focused row
+- `p` SFTP chmod prompt (remote pane)
+- `s` cycle sort key: name → size → date → name
+- `S` toggle sort direction
+- `.` toggle hide-dotfiles
 
 ### Mouse
 - Scroll wheel over a list, queue, or help region scrolls it (also works over the scrollbar rail)
 - Single-click a file row: focus that pane and select the row
 - Double-click a directory row: enter it
+- Double-click a file row: queue transfer (same as Enter)
 - Click-drag a list / queue / help scrollbar thumb to scroll
 - Bookmarks modal: single-click selects a bookmark; double-click loads it into quick connect
 - Quick connect: click the Protocol field to cycle SFTP → FTP → FTPS
-- Input fields (quick connect + prompts): click to position the cursor; click-drag to select a range; typing or `Backspace` replaces the selection
+- Input fields (quick connect + text prompts): click to position the cursor; click-drag to select a range; typing or `Backspace` replaces the selection. Choice prompts have no text field.
 
 ### Keyboard field editing (quick-connect fields and prompts)
 - `Left` / `Right` move the cursor one character

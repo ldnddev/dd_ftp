@@ -1,4 +1,7 @@
-use crate::{Action, AppState, FocusPane, PromptType, QuickConnectField, TextField, Toast};
+use crate::{
+    Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField, TextField,
+    TextPromptKind, Toast,
+};
 use dd_ftp_core::Protocol;
 
 pub fn reduce(state: &mut AppState, action: Action) {
@@ -193,9 +196,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::ToggleHelp => {
             state.show_help = !state.show_help;
+            if state.show_help {
+                state.show_theme_debug = false;
+            }
         }
         Action::ToggleThemeDebug => {
             state.show_theme_debug = !state.show_theme_debug;
+            if state.show_theme_debug {
+                state.show_help = false;
+            }
         }
         Action::SelectUp => match state.focus {
             FocusPane::Local => {
@@ -243,22 +252,25 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::ShowCreatePrompt => {
             state.show_prompt = true;
-            state.prompt_type = Some(PromptType::CreateFile);
+            state.prompt_kind = Some(PromptKind::Text(TextPromptKind::CreateFile));
             state.prompt_value = TextField::default();
             state.prompt_target = None;
         }
         Action::ShowRenamePrompt => {
             state.show_prompt = true;
-            state.prompt_type = Some(PromptType::Rename);
+            state.prompt_kind = Some(PromptKind::Text(TextPromptKind::Rename));
             state.prompt_value = TextField::default();
             // Target will be set based on current selection
             state.prompt_target = None;
         }
         Action::ShowDeletePrompt => {
             state.show_prompt = true;
-            state.prompt_type = Some(PromptType::Delete);
-            state.prompt_value = TextField::default();
+            state.prompt_kind = Some(PromptKind::Choice(ChoicePromptKind::ConfirmDelete));
             state.prompt_target = None;
+        }
+        Action::ShowChoicePrompt(kind) => {
+            state.show_prompt = true;
+            state.prompt_kind = Some(PromptKind::Choice(kind));
         }
         Action::PromptInput(ch) => {
             state.prompt_value.insert_char(ch);
@@ -268,13 +280,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::ConfirmPrompt => {
             state.show_prompt = false;
-            state.prompt_type = None;
+            state.prompt_kind = None;
             state.prompt_value = TextField::default();
             state.prompt_target = None;
         }
         Action::CancelPrompt => {
             state.show_prompt = false;
-            state.prompt_type = None;
+            state.prompt_kind = None;
             state.prompt_value = TextField::default();
             state.prompt_target = None;
         }
@@ -328,5 +340,118 @@ mod prompt_tests {
         reduce(&mut s, Action::PromptInput('b'));
         assert_eq!(s.prompt_value.value, "ab");
         assert_eq!(s.prompt_value.cursor, 2);
+    }
+
+    #[test]
+    fn confirm_quit_is_choice_and_does_not_touch_prompt_value() {
+        let mut s = AppState {
+            prompt_value: TextField::from_str("keep-me"),
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::ShowChoicePrompt(ChoicePromptKind::ConfirmQuit),
+        );
+        assert!(s.show_prompt);
+        assert_eq!(
+            s.prompt_kind,
+            Some(PromptKind::Choice(ChoicePromptKind::ConfirmQuit))
+        );
+        assert_eq!(s.prompt_value.value, "keep-me");
+        reduce(&mut s, Action::CancelPrompt);
+        assert!(!s.show_prompt);
+        assert_eq!(s.prompt_kind, None);
+    }
+
+    #[test]
+    fn confirm_delete_is_choice_and_does_not_touch_prompt_value() {
+        let mut s = AppState {
+            prompt_value: TextField::from_str("keep-me"),
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ShowDeletePrompt);
+        assert!(s.show_prompt);
+        assert_eq!(
+            s.prompt_kind,
+            Some(PromptKind::Choice(ChoicePromptKind::ConfirmDelete))
+        );
+        assert_eq!(s.prompt_value.value, "keep-me");
+        reduce(&mut s, Action::CancelPrompt);
+        assert!(!s.show_prompt);
+        assert_eq!(s.prompt_kind, None);
+    }
+
+    #[test]
+    fn confirm_bookmark_delete_is_choice_and_does_not_touch_prompt_value() {
+        let mut s = AppState {
+            prompt_value: TextField::from_str("keep-me"),
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::ShowChoicePrompt(ChoicePromptKind::ConfirmBookmarkDelete),
+        );
+        assert!(s.show_prompt);
+        assert_eq!(
+            s.prompt_kind,
+            Some(PromptKind::Choice(ChoicePromptKind::ConfirmBookmarkDelete))
+        );
+        assert_eq!(s.prompt_value.value, "keep-me");
+        reduce(&mut s, Action::CancelPrompt);
+        assert!(!s.show_prompt);
+        assert_eq!(s.prompt_kind, None);
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use crate::AppState;
+
+    #[test]
+    fn toggle_help_twice_closes() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleHelp);
+        assert!(s.show_help);
+        reduce(&mut s, Action::ToggleHelp);
+        assert!(!s.show_help);
+    }
+
+    #[test]
+    fn toggle_theme_debug_twice_closes() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleThemeDebug);
+        assert!(s.show_theme_debug);
+        reduce(&mut s, Action::ToggleThemeDebug);
+        assert!(!s.show_theme_debug);
+    }
+
+    #[test]
+    fn toggle_help_clears_theme_debug() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleThemeDebug);
+        assert!(s.show_theme_debug);
+        reduce(&mut s, Action::ToggleHelp);
+        assert!(s.show_help);
+        assert!(!s.show_theme_debug);
+    }
+
+    #[test]
+    fn toggle_compare_closes_compare() {
+        let mut s = AppState {
+            show_compare: true,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleCompare);
+        assert!(!s.show_compare);
+    }
+
+    #[test]
+    fn toggle_theme_debug_clears_help() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleHelp);
+        reduce(&mut s, Action::ToggleThemeDebug);
+        assert!(s.show_theme_debug);
+        assert!(!s.show_help);
     }
 }

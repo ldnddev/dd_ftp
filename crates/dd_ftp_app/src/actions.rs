@@ -1,6 +1,8 @@
 use dd_ftp_core::{ConnectionInfo, FileEntry, TransferJob};
 use uuid::Uuid;
 
+use crate::ChoicePromptKind;
+
 #[derive(Debug)]
 pub enum Action {
     Connect(ConnectionInfo),
@@ -59,6 +61,7 @@ pub enum Action {
     ShowCreatePrompt,
     ShowRenamePrompt,
     ShowDeletePrompt,
+    ShowChoicePrompt(ChoicePromptKind),
     PromptInput(char),
     PromptBackspace,
     ConfirmPrompt,

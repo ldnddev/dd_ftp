@@ -13,8 +13,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, RemoteSession, TransferJob};
-use ssh2::{CheckResult, HashType, HostKeyType, KnownHostFileKind, Session};
+use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, ProgressCb, RemoteSession, TransferJob};
+use ssh2::{CheckResult, FileStat, HashType, HostKeyType, KnownHostFileKind, Session};
 use uuid::Uuid;
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -399,6 +399,23 @@ impl SftpSession {
             .with_context(|| format!("failed to create remote directory: {path}"))
     }
 
+    fn set_permissions_sync(session: &Session, path: &str, mode: u32) -> Result<()> {
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
+        // Only `perm` may be Some — libssh2 zeroes other fields if they are set.
+        let stat = FileStat {
+            size: None,
+            uid: None,
+            gid: None,
+            perm: Some(mode),
+            atime: None,
+            mtime: None,
+        };
+        sftp.setstat(Path::new(path), stat)
+            .with_context(|| format!("failed to set permissions on {path}"))
+    }
+
     fn upload_sync<F>(
         session: &Session,
         job: &TransferJob,
@@ -597,7 +614,7 @@ impl RemoteSession for SftpSession {
         Ok(())
     }
 
-    async fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>> {
+    async fn list_dir(&mut self, path: &str) -> Result<Vec<FileEntry>> {
         let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
@@ -609,17 +626,45 @@ impl RemoteSession for SftpSession {
         .map_err(|e| anyhow!("join error during list_dir: {e}"))?
     }
 
-    async fn upload(&self, job: &TransferJob) -> Result<()> {
-        self.upload_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
-            .await
+    async fn upload(&mut self, job: &TransferJob) -> Result<()> {
+        RemoteSession::upload_with_progress(
+            self,
+            job,
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|_id, _tx, _size| {}),
+        )
+        .await
     }
 
-    async fn download(&self, job: &TransferJob) -> Result<()> {
-        self.download_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
-            .await
+    async fn download(&mut self, job: &TransferJob) -> Result<()> {
+        RemoteSession::download_with_progress(
+            self,
+            job,
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|_id, _tx, _size| {}),
+        )
+        .await
     }
 
-    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+    async fn upload_with_progress(
+        &mut self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: ProgressCb,
+    ) -> Result<()> {
+        SftpSession::upload_with_progress(self, job, cancel, on_progress).await
+    }
+
+    async fn download_with_progress(
+        &mut self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: ProgressCb,
+    ) -> Result<()> {
+        SftpSession::download_with_progress(self, job, cancel, on_progress).await
+    }
+
+    async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         let inner = self.inner.clone().context("not connected")?;
         let from = from.to_string();
         let to = to.to_string();
@@ -632,7 +677,7 @@ impl RemoteSession for SftpSession {
         .map_err(|e| anyhow!("join error during rename: {e}"))?
     }
 
-    async fn remove_file(&self, path: &str) -> Result<()> {
+    async fn remove_file(&mut self, path: &str) -> Result<()> {
         let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
@@ -644,7 +689,7 @@ impl RemoteSession for SftpSession {
         .map_err(|e| anyhow!("join error during remove_file: {e}"))?
     }
 
-    async fn remove_dir(&self, path: &str) -> Result<()> {
+    async fn remove_dir(&mut self, path: &str) -> Result<()> {
         let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
@@ -656,7 +701,7 @@ impl RemoteSession for SftpSession {
         .map_err(|e| anyhow!("join error during remove_dir: {e}"))?
     }
 
-    async fn create_dir(&self, path: &str) -> Result<()> {
+    async fn create_dir(&mut self, path: &str) -> Result<()> {
         let inner = self.inner.clone().context("not connected")?;
         let path = path.to_string();
 
@@ -666,6 +711,18 @@ impl RemoteSession for SftpSession {
         })
         .await
         .map_err(|e| anyhow!("join error during create_dir: {e}"))?
+    }
+
+    async fn set_permissions(&mut self, path: &str, mode: u32) -> Result<()> {
+        let inner = self.inner.clone().context("not connected")?;
+        let path = path.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let session = lock_session(&inner)?;
+            Self::set_permissions_sync(&session, &path, mode)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during set_permissions: {e}"))?
     }
 }
 

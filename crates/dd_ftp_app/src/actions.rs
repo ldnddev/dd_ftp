@@ -1,7 +1,7 @@
 use dd_ftp_core::{ConnectionInfo, FileEntry, TransferJob};
 use uuid::Uuid;
 
-use crate::{ChoicePromptKind, OverwritePolicy, SelectPolicy};
+use crate::{ChoicePromptKind, FocusPane, OverwritePolicy, SelectPolicy};
 
 #[derive(Debug)]
 pub enum Action {
@@ -55,6 +55,13 @@ pub enum Action {
     SetStatus(String),
     ShowError(String),
     ClearError,
+    SetFocus(FocusPane),
+    SelectIndex {
+        pane: FocusPane,
+        index: usize,
+    },
+    HelpScroll(i32),
+    QueueScroll(i32),
     FocusNextPane,
     ToggleHelp,
     ToggleThemeDebug,

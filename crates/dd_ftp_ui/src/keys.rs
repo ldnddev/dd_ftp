@@ -48,7 +48,7 @@ pub const KEYMAP: &[KeyBinding] = &[
         group: KeyGroup::Global,
     },
     KeyBinding {
-        keys: "q",
+        keys: "Ctrl+q",
         action: "Quit (confirms if transfers are active)",
         group: KeyGroup::Global,
     },

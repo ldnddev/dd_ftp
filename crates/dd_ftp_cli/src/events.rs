@@ -45,6 +45,39 @@ pub(crate) async fn handle_key(
         return Ok(LoopControl::Continue);
     }
 
+    if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        if app.is_choice_prompt() {
+            if let Some(PromptKind::Choice(kind)) = app.prompt_kind {
+                match kind {
+                    ChoicePromptKind::ConfirmQuit => {
+                        crate::session::bump_generation_drop_workers(app, runtime).await;
+                        return Ok(LoopControl::Quit);
+                    }
+                    ChoicePromptKind::Overwrite => {
+                        crate::session::apply_overwrite_choice(
+                            app,
+                            runtime,
+                            OverwriteChoice::Abort,
+                        );
+                    }
+                    ChoicePromptKind::HostKey => {
+                        crate::session::reject_host_key(runtime);
+                        reduce(app, Action::CancelPrompt);
+                    }
+                    _ => {
+                        reduce(app, Action::CancelPrompt);
+                    }
+                }
+            }
+        }
+        if request_quit(app) {
+            return Ok(LoopControl::Quit);
+        }
+        return Ok(LoopControl::Continue);
+    }
+
     if !app.any_modal_open()
         && key.code == KeyCode::Char('k')
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -132,12 +165,6 @@ pub(crate) async fn handle_key(
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     crate::session::apply_overwrite_choice(app, runtime, OverwriteChoice::Rename);
                 }
-                KeyCode::Char('q') => {
-                    crate::session::apply_overwrite_choice(app, runtime, OverwriteChoice::Abort);
-                    if request_quit(app) {
-                        return Ok(LoopControl::Quit);
-                    }
-                }
                 _ => {}
             }
             return Ok(LoopControl::Continue);
@@ -171,25 +198,6 @@ pub(crate) async fn handle_key(
                     reduce(app, Action::ConfirmPrompt);
                 }
                 ChoicePromptKind::Overwrite => {}
-            },
-            KeyCode::Char('q') => match kind {
-                ChoicePromptKind::ConfirmQuit => {
-                    crate::session::bump_generation_drop_workers(app, runtime).await;
-                    return Ok(LoopControl::Quit);
-                }
-                ChoicePromptKind::HostKey => {
-                    crate::session::reject_host_key(runtime);
-                    reduce(app, Action::CancelPrompt);
-                    if request_quit(app) {
-                        return Ok(LoopControl::Quit);
-                    }
-                }
-                _ => {
-                    reduce(app, Action::CancelPrompt);
-                    if request_quit(app) {
-                        return Ok(LoopControl::Quit);
-                    }
-                }
             },
             _ => {}
         }
@@ -446,11 +454,6 @@ pub(crate) async fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('q') => {
-            if request_quit(app) {
-                return Ok(LoopControl::Quit);
-            }
-        }
         KeyCode::Esc => {
             if app.show_compare {
                 reduce(app, Action::ToggleCompare);

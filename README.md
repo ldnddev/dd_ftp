@@ -53,7 +53,7 @@ export DD_FTP_PATH=/
 - `F1` toggle help (opening closes theme debug)
 - `Esc` close current modal; when compare is on and no modal is open, close compare
 - `F2` toggle theme debug (opening closes help)
-- `q` quit (confirms if transfers are active)
+- `Ctrl+q` quit (confirms if transfers are active)
 - `Ctrl+C` cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)
 - `C` toggle directory compare
 

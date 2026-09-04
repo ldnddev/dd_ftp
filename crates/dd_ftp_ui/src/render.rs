@@ -490,11 +490,11 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     // Always leads with F1:Help. Connection state lives in the header; the
     // transient status string is shown right-aligned only when there is room.
     let keys = if status_area.width < 75 {
-        "F1:Help  Tab:Pane  j/k:Nav  /:Filter  u/d:Xfer  m:Sites  q:Quit"
+        "F1:Help  Tab:Pane  j/k:Nav  /:Filter  u/d:Xfer  m:Sites  ^Q:Quit"
     } else if status_area.width < 110 {
-        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u/d: Up/Down   m: Bookmarks   o: Connect   q: Quit"
+        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u/d: Up/Down   m: Bookmarks   o: Connect   Ctrl+q: Quit"
     } else {
-        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   r: Refresh   q: Quit   (mouse: click/scroll/drag)"
+        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   r: Refresh   Ctrl+q: Quit   (mouse: click/scroll/drag)"
     };
     let footer_keys =
         Paragraph::new(keys).style(Style::default().fg(t.text_secondary).bg(t.base_background));

@@ -348,6 +348,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.show_prompt = true;
             state.prompt_kind = Some(PromptKind::Choice(kind));
         }
+        Action::SetOverwritePolicy(policy) => {
+            if let Some(ow) = state.overwrite.as_mut() {
+                ow.apply_all = policy;
+            }
+        }
         Action::PromptInput(ch) => {
             state.prompt_value.insert_char(ch);
         }
@@ -360,6 +365,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.prompt_value = TextField::default();
             state.prompt_target = None;
             state.host_key = None;
+            state.overwrite = None;
         }
         Action::CancelPrompt => {
             state.show_prompt = false;
@@ -367,6 +373,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.prompt_value = TextField::default();
             state.prompt_target = None;
             state.host_key = None;
+            state.overwrite = None;
         }
         Action::CreateFile(_)
         | Action::CreateFolder(_)
@@ -408,7 +415,7 @@ mod qc_tests {
 #[cfg(test)]
 mod prompt_tests {
     use super::*;
-    use crate::AppState;
+    use crate::{AppState, OverwritePolicy};
 
     #[test]
     fn prompt_input_inserts_at_cursor() {
@@ -503,6 +510,97 @@ mod prompt_tests {
         assert!(!s.show_prompt);
         assert_eq!(s.prompt_kind, None);
         assert!(s.host_key.is_none());
+    }
+
+    fn pending(name: &str) -> crate::PendingFile {
+        crate::PendingFile {
+            local_path: format!("/tmp/{name}"),
+            remote_path: format!("/pub/{name}"),
+            direction: dd_ftp_core::TransferDirection::Upload,
+            size_bytes: Some(1),
+        }
+    }
+
+    #[test]
+    fn overwrite_default_policy_is_skip() {
+        let mut s = AppState {
+            prompt_value: TextField::from_str("keep-me"),
+            overwrite: Some(crate::OverwritePrompt {
+                current: pending("a.txt"),
+                remaining: vec![pending("b.txt")],
+                apply_all: OverwritePolicy::Ask,
+            }),
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::ShowChoicePrompt(ChoicePromptKind::Overwrite),
+        );
+        assert!(s.show_prompt);
+        assert_eq!(
+            s.prompt_kind,
+            Some(PromptKind::Choice(ChoicePromptKind::Overwrite))
+        );
+        assert_eq!(s.prompt_value.value, "keep-me");
+        assert_eq!(
+            s.overwrite.as_ref().map(|o| o.apply_all),
+            Some(OverwritePolicy::Ask)
+        );
+    }
+
+    #[test]
+    fn overwrite_all_applies_to_remaining() {
+        let mut s = AppState {
+            overwrite: Some(crate::OverwritePrompt {
+                current: pending("a.txt"),
+                remaining: vec![pending("b.txt"), pending("c.txt")],
+                apply_all: OverwritePolicy::Ask,
+            }),
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::ShowChoicePrompt(ChoicePromptKind::Overwrite),
+        );
+        reduce(
+            &mut s,
+            Action::SetOverwritePolicy(OverwritePolicy::OverwriteAll),
+        );
+        let ow = s.overwrite.as_ref().expect("overwrite snapshot");
+        assert_eq!(ow.apply_all, OverwritePolicy::OverwriteAll);
+        assert_eq!(ow.remaining.len(), 2);
+        assert_eq!(ow.remaining[0].remote_path, "/pub/b.txt");
+        assert_eq!(ow.remaining[1].remote_path, "/pub/c.txt");
+    }
+
+    #[test]
+    fn overwrite_esc_leaves_already_queued_jobs() {
+        use dd_ftp_core::{TransferDirection, TransferJob};
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::QueueTransfer(TransferJob::new(
+                "/tmp/kept",
+                "/pub/kept",
+                TransferDirection::Upload,
+            )),
+        );
+        assert_eq!(s.queue.pending.len(), 1);
+        s.overwrite = Some(crate::OverwritePrompt {
+            current: pending("conflict.txt"),
+            remaining: vec![pending("later.txt")],
+            apply_all: OverwritePolicy::Ask,
+        });
+        reduce(
+            &mut s,
+            Action::ShowChoicePrompt(ChoicePromptKind::Overwrite),
+        );
+        reduce(&mut s, Action::CancelPrompt);
+        assert!(!s.show_prompt);
+        assert_eq!(s.prompt_kind, None);
+        assert!(s.overwrite.is_none());
+        assert_eq!(s.queue.pending.len(), 1);
+        assert_eq!(s.queue.pending[0].remote_path, "/pub/kept");
     }
 }
 

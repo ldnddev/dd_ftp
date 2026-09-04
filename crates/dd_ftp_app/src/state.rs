@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dd_ftp_core::{ConnectionInfo, FileEntry};
+use dd_ftp_core::{ConnectionInfo, FileEntry, TransferDirection};
 use dd_ftp_transfer::TransferQueue;
 
 use crate::{TextField, Toast};
@@ -65,6 +65,7 @@ pub enum TextPromptKind {
     CreateFile,
     CreateFolder,
     Rename,
+    OverwriteRename,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,32 @@ pub enum ChoicePromptKind {
     ConfirmDelete,
     ConfirmBookmarkDelete,
     HostKey,
+    Overwrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverwritePolicy {
+    #[default]
+    Ask,
+    OverwriteAll,
+    SkipAll,
+}
+
+/// One file discovered by a folder scan. Enqueued only after drain + overwrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFile {
+    pub local_path: String,
+    pub remote_path: String,
+    pub direction: TransferDirection,
+    pub size_bytes: Option<u64>,
+}
+
+/// Display snapshot of the overwrite ChoicePrompt. Remaining files live on the CLI run stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverwritePrompt {
+    pub current: PendingFile,
+    pub remaining: Vec<PendingFile>,
+    pub apply_all: OverwritePolicy,
 }
 
 /// Display-only host-key prompt. The oneshot lives in CLI `in_flight`.
@@ -177,6 +204,8 @@ pub struct AppState {
     pub ftp_session: Option<dd_ftp_ftp::UnifiedFtpSession>,
     /// Host-key ChoicePrompt fields. Oneshot is not stored here.
     pub host_key: Option<HostKeyView>,
+    /// Overwrite ChoicePrompt fields. pending_scan on the CLI run stack is source of truth.
+    pub overwrite: Option<OverwritePrompt>,
 }
 
 impl AppState {
@@ -318,6 +347,7 @@ impl Default for AppState {
             queue: TransferQueue::default(),
             ftp_session: None,
             host_key: None,
+            overwrite: None,
         }
     }
 }

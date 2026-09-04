@@ -547,12 +547,13 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             Line::from("  Ctrl+K -> keyring health check"),
             Line::from(""),
             Line::from("Transfers"),
-            Line::from("  u -> queue upload"),
-            Line::from("  d -> queue download"),
+            Line::from("  u -> queue upload (directories recurse)"),
+            Line::from("  d -> queue download (directories recurse)"),
             Line::from("  R -> retry last failed transfer"),
             Line::from("  X -> clear pending queue"),
             Line::from("  Ctrl+C -> cancel in-flight transfers"),
             Line::from("  Enter (file) -> queue upload (local) or download (remote)"),
+            Line::from("  Overwrite: Enter/s skip  o overwrite  a overwrite-all  n skip-all  r rename  Esc abort"),
             Line::from(""),
             Line::from("Filters / compare"),
             Line::from("  / -> toggle filter (Esc closes and clears the pattern)"),
@@ -1036,6 +1037,33 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                             )]),
                         ],
                     ),
+                    ChoicePromptKind::Overwrite => {
+                        let ow = app.overwrite.as_ref();
+                        let local = ow.map(|o| o.current.local_path.as_str()).unwrap_or("");
+                        let remote = ow.map(|o| o.current.remote_path.as_str()).unwrap_or("");
+                        (
+                            " Overwrite ",
+                            vec![
+                                Line::from(vec![Span::styled(
+                                    "Destination exists",
+                                    Style::default().fg(t.modal_labels),
+                                )]),
+                                Line::from(vec![Span::styled(
+                                    format!("local: {local}"),
+                                    Style::default().fg(t.modal_text),
+                                )]),
+                                Line::from(vec![Span::styled(
+                                    format!("remote: {remote}"),
+                                    Style::default().fg(t.modal_text),
+                                )]),
+                                Line::from(""),
+                                Line::from(vec![Span::styled(
+                                    "Enter/s skip  o overwrite  a overwrite-all  n skip-all  r rename  Esc abort",
+                                    Style::default().fg(t.warning),
+                                )]),
+                            ],
+                        )
+                    }
                     ChoicePromptKind::HostKey => {
                         let hk = app.host_key.as_ref();
                         let host = hk.map(|h| h.host.as_str()).unwrap_or("");
@@ -1108,6 +1136,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     TextPromptKind::CreateFile => (" Create File ", "Enter file name:"),
                     TextPromptKind::CreateFolder => (" Create Folder ", "Enter folder name:"),
                     TextPromptKind::Rename => (" Rename ", "Enter new name:"),
+                    TextPromptKind::OverwriteRename => (" Rename destination ", "Enter new name:"),
                 };
 
                 let mut lines = vec![Line::from(vec![Span::styled(

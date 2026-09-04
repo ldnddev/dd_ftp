@@ -81,12 +81,13 @@ export DD_FTP_PATH=/
 - `Ctrl+K` keyring health check
 
 ### Transfers
-- `u` queue upload
-- `d` queue download
+- `u` queue upload (directories recurse)
+- `d` queue download (directories recurse)
 - `R` retry last failed
 - `X` clear pending queue
 - `Ctrl+C` cancel in-flight transfers
 - `Enter` (on a file) queue upload/download
+- Overwrite prompt (default skip): `Enter`/`s` skip, `o` overwrite, `a` overwrite-all, `n` skip-all, `r` rename, `Esc` abort
 
 ### Filters / compare
 - `/` toggle filter (`Esc` closes and clears the pattern)

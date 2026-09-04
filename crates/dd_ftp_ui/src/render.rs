@@ -1,4 +1,7 @@
-use dd_ftp_app::{AppState, FocusPane, QuickConnectField, ToastLevel};
+use dd_ftp_app::{
+    AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField, TextPromptKind,
+    ToastLevel,
+};
 use dd_ftp_core::{Protocol, TransferJob};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -519,6 +522,14 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     .add_modifier(Modifier::BOLD),
             )]),
             Line::from(""),
+            Line::from("Global"),
+            Line::from("  F1 -> toggle this help (opening closes theme debug)"),
+            Line::from("  Esc -> close current modal; if compare is on, close compare"),
+            Line::from("  F2 -> toggle theme debug overlay (opening closes help)"),
+            Line::from("  q -> quit (confirms if transfers are active)"),
+            Line::from("  Ctrl+C -> cancel in-flight transfers"),
+            Line::from("  C -> toggle directory compare"),
+            Line::from(""),
             Line::from("Navigation"),
             Line::from("  1 -> focus Local pane"),
             Line::from("  2 -> focus Remote pane"),
@@ -528,32 +539,53 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             Line::from("  k / Up -> move up"),
             Line::from("  l -> enter selected directory"),
             Line::from("  h -> go to parent directory"),
-            Line::from(""),
-            Line::from("Actions"),
-            Line::from("  / -> toggle filter"),
-            Line::from("  C -> toggle directory compare"),
-            Line::from("  b -> cycle bookmarks"),
-            Line::from("  m -> open bookmarks modal"),
-            Line::from("  o -> open quick connect"),
-            Line::from("  c -> connect/disconnect (SFTP+FTP connect path)"),
             Line::from("  r -> refresh listing(s)"),
+            Line::from("  Enter -> enter directory, or queue upload/download of a file"),
+            Line::from(""),
+            Line::from("Connection / bookmarks"),
+            Line::from("  o -> open quick connect"),
+            Line::from("  m -> open bookmarks modal"),
+            Line::from("  b -> cycle bookmarks"),
+            Line::from("  c -> connect using the quick-connect form / disconnect"),
+            Line::from("  c (bookmarks) -> connect highlighted bookmark (disconnect first)"),
+            Line::from("  d (bookmarks) -> delete bookmark with confirm"),
+            Line::from("  e (bookmarks) -> edit bookmark"),
+            Line::from("  D (bookmarks) -> set default bookmark"),
+            Line::from("  B -> save current quick-connect as bookmark"),
+            Line::from("  Ctrl+K -> keyring health check"),
+            Line::from(""),
+            Line::from("Transfers"),
             Line::from("  u -> queue upload"),
             Line::from("  d -> queue download"),
-            Line::from("  x -> worker status hint"),
-            Line::from("  X -> clear pending queue"),
             Line::from("  R -> retry last failed transfer"),
-            Line::from("  Ctrl+K -> keyring health check"),
-            Line::from("  B -> save current quick-connect as bookmark"),
+            Line::from("  X -> clear pending queue"),
+            Line::from("  Ctrl+C -> cancel in-flight transfers"),
+            Line::from("  Enter (file) -> queue upload (local) or download (remote)"),
             Line::from(""),
-            Line::from("File Operations"),
-            Line::from("  Ctrl+n -> new file/folder (Tab toggles)"),
-            Line::from("  Ctrl+Alt+e -> rename selected item"),
-            Line::from("  Ctrl+Delete -> delete selected item"),
+            Line::from("Filters / compare"),
+            Line::from("  / -> toggle filter (Esc closes and clears the pattern)"),
+            Line::from("  C -> toggle directory compare"),
+            Line::from("  Esc -> close compare when no modal is open"),
             Line::from(""),
-            Line::from("Global"),
-            Line::from("  F1 -> toggle this help"),
-            Line::from("  F2 -> toggle theme debug overlay"),
-            Line::from("  q -> quit"),
+            Line::from("File operations"),
+            Line::from("  n / Ctrl+n -> new file/folder (Tab toggles)"),
+            Line::from("  e / Ctrl+Alt+e -> rename selected item"),
+            Line::from("  Delete / Ctrl+Delete -> delete selected item with confirm"),
+            Line::from(""),
+            Line::from("Selection / sort"),
+            Line::from("  Space -> toggle multi-select mark on the focused row"),
+            Line::from("  p -> SFTP chmod prompt (remote pane)"),
+            Line::from("  s -> cycle sort key: name -> size -> date -> name"),
+            Line::from("  S -> toggle sort direction"),
+            Line::from("  . -> toggle hide-dotfiles"),
+            Line::from(""),
+            Line::from("Mouse"),
+            Line::from("  Wheel -> scroll list / queue / help (also over the scrollbar rail)"),
+            Line::from("  Click row -> focus pane, select visible row"),
+            Line::from("  Double-click directory -> enter it"),
+            Line::from("  Double-click file -> queue transfer (same as Enter)"),
+            Line::from("  Drag scrollbar -> scroll"),
+            Line::from("  QC / prompt field click-drag -> cursor / selection"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Press F1 or Esc to close",
@@ -824,7 +856,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         lines.push(Line::from(
             "j/k move | Enter load into quick connect | c connect",
         ));
-        lines.push(Line::from("e edit | d delete | D set default | Esc close"));
+        lines.push(Line::from(
+            "e edit | d delete (confirm) | D set default | Esc close",
+        ));
 
         let modal = Paragraph::new(lines.clone())
             .style(Style::default().bg(t.modal_background).fg(t.modal_text))
@@ -957,93 +991,136 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     }
 
     if app.show_prompt {
-        let area = centered_rect(60, 30, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Block::default().style(Style::default().bg(t.modal_background)),
-            area,
-        );
+        match app.prompt_kind {
+            Some(PromptKind::Choice(kind)) => {
+                let area = centered_rect(60, 24, frame.area());
+                frame.render_widget(Clear, area);
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(t.modal_background)),
+                    area,
+                );
 
-        let (title, message) = match app.prompt_type {
-            Some(dd_ftp_app::PromptType::CreateFile) => (" Create File ", "Enter file name:"),
-            Some(dd_ftp_app::PromptType::CreateFolder) => (" Create Folder ", "Enter folder name:"),
-            Some(dd_ftp_app::PromptType::Rename) => (" Rename ", "Enter new name:"),
-            Some(dd_ftp_app::PromptType::Delete) => (" Delete ", "Confirm delete (y/n):"),
-            None => (" Prompt ", ""),
-        };
+                let target = app.prompt_target.as_deref().unwrap_or("");
+                let (title, body) = match kind {
+                    ChoicePromptKind::ConfirmQuit => (
+                        " Quit ",
+                        "Quit anyway? Active transfers will be interrupted (y/n)".to_string(),
+                    ),
+                    ChoicePromptKind::ConfirmDelete => {
+                        (" Delete ", format!("Delete '{target}'? (y/n)"))
+                    }
+                    ChoicePromptKind::ConfirmBookmarkDelete => (
+                        " Delete bookmark ",
+                        format!("Delete bookmark '{target}'? (y/n)"),
+                    ),
+                };
 
-        let mut lines = vec![Line::from(vec![Span::styled(
-            message,
-            Style::default().fg(t.modal_labels),
-        )])];
+                let lines = vec![
+                    Line::from(vec![Span::styled(
+                        body,
+                        Style::default().fg(t.modal_labels),
+                    )]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "y confirm | n / Esc cancel",
+                        Style::default().fg(t.warning),
+                    )]),
+                ];
 
-        // Show target file for delete/rename
-        if let Some(ref target) = app.prompt_target {
-            if app.prompt_type == Some(dd_ftp_app::PromptType::Delete) {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("File: {}", target),
-                    Style::default().fg(t.text_secondary),
-                )]));
+                let modal = Paragraph::new(lines)
+                    .style(Style::default().bg(t.modal_background).fg(t.modal_text))
+                    .wrap(Wrap { trim: true })
+                    .block(
+                        Block::default()
+                            .title(Line::from(vec![Span::styled(
+                                title,
+                                Style::default()
+                                    .fg(t.modal_labels)
+                                    .add_modifier(Modifier::BOLD),
+                            )]))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(t.border_active)),
+                    );
+
+                frame.render_widget(modal, area);
             }
+            Some(PromptKind::Text(kind)) => {
+                let area = centered_rect(60, 30, frame.area());
+                frame.render_widget(Clear, area);
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(t.modal_background)),
+                    area,
+                );
+
+                let (title, message) = match kind {
+                    TextPromptKind::CreateFile => (" Create File ", "Enter file name:"),
+                    TextPromptKind::CreateFolder => (" Create Folder ", "Enter folder name:"),
+                    TextPromptKind::Rename => (" Rename ", "Enter new name:"),
+                };
+
+                let mut lines = vec![Line::from(vec![Span::styled(
+                    message,
+                    Style::default().fg(t.modal_labels),
+                )])];
+
+                lines.push(Line::from(""));
+                let mut prompt_spans =
+                    vec![Span::styled("> ", Style::default().fg(t.input_text_focus))];
+                prompt_spans.extend(render_field_line(&app.prompt_value, false, &t));
+                lines.push(Line::from(prompt_spans));
+                lines.push(Line::from(""));
+                match kind {
+                    TextPromptKind::CreateFile => {
+                        lines.push(Line::from(vec![Span::styled(
+                            "Tab: switch to Folder",
+                            Style::default().fg(t.text_secondary),
+                        )]));
+                    }
+                    TextPromptKind::CreateFolder => {
+                        lines.push(Line::from(vec![Span::styled(
+                            "Tab: switch to File",
+                            Style::default().fg(t.text_secondary),
+                        )]));
+                    }
+                    _ => {}
+                }
+                lines.push(Line::from(vec![Span::styled(
+                    "Enter to confirm | Esc to cancel",
+                    Style::default().fg(t.warning),
+                )]));
+
+                let modal = Paragraph::new(lines)
+                    .style(Style::default().bg(t.modal_background).fg(t.modal_text))
+                    .block(
+                        Block::default()
+                            .title(Line::from(vec![Span::styled(
+                                title,
+                                Style::default()
+                                    .fg(t.modal_labels)
+                                    .add_modifier(Modifier::BOLD),
+                            )]))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(t.border_active)),
+                    );
+
+                frame.render_widget(modal, area);
+
+                let input_line_offset = 1 /* message */ + 1 /* blank */;
+                let prompt_input_area = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1 + input_line_offset as u16,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                };
+                // hitbox starts at the modal inner edge (area.x+1); text_x adds the 2-col "> " prefix
+                map.fields.push(FieldRegion {
+                    id: FieldId::Prompt,
+                    area: prompt_input_area,
+                    text_x: area.x + 3,
+                });
+            }
+            None => {}
         }
-
-        lines.push(Line::from(""));
-        let mut prompt_spans = vec![Span::styled("> ", Style::default().fg(t.input_text_focus))];
-        prompt_spans.extend(render_field_line(&app.prompt_value, false, &t));
-        lines.push(Line::from(prompt_spans));
-        lines.push(Line::from(""));
-        match app.prompt_type {
-            Some(dd_ftp_app::PromptType::CreateFile) => {
-                lines.push(Line::from(vec![Span::styled(
-                    "Tab: switch to Folder",
-                    Style::default().fg(t.text_secondary),
-                )]));
-            }
-            Some(dd_ftp_app::PromptType::CreateFolder) => {
-                lines.push(Line::from(vec![Span::styled(
-                    "Tab: switch to File",
-                    Style::default().fg(t.text_secondary),
-                )]));
-            }
-            _ => {}
-        }
-        lines.push(Line::from(vec![Span::styled(
-            "Enter to confirm | Esc to cancel",
-            Style::default().fg(t.warning),
-        )]));
-
-        let modal = Paragraph::new(lines)
-            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .block(
-                Block::default()
-                    .title(Line::from(vec![Span::styled(
-                        title,
-                        Style::default()
-                            .fg(t.modal_labels)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.border_active)),
-            );
-
-        frame.render_widget(modal, area);
-
-        let has_target_line =
-            app.prompt_type == Some(dd_ftp_app::PromptType::Delete) && app.prompt_target.is_some();
-        let input_line_offset =
-            1 /* message */ + if has_target_line { 1 } else { 0 } + 1 /* blank */;
-        let prompt_input_area = Rect {
-            x: area.x + 1,
-            y: area.y + 1 + input_line_offset as u16,
-            width: area.width.saturating_sub(2),
-            height: 1,
-        };
-        // hitbox starts at the modal inner edge (area.x+1); text_x adds the 2-col "> " prefix
-        map.fields.push(FieldRegion {
-            id: FieldId::Prompt,
-            area: prompt_input_area,
-            text_x: area.x + 3,
-        });
     }
 
     if let Some(toast) = &app.toast {

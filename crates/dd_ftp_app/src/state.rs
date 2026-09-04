@@ -50,11 +50,23 @@ pub enum FocusPane {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptType {
+pub enum TextPromptKind {
     CreateFile,
     CreateFolder,
     Rename,
-    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChoicePromptKind {
+    ConfirmQuit,
+    ConfirmDelete,
+    ConfirmBookmarkDelete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Text(TextPromptKind),
+    Choice(ChoicePromptKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,7 +128,7 @@ pub struct AppState {
     pub show_filter: bool,
     pub show_compare: bool,
     pub show_prompt: bool,
-    pub prompt_type: Option<PromptType>,
+    pub prompt_kind: Option<PromptKind>,
     pub prompt_value: TextField,
     pub prompt_target: Option<String>,
     pub filter_pattern: String,
@@ -189,6 +201,14 @@ impl AppState {
             || self.show_quick_connect
             || self.show_bookmarks
     }
+
+    pub fn is_text_prompt(&self) -> bool {
+        matches!(self.prompt_kind, Some(PromptKind::Text(_)))
+    }
+
+    pub fn is_choice_prompt(&self) -> bool {
+        matches!(self.prompt_kind, Some(PromptKind::Choice(_)))
+    }
 }
 
 impl Default for AppState {
@@ -211,7 +231,7 @@ impl Default for AppState {
             show_filter: false,
             show_compare: false,
             show_prompt: false,
-            prompt_type: None,
+            prompt_kind: None,
             prompt_value: TextField::default(),
             prompt_target: None,
             filter_pattern: String::new(),

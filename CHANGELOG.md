@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-09-04
+
+### Added
+- Unique cancel key (`Ctrl+C`); `C` stays directory compare; F1/F2 toggle closed; Enter opens dirs and queues files
+- Recursive folder upload/download with overwrite/skip/rename prompts (default skip)
+- SFTP host-key TOFU against `~/.ssh/known_hosts`; path-escape guards on local and remote names
+- File list columns (name, size, date, permissions); disconnected remote empty state; error toasts
+- Multi-select (Space), SFTP chmod (`p`), sort (`s`/`S`), hide-dotfiles (`.`), transfer speed/ETA
+- Help overlay and README generated from a single `KEYMAP` table; compare badges in existing lists
+
+### Changed
+- Selection indexes the visible (filtered) list; FTP downloads use `cwd + name` instead of the raw LIST line
+- Connect, list, and file operations run off the UI thread; UI SFTP session is persistent; FTP transfers stream with progress/cancel
+- CLI split into modules; live protocol sessions moved out of `AppState` into a CLI `Runtime`; `RemoteSession` implemented for FTP/FTPS
+
+### Fixed
+- Dead cancel keybind shadowed by compare; empty remote refresh leaving stale listings; post-transfer SFTP-only relist
+- Filter highlight/action desync; leftover DEBUG delete status; theme reloaded from disk every frame
+
 ## [Unreleased] - 2026-06-16
 
 ### Added

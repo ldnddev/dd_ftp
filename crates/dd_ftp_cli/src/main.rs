@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
 
     run_keyring_health_check(&mut app);
 
-    let theme_loaded = dd_ftp_ui::load_theme_with_source();
+    let theme_loaded = dd_ftp_ui::reload_theme();
     reduce(
         &mut app,
         Action::SetStatus(format!("Theme loaded: {}", theme_loaded.source.label())),
@@ -296,6 +296,9 @@ async fn run(
 
                     if key.code == KeyCode::F(2) && (!app.any_modal_open() || app.show_theme_debug)
                     {
+                        if !app.show_theme_debug {
+                            let _ = dd_ftp_ui::reload_theme();
+                        }
                         reduce(app, Action::ToggleThemeDebug);
                         continue;
                     }
@@ -710,7 +713,7 @@ async fn run(
                                     Err(err) => {
                                         reduce(
                                             app,
-                                            Action::SetStatus(format!(
+                                            Action::ShowError(format!(
                                                 "Remote refresh failed: {err}"
                                             )),
                                         );
@@ -1090,7 +1093,7 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
                         Err(err) => {
                             reduce(
                                 app,
-                                Action::SetStatus(format!("Remote enter failed: {err}")),
+                                Action::ShowError(format!("Remote enter failed: {err}")),
                             );
                         }
                     }
@@ -1153,7 +1156,7 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
                 Err(err) => {
                     reduce(
                         app,
-                        Action::SetStatus(format!("Remote parent failed: {err}")),
+                        Action::ShowError(format!("Remote parent failed: {err}")),
                     );
                 }
             }
@@ -1172,7 +1175,7 @@ async fn list_remote(
         (Some(ftp), Some(Protocol::Ftp)) => ftp.list_dir(FtpVariant::Ftp, path).await,
         (Some(ftp), Some(Protocol::Ftps)) => ftp.list_dir(FtpVariant::Ftps, path).await,
         (Some(_), _) => {
-            reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
+            reduce(app, Action::ShowError("Unknown FTP variant".to_string()));
             Ok(Vec::new())
         }
         (None, _) => session.list_dir(path).await,
@@ -1181,14 +1184,19 @@ async fn list_remote(
 
 async fn relist_remote(app: &mut AppState, session: &mut SftpSession) {
     let path = app.remote_cwd.clone();
-    if let Ok(entries) = list_remote(app, session, &path).await {
-        reduce(
-            app,
-            Action::SetRemoteEntries {
-                entries,
-                select: SelectPolicy::PreserveName,
-            },
-        );
+    match list_remote(app, session, &path).await {
+        Ok(entries) => {
+            reduce(
+                app,
+                Action::SetRemoteEntries {
+                    entries,
+                    select: SelectPolicy::PreserveName,
+                },
+            );
+        }
+        Err(err) => {
+            reduce(app, Action::ShowError(format!("Remote list failed: {err}")));
+        }
     }
 }
 
@@ -1247,21 +1255,26 @@ async fn handle_worker_result(
             );
             if app.connected {
                 let path = app.remote_cwd.clone();
-                if let Ok(entries) = list_remote(app, session, &path).await {
-                    reduce(
-                        app,
-                        Action::SetRemoteEntries {
-                            entries,
-                            select: SelectPolicy::PreserveName,
-                        },
-                    );
+                match list_remote(app, session, &path).await {
+                    Ok(entries) => {
+                        reduce(
+                            app,
+                            Action::SetRemoteEntries {
+                                entries,
+                                select: SelectPolicy::PreserveName,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        reduce(app, Action::ShowError(format!("Remote list failed: {err}")));
+                    }
                 }
             }
         }
         Err(err) => {
             msg.job.last_error = Some(err.to_string());
             reduce(app, Action::MarkTransferFailed(msg.job));
-            reduce(app, Action::SetStatus(format!("Transfer failed: {err}")));
+            reduce(app, Action::ShowError(format!("Transfer failed: {err}")));
         }
     }
 }
@@ -1350,7 +1363,7 @@ async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: 
             reduce(app, Action::SetConnected(false));
             reduce(
                 app,
-                Action::SetStatus(format!(
+                Action::ShowError(format!(
                     "Connect failed for {}@{}:{} via {:?} -> {err}",
                     info.username, info.host, info.port, info.protocol
                 )),
@@ -1780,13 +1793,22 @@ fn local_list(path: &str) -> Vec<FileEntry> {
                     dd_ftp_core::EntryKind::File
                 };
 
+                let modified = meta.modified().ok().map(Into::into);
+                #[cfg(unix)]
+                let permissions = {
+                    use std::os::unix::fs::PermissionsExt;
+                    Some(format!("{:o}", meta.permissions().mode() & 0o7777))
+                };
+                #[cfg(not(unix))]
+                let permissions = None;
+
                 out.push(FileEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
                     path: entry.path().to_string_lossy().to_string(),
                     kind,
                     size: meta.len(),
-                    modified: None,
-                    permissions: None,
+                    modified,
+                    permissions,
                 });
             }
         }
@@ -1796,7 +1818,7 @@ fn local_list(path: &str) -> Vec<FileEntry> {
         .into_iter()
         .partition(|e| e.name == "." || e.name == "..");
 
-    regular.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    regular.sort_by_key(|a| a.name.to_lowercase());
 
     let mut result = special;
     result.extend(regular);
@@ -2067,14 +2089,6 @@ async fn delete_item(app: &mut AppState, session: &mut SftpSession, target: &str
             };
             let target_str = target_path.to_string_lossy().to_string();
 
-            reduce(
-                app,
-                Action::SetStatus(format!(
-                    "DEBUG: Deleting '{}' (is_dir={})",
-                    target_str, is_dir
-                )),
-            );
-
             let result = if is_dir {
                 std::fs::remove_dir(&target_path)
             } else {
@@ -2234,5 +2248,30 @@ mod path_tests {
             "download remote_path must not be a LIST line, got {}",
             job.remote_path
         );
+    }
+
+    #[test]
+    fn local_list_fills_size_and_modified() {
+        let dir = std::env::temp_dir().join(format!(
+            "dd_ftp_local_list_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, b"hello world").expect("write file");
+
+        let entries = local_list(dir.to_str().expect("utf8 path"));
+        let hello = entries
+            .iter()
+            .find(|e| e.name == "hello.txt")
+            .expect("listed file");
+        assert!(hello.size > 0);
+        assert!(hello.modified.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

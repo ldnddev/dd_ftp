@@ -1,6 +1,6 @@
 use ratatui::style::Color;
 use serde::Deserialize;
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::RwLock};
 
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -146,6 +146,37 @@ pub struct LoadedTheme {
     pub warning: Option<String>,
     /// Optional per-theme header tagline override. Empty = use built-in list.
     pub header_quotes: Vec<String>,
+}
+
+static THEME: RwLock<Option<LoadedTheme>> = RwLock::new(None);
+
+pub fn cached_theme() -> LoadedTheme {
+    match THEME.read() {
+        Ok(guard) => {
+            if let Some(t) = guard.as_ref() {
+                return t.clone();
+            }
+        }
+        Err(poisoned) => {
+            if let Some(t) = poisoned.get_ref().as_ref() {
+                return t.clone();
+            }
+        }
+    }
+    LoadedTheme {
+        theme: Theme::default(),
+        source: ThemeSource::Default,
+        path: None,
+        version: None,
+        warning: None,
+        header_quotes: Vec::new(),
+    }
+}
+
+pub fn reload_theme() -> LoadedTheme {
+    let loaded = load_theme_with_source();
+    *THEME.write().unwrap() = Some(loaded.clone());
+    loaded
 }
 
 pub fn load_theme() -> Theme {
@@ -372,4 +403,43 @@ fn parse_hex(input: &str) -> Option<Color> {
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some(Color::Rgb(r, g, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_THEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cached_theme_twice_succeeds() {
+        let _guard = TEST_THEME_LOCK.lock().unwrap();
+        let first = cached_theme();
+        let second = cached_theme();
+        assert_eq!(first.source.label(), second.source.label());
+        assert_eq!(first.version, second.version);
+    }
+
+    #[test]
+    fn reload_theme_replaces_the_cache() {
+        let _guard = TEST_THEME_LOCK.lock().unwrap();
+        {
+            let mut theme_guard = THEME.write().unwrap();
+            *theme_guard = Some(LoadedTheme {
+                theme: Theme::default(),
+                source: ThemeSource::Default,
+                path: None,
+                version: Some(99),
+                warning: Some("sentinel".into()),
+                header_quotes: vec!["x".into()],
+            });
+        }
+        let loaded = reload_theme();
+        let cached = cached_theme();
+        assert_ne!(cached.version, Some(99));
+        assert_ne!(cached.warning.as_deref(), Some("sentinel"));
+        assert_eq!(cached.version, loaded.version);
+        assert_eq!(cached.warning, loaded.warning);
+        assert_eq!(cached.source.label(), loaded.source.label());
+    }
 }

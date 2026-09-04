@@ -359,12 +359,14 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.prompt_kind = None;
             state.prompt_value = TextField::default();
             state.prompt_target = None;
+            state.host_key = None;
         }
         Action::CancelPrompt => {
             state.show_prompt = false;
             state.prompt_kind = None;
             state.prompt_value = TextField::default();
             state.prompt_target = None;
+            state.host_key = None;
         }
         Action::CreateFile(_)
         | Action::CreateFolder(_)
@@ -476,6 +478,31 @@ mod prompt_tests {
         reduce(&mut s, Action::CancelPrompt);
         assert!(!s.show_prompt);
         assert_eq!(s.prompt_kind, None);
+    }
+
+    #[test]
+    fn host_key_is_choice_and_does_not_touch_prompt_value() {
+        let mut s = AppState {
+            prompt_value: TextField::from_str("keep-me"),
+            host_key: Some(crate::HostKeyView {
+                host: "example.com".into(),
+                port: 22,
+                fingerprint: "abcd".into(),
+                changed: false,
+            }),
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ShowChoicePrompt(ChoicePromptKind::HostKey));
+        assert!(s.show_prompt);
+        assert_eq!(
+            s.prompt_kind,
+            Some(PromptKind::Choice(ChoicePromptKind::HostKey))
+        );
+        assert_eq!(s.prompt_value.value, "keep-me");
+        reduce(&mut s, Action::CancelPrompt);
+        assert!(!s.show_prompt);
+        assert_eq!(s.prompt_kind, None);
+        assert!(s.host_key.is_none());
     }
 }
 

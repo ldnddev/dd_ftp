@@ -993,31 +993,91 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                 );
 
                 let target = app.prompt_target.as_deref().unwrap_or("");
-                let (title, body) = match kind {
+                let (title, lines) = match kind {
                     ChoicePromptKind::ConfirmQuit => (
                         " Quit ",
-                        "Quit anyway? Active transfers will be interrupted (y/n)".to_string(),
+                        vec![
+                            Line::from(vec![Span::styled(
+                                "Quit anyway? Active transfers will be interrupted (y/n)",
+                                Style::default().fg(t.modal_labels),
+                            )]),
+                            Line::from(""),
+                            Line::from(vec![Span::styled(
+                                "y confirm | n / Esc cancel",
+                                Style::default().fg(t.warning),
+                            )]),
+                        ],
                     ),
-                    ChoicePromptKind::ConfirmDelete => {
-                        (" Delete ", format!("Delete '{target}'? (y/n)"))
-                    }
+                    ChoicePromptKind::ConfirmDelete => (
+                        " Delete ",
+                        vec![
+                            Line::from(vec![Span::styled(
+                                format!("Delete '{target}'? (y/n)"),
+                                Style::default().fg(t.modal_labels),
+                            )]),
+                            Line::from(""),
+                            Line::from(vec![Span::styled(
+                                "y confirm | n / Esc cancel",
+                                Style::default().fg(t.warning),
+                            )]),
+                        ],
+                    ),
                     ChoicePromptKind::ConfirmBookmarkDelete => (
                         " Delete bookmark ",
-                        format!("Delete bookmark '{target}'? (y/n)"),
+                        vec![
+                            Line::from(vec![Span::styled(
+                                format!("Delete bookmark '{target}'? (y/n)"),
+                                Style::default().fg(t.modal_labels),
+                            )]),
+                            Line::from(""),
+                            Line::from(vec![Span::styled(
+                                "y confirm | n / Esc cancel",
+                                Style::default().fg(t.warning),
+                            )]),
+                        ],
                     ),
+                    ChoicePromptKind::HostKey => {
+                        let hk = app.host_key.as_ref();
+                        let host = hk.map(|h| h.host.as_str()).unwrap_or("");
+                        let port = hk.map(|h| h.port).unwrap_or(0);
+                        let fp = hk.map(|h| h.fingerprint.as_str()).unwrap_or("");
+                        let changed = hk.is_some_and(|h| h.changed);
+                        let header = if changed {
+                            format!("WARNING: HOST KEY CHANGED for {host}:{port}")
+                        } else {
+                            format!("Host key unknown for {host}:{port}")
+                        };
+                        let ask = if changed {
+                            "This may be a MITM. Trust the new key and update known_hosts? (y/n)"
+                        } else {
+                            "Trust and save to ~/.ssh/known_hosts? (y/n)"
+                        };
+                        let header_style = if changed {
+                            Style::default().fg(t.error)
+                        } else {
+                            Style::default().fg(t.modal_labels)
+                        };
+                        (
+                            " Host key ",
+                            vec![
+                                Line::from(vec![Span::styled(header, header_style)]),
+                                Line::from(vec![Span::styled(
+                                    format!("SHA256:{fp}"),
+                                    Style::default().fg(t.modal_text),
+                                )]),
+                                Line::from(vec![Span::styled(
+                                    ask,
+                                    Style::default().fg(t.modal_labels),
+                                )]),
+                                Line::from(""),
+                                Line::from(vec![Span::styled(
+                                    "y accept | n / Esc reject",
+                                    Style::default().fg(t.warning),
+                                )]),
+                            ],
+                        )
+                    }
                 };
-
-                let lines = vec![
-                    Line::from(vec![Span::styled(
-                        body,
-                        Style::default().fg(t.modal_labels),
-                    )]),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        "y confirm | n / Esc cancel",
-                        Style::default().fg(t.warning),
-                    )]),
-                ];
 
                 let modal = Paragraph::new(lines)
                     .style(Style::default().bg(t.modal_background).fg(t.modal_text))

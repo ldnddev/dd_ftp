@@ -1,10 +1,13 @@
 use std::convert::TryFrom;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, TransferJob};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio_rustls::rustls::{client::ServerName, ClientConfig, OwnedTrustAnchor, RootCertStore};
+
+const FTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
 pub enum FtpVariant {
@@ -40,9 +43,13 @@ impl UnifiedFtpSession {
     }
 
     async fn login_stream(info: &ConnectionInfo) -> Result<async_ftp::FtpStream> {
-        let mut stream = async_ftp::FtpStream::connect((info.host.as_str(), info.port))
-            .await
-            .with_context(|| format!("FTP connect failed: {}:{}", info.host, info.port))?;
+        let mut stream = tokio::time::timeout(
+            FTP_CONNECT_TIMEOUT,
+            async_ftp::FtpStream::connect((info.host.as_str(), info.port)),
+        )
+        .await
+        .with_context(|| format!("FTP connect timed out: {}:{}", info.host, info.port))?
+        .with_context(|| format!("FTP connect failed: {}:{}", info.host, info.port))?;
 
         let password = info.password.clone().unwrap_or_default();
         stream
@@ -54,9 +61,13 @@ impl UnifiedFtpSession {
     }
 
     async fn login_secure_stream(info: &ConnectionInfo) -> Result<async_ftp::FtpStream> {
-        let stream = async_ftp::FtpStream::connect((info.host.as_str(), info.port))
-            .await
-            .with_context(|| format!("FTPS connect failed: {}:{}", info.host, info.port))?;
+        let stream = tokio::time::timeout(
+            FTP_CONNECT_TIMEOUT,
+            async_ftp::FtpStream::connect((info.host.as_str(), info.port)),
+        )
+        .await
+        .with_context(|| format!("FTPS connect timed out: {}:{}", info.host, info.port))?
+        .with_context(|| format!("FTPS connect failed: {}:{}", info.host, info.port))?;
 
         let mut root_store = RootCertStore::empty();
         root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {

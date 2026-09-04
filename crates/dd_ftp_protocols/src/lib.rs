@@ -1,3 +1,3 @@
 pub mod sftp;
 
-pub use sftp::SftpSession;
+pub use sftp::{HostKeyOffer, SftpSession};

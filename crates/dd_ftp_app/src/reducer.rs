@@ -1,6 +1,6 @@
 use crate::{
-    Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField, SelectPolicy,
-    TextField, TextPromptKind, Toast,
+    is_dot_or_dotdot, Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField,
+    SelectPolicy, TextField, TextPromptKind, Toast,
 };
 use dd_ftp_core::{FileEntry, Protocol};
 
@@ -67,6 +67,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SetLocalEntries { entries, select } => {
             let previous_name = state.selected_local_entry().map(|e| e.name.clone());
             state.local_entries = entries;
+            if select == SelectPolicy::Reset {
+                state.marked_local.clear();
+            } else {
+                state
+                    .marked_local
+                    .retain(|p| state.local_entries.iter().any(|e| &e.path == p));
+            }
             let idx = {
                 let visible = state.visible_local();
                 resolve_select(
@@ -81,6 +88,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SetRemoteEntries { entries, select } => {
             let previous_name = state.selected_remote_entry().map(|e| e.name.clone());
             state.remote_entries = entries;
+            if select == SelectPolicy::Reset {
+                state.marked_remote.clear();
+            } else {
+                state
+                    .marked_remote
+                    .retain(|p| state.remote_entries.iter().any(|e| &e.path == p));
+            }
             let idx = {
                 let visible = state.visible_remote();
                 resolve_select(
@@ -381,6 +395,58 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.prompt_value = TextField::default();
             // Target will be set based on current selection
             state.prompt_target = None;
+        }
+        Action::ShowChmodPrompt { mode } => {
+            state.show_prompt = true;
+            state.prompt_kind = Some(PromptKind::Text(TextPromptKind::Chmod));
+            state.prompt_value = TextField::from_str(&mode);
+            state.prompt_target = None;
+        }
+        Action::ToggleMark => {
+            let info = match state.focus {
+                FocusPane::Local => state
+                    .selected_local_entry()
+                    .map(|e| (e.path.clone(), is_dot_or_dotdot(&e.name))),
+                FocusPane::Remote => state
+                    .selected_remote_entry()
+                    .map(|e| (e.path.clone(), is_dot_or_dotdot(&e.name))),
+                FocusPane::Queue => None,
+            };
+            if let Some((path, skip)) = info {
+                if !skip {
+                    let marks = match state.focus {
+                        FocusPane::Local => &mut state.marked_local,
+                        FocusPane::Remote => &mut state.marked_remote,
+                        FocusPane::Queue => return,
+                    };
+                    if !marks.remove(&path) {
+                        marks.insert(path);
+                    }
+                }
+            }
+        }
+        Action::ClearMarks { pane } => match pane {
+            FocusPane::Local => state.marked_local.clear(),
+            FocusPane::Remote => state.marked_remote.clear(),
+            FocusPane::Queue => {}
+        },
+        Action::CycleSort => {
+            let local_name = state.selected_local_entry().map(|e| e.name.clone());
+            let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
+            state.sort_key = state.sort_key.next();
+            preserve_filter_selection(state, local_name, remote_name);
+        }
+        Action::ToggleSortDir => {
+            let local_name = state.selected_local_entry().map(|e| e.name.clone());
+            let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
+            state.sort_asc = !state.sort_asc;
+            preserve_filter_selection(state, local_name, remote_name);
+        }
+        Action::ToggleHideDotfiles => {
+            let local_name = state.selected_local_entry().map(|e| e.name.clone());
+            let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
+            state.hide_dotfiles = !state.hide_dotfiles;
+            preserve_filter_selection(state, local_name, remote_name);
         }
         Action::ShowDeletePrompt => {
             state.show_prompt = true;
@@ -766,8 +832,8 @@ mod selection_tests {
                 select: SelectPolicy::PreserveName,
             },
         );
-        assert_eq!(s.selected_remote, 1);
         assert_eq!(s.selected_remote_entry().unwrap().name, "keep");
+        assert_eq!(s.selected_remote, 0);
     }
 
     #[test]
@@ -917,7 +983,7 @@ mod reduce_table_tests {
                 next: &["new", "keep", "z"],
                 policy: SelectPolicy::PreserveName,
                 want_name: "keep",
-                want_idx: 1,
+                want_idx: 0,
             },
             Case {
                 name: "reset",
@@ -980,7 +1046,7 @@ mod reduce_table_tests {
                 next: &["new", "keep", "z"],
                 policy: SelectPolicy::PreserveName,
                 want_name: "keep",
-                want_idx: 1,
+                want_idx: 0,
             },
             Case {
                 name: "reset",
@@ -1167,5 +1233,195 @@ mod reduce_table_tests {
         assert_eq!(s.worker_active_count, 2);
         assert!(s.worker_running);
         assert!(s.worker_cancel_requested);
+    }
+}
+
+#[cfg(test)]
+mod mark_sort_chmod_tests {
+    use super::*;
+    use crate::{is_dot_or_dotdot, parse_octal_mode, AppState, SelectPolicy, SortKey};
+    use dd_ftp_core::{EntryKind, FileEntry};
+
+    fn fe(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: format!("/{name}"),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    fn dir(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: format!("/{name}"),
+            kind: EntryKind::Directory,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    #[test]
+    fn toggle_mark_adds_and_removes_path() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleMark);
+        assert!(s.marked_local.contains("/a"));
+        reduce(&mut s, Action::ToggleMark);
+        assert!(!s.marked_local.contains("/a"));
+        assert!(s.marked_local.is_empty());
+    }
+
+    #[test]
+    fn set_entries_reset_clears_marks() {
+        let mut s = AppState {
+            local_entries: vec![fe("a")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleMark);
+        assert!(!s.marked_local.is_empty());
+        reduce(
+            &mut s,
+            Action::SetLocalEntries {
+                entries: vec![fe("a"), fe("b")],
+                select: SelectPolicy::Reset,
+            },
+        );
+        assert!(s.marked_local.is_empty());
+
+        s.remote_entries = vec![fe("r")];
+        s.selected_remote = 0;
+        s.focus = FocusPane::Remote;
+        reduce(&mut s, Action::ToggleMark);
+        assert!(!s.marked_remote.is_empty());
+        reduce(
+            &mut s,
+            Action::SetRemoteEntries {
+                entries: vec![fe("r"), fe("s")],
+                select: SelectPolicy::Reset,
+            },
+        );
+        assert!(s.marked_remote.is_empty());
+    }
+
+    #[test]
+    fn set_entries_preserve_name_keeps_marks() {
+        let mut s = AppState {
+            local_entries: vec![fe("a")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleMark);
+        reduce(
+            &mut s,
+            Action::SetLocalEntries {
+                entries: vec![fe("a"), fe("b")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert!(s.marked_local.contains("/a"));
+    }
+
+    #[test]
+    fn set_entries_preserve_name_prunes_stale_marks() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleMark);
+        s.selected_local = 1;
+        reduce(&mut s, Action::ToggleMark);
+        assert!(s.marked_local.contains("/a"));
+        assert!(s.marked_local.contains("/b"));
+        reduce(
+            &mut s,
+            Action::SetLocalEntries {
+                entries: vec![fe("b"), fe("c")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert!(!s.marked_local.contains("/a"));
+        assert!(s.marked_local.contains("/b"));
+
+        s.remote_entries = vec![fe("r")];
+        s.selected_remote = 0;
+        s.focus = FocusPane::Remote;
+        reduce(&mut s, Action::ToggleMark);
+        reduce(
+            &mut s,
+            Action::SetRemoteEntries {
+                entries: vec![fe("other")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert!(s.marked_remote.is_empty());
+    }
+
+    #[test]
+    fn toggle_mark_does_not_mark_dot_or_dotdot() {
+        let mut s = AppState {
+            local_entries: vec![dir("."), dir(".."), fe("a")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleMark);
+        assert!(s.marked_local.is_empty());
+        s.selected_local = 1;
+        reduce(&mut s, Action::ToggleMark);
+        assert!(s.marked_local.is_empty());
+        s.selected_local = 2;
+        reduce(&mut s, Action::ToggleMark);
+        assert!(s.marked_local.contains("/a"));
+        assert!(is_dot_or_dotdot("."));
+        assert!(is_dot_or_dotdot(".."));
+    }
+
+    #[test]
+    fn show_chmod_prompt_opens_with_selected_mode_string() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ShowChmodPrompt { mode: "755".into() });
+        assert!(s.show_prompt);
+        assert_eq!(s.prompt_kind, Some(PromptKind::Text(TextPromptKind::Chmod)));
+        assert_eq!(s.prompt_value.value, "755");
+    }
+
+    #[test]
+    fn octal_parse_table_and_mask() {
+        assert_eq!(parse_octal_mode("755").unwrap(), 0o755);
+        assert_eq!(parse_octal_mode("0755").unwrap(), 0o755);
+        assert_eq!(parse_octal_mode("0o755").unwrap(), 0o755);
+        assert!(parse_octal_mode("zzz").is_err());
+        assert_eq!(parse_octal_mode("17777").unwrap(), 0o7777);
+        assert_eq!(parse_octal_mode("77777").unwrap() & 0o7777, 0o7777);
+    }
+
+    #[test]
+    fn cycle_sort_and_hide_dotfiles() {
+        let mut s = AppState::default();
+        assert_eq!(s.sort_key, SortKey::Name);
+        assert!(s.sort_asc);
+        reduce(&mut s, Action::CycleSort);
+        assert_eq!(s.sort_key, SortKey::Size);
+        reduce(&mut s, Action::CycleSort);
+        assert_eq!(s.sort_key, SortKey::Date);
+        reduce(&mut s, Action::CycleSort);
+        assert_eq!(s.sort_key, SortKey::Name);
+        reduce(&mut s, Action::ToggleSortDir);
+        assert!(!s.sort_asc);
+        reduce(&mut s, Action::ToggleHideDotfiles);
+        assert!(s.hide_dotfiles);
     }
 }

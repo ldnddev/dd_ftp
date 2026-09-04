@@ -1,9 +1,55 @@
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dd_ftp_core::{ConnectionInfo, FileEntry, TransferDirection};
 use dd_ftp_transfer::TransferQueue;
 
 use crate::{TextField, Toast};
+
+/// Listing sort key. One global key for both panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortKey {
+    #[default]
+    Name,
+    Size,
+    Date,
+}
+
+impl SortKey {
+    pub fn next(self) -> Self {
+        match self {
+            SortKey::Name => SortKey::Size,
+            SortKey::Size => SortKey::Date,
+            SortKey::Date => SortKey::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Date => "date",
+        }
+    }
+}
+
+/// Parse chmod input as octal. Accepts `755`, `0755`, and `0o755`; masks with `0o7777`.
+pub fn parse_octal_mode(input: &str) -> Result<u32, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("invalid chmod mode".to_string());
+    }
+    let digits = trimmed
+        .strip_prefix("0o")
+        .or_else(|| trimmed.strip_prefix("0O"))
+        .unwrap_or(trimmed);
+    let mode = u32::from_str_radix(digits, 8).map_err(|_| "invalid chmod mode".to_string())?;
+    Ok(mode & 0o7777)
+}
+
+pub fn is_dot_or_dotdot(name: &str) -> bool {
+    name == "." || name == ".."
+}
 
 /// How to place `selected_*` after a listing or filter change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +111,7 @@ pub enum TextPromptKind {
     CreateFile,
     CreateFolder,
     Rename,
+    Chmod,
     OverwriteRename,
 }
 
@@ -205,6 +252,11 @@ pub struct AppState {
     pub host_key: Option<HostKeyView>,
     /// Overwrite ChoicePrompt fields. pending_scan on the CLI run stack is source of truth.
     pub overwrite: Option<OverwritePrompt>,
+    pub hide_dotfiles: bool,
+    pub sort_key: SortKey,
+    pub sort_asc: bool,
+    pub marked_local: HashSet<String>,
+    pub marked_remote: HashSet<String>,
 }
 
 impl AppState {
@@ -267,18 +319,98 @@ impl AppState {
         pattern.is_empty() || name.to_lowercase().contains(&pattern.to_lowercase())
     }
 
-    pub fn visible_local(&self) -> Vec<&FileEntry> {
-        self.local_entries
+    fn hide_dotfile(name: &str, hide: bool) -> bool {
+        hide && name.starts_with('.') && !is_dot_or_dotdot(name)
+    }
+
+    fn sort_entries(entries: &mut [&FileEntry], key: SortKey, asc: bool) {
+        entries.sort_by(|a, b| {
+            let rank = |name: &str| -> u8 {
+                if name == "." {
+                    0
+                } else if name == ".." {
+                    1
+                } else {
+                    2
+                }
+            };
+            let special = rank(&a.name).cmp(&rank(&b.name));
+            if special != std::cmp::Ordering::Equal {
+                return special;
+            }
+            match key {
+                SortKey::Name => {
+                    let dirs = b.is_dir().cmp(&a.is_dir());
+                    let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                    dirs.then(if asc { names } else { names.reverse() })
+                }
+                SortKey::Size => {
+                    let sizes = a.size.cmp(&b.size);
+                    let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                    let ord = sizes.then(names);
+                    if asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                }
+                SortKey::Date => {
+                    let dates = a.modified.cmp(&b.modified);
+                    let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                    let ord = dates.then(names);
+                    if asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                }
+            }
+        });
+    }
+
+    fn visible_entries<'a>(
+        entries: &'a [FileEntry],
+        pattern: &str,
+        hide_dotfiles: bool,
+        sort_key: SortKey,
+        sort_asc: bool,
+    ) -> Vec<&'a FileEntry> {
+        let mut out: Vec<&FileEntry> = entries
             .iter()
-            .filter(|e| Self::entry_visible(&e.name, &self.filter_pattern))
-            .collect()
+            .filter(|e| Self::entry_visible(&e.name, pattern))
+            .filter(|e| !Self::hide_dotfile(&e.name, hide_dotfiles))
+            .collect();
+        Self::sort_entries(&mut out, sort_key, sort_asc);
+        out
+    }
+
+    pub fn visible_local(&self) -> Vec<&FileEntry> {
+        Self::visible_entries(
+            &self.local_entries,
+            &self.filter_pattern,
+            self.hide_dotfiles,
+            self.sort_key,
+            self.sort_asc,
+        )
     }
 
     pub fn visible_remote(&self) -> Vec<&FileEntry> {
-        self.remote_entries
-            .iter()
-            .filter(|e| Self::entry_visible(&e.name, &self.filter_pattern))
-            .collect()
+        Self::visible_entries(
+            &self.remote_entries,
+            &self.filter_pattern,
+            self.hide_dotfiles,
+            self.sort_key,
+            self.sort_asc,
+        )
+    }
+
+    pub fn sort_title_suffix(&self) -> String {
+        let arrow = if self.sort_asc { "↑" } else { "↓" };
+        let mut s = format!("sort: {}{}", self.sort_key.label(), arrow);
+        if self.hide_dotfiles {
+            s.push_str("  hidden-dotfiles");
+        }
+        s
     }
 
     pub fn selected_local_entry(&self) -> Option<&FileEntry> {
@@ -287,6 +419,33 @@ impl AppState {
 
     pub fn selected_remote_entry(&self) -> Option<&FileEntry> {
         self.visible_remote().get(self.selected_remote).copied()
+    }
+
+    /// Marked live rows for `u`/`d`/Enter. If no current listing path is marked,
+    /// fall back to the focused row (stale marks after rename/delete/refresh).
+    pub fn entries_for_transfer(&self, pane: FocusPane) -> Vec<&FileEntry> {
+        let (entries, marks, selected) = match pane {
+            FocusPane::Local => (
+                &self.local_entries,
+                &self.marked_local,
+                self.selected_local_entry(),
+            ),
+            FocusPane::Remote => (
+                &self.remote_entries,
+                &self.marked_remote,
+                self.selected_remote_entry(),
+            ),
+            FocusPane::Queue => return Vec::new(),
+        };
+        let live: Vec<&FileEntry> = entries
+            .iter()
+            .filter(|e| marks.contains(&e.path) && !is_dot_or_dotdot(&e.name))
+            .collect();
+        if live.is_empty() {
+            selected.into_iter().collect()
+        } else {
+            live
+        }
     }
 
     pub fn set_focus(&mut self, pane: FocusPane) {
@@ -346,6 +505,11 @@ impl Default for AppState {
             queue: TransferQueue::default(),
             host_key: None,
             overwrite: None,
+            hide_dotfiles: false,
+            sort_key: SortKey::Name,
+            sort_asc: true,
+            marked_local: HashSet::new(),
+            marked_remote: HashSet::new(),
         }
     }
 }
@@ -367,6 +531,28 @@ mod visible_tests {
         }
     }
 
+    fn fe_size(name: &str, size: u64) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: name.to_string(),
+            kind: EntryKind::File,
+            size,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    fn dir(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: name.to_string(),
+            kind: EntryKind::Directory,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
     #[test]
     fn visible_local_table() {
         struct Case {
@@ -377,11 +563,11 @@ mod visible_tests {
         let cases = [
             Case {
                 pattern: "",
-                want: &["a", "Foo", "afoo", "bar"],
+                want: &["a", "afoo", "bar", "Foo"],
             },
             Case {
                 pattern: "foo",
-                want: &["Foo", "afoo"],
+                want: &["afoo", "Foo"],
             },
         ];
         for case in cases {
@@ -393,6 +579,101 @@ mod visible_tests {
             let names: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
             assert_eq!(names, case.want, "pattern {:?}", case.pattern);
         }
+    }
+
+    #[test]
+    fn hide_dotfiles_drops_gitignore_but_keeps_dotdot() {
+        let s = AppState {
+            local_entries: vec![dir("."), dir(".."), fe(".gitignore"), fe("readme")],
+            hide_dotfiles: true,
+            ..Default::default()
+        };
+        let names: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec![".", "..", "readme"]);
+        assert!(!names.contains(&".gitignore"));
+        assert!(names.contains(&".."));
+    }
+
+    #[test]
+    fn sort_by_size_descending() {
+        let s = AppState {
+            local_entries: vec![fe_size("a", 10), fe_size("b", 30), fe_size("c", 20)],
+            sort_key: SortKey::Size,
+            sort_asc: false,
+            ..Default::default()
+        };
+        let names: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn entries_for_transfer_falls_back_when_no_live_marked_path() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b")],
+            selected_local: 1,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        s.marked_local.insert("/gone".into());
+        let names: Vec<&str> = s
+            .entries_for_transfer(FocusPane::Local)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["b"],
+            "stale marks must fall back to focused row"
+        );
+
+        s.marked_local.clear();
+        s.marked_local.insert("a".into());
+        s.local_entries[0].path = "a".into();
+        let names: Vec<&str> = s
+            .entries_for_transfer(FocusPane::Local)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a"]);
+    }
+
+    #[test]
+    fn parse_octal_mode_table() {
+        struct Case {
+            input: &'static str,
+            want: Result<u32, ()>,
+        }
+        let cases = [
+            Case {
+                input: "755",
+                want: Ok(0o755),
+            },
+            Case {
+                input: "0755",
+                want: Ok(0o755),
+            },
+            Case {
+                input: "0o755",
+                want: Ok(0o755),
+            },
+            Case {
+                input: "zzz",
+                want: Err(()),
+            },
+            Case {
+                input: "17777",
+                want: Ok(0o7777),
+            },
+        ];
+        for case in cases {
+            let got = parse_octal_mode(case.input);
+            match case.want {
+                Ok(mode) => assert_eq!(got, Ok(mode), "input {:?}", case.input),
+                Err(()) => assert!(got.is_err(), "input {:?} should err", case.input),
+            }
+        }
+        assert_eq!(parse_octal_mode("77777").unwrap(), 0o7777);
+        assert_eq!(0o77777 & 0o7777, 0o7777);
     }
 
     #[test]

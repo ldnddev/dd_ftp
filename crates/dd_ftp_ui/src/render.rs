@@ -1,8 +1,11 @@
+use std::time::Duration;
+
 use dd_ftp_app::{
-    AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField, TextPromptKind,
-    ToastLevel,
+    is_dot_or_dotdot, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField,
+    TextPromptKind, ToastLevel,
 };
 use dd_ftp_core::{Protocol, TransferJob};
+use dd_ftp_transfer::TransferQueue;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -14,6 +17,8 @@ use ratatui::{
     Frame,
 };
 
+use crate::compare::{classify_compare, CompareBadge};
+use crate::keys::{KeyGroup, KEYMAP};
 use crate::layout::{ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap};
 use crate::theme::{cached_theme, Theme};
 
@@ -183,7 +188,21 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     let local_cols = meta_columns(local_row_width.saturating_sub(6));
     let local_items: Vec<ListItem> = local_visible
         .into_iter()
-        .map(|e| file_list_item(e, local_row_width, local_cols, &t))
+        .map(|e| {
+            let badge = if app.show_compare {
+                classify_compare(&e.name, &app.local_entries, &app.remote_entries)
+            } else {
+                None
+            };
+            file_list_item(
+                e,
+                local_row_width,
+                local_cols,
+                app.marked_local.contains(&e.path),
+                badge,
+                &t,
+            )
+        })
         .collect();
     let remote_visible = if app.connected {
         app.visible_remote()
@@ -195,7 +214,21 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     let remote_cols = meta_columns(remote_row_width.saturating_sub(6));
     let remote_items: Vec<ListItem> = remote_visible
         .into_iter()
-        .map(|e| file_list_item(e, remote_row_width, remote_cols, &t))
+        .map(|e| {
+            let badge = if app.show_compare {
+                classify_compare(&e.name, &app.local_entries, &app.remote_entries)
+            } else {
+                None
+            };
+            file_list_item(
+                e,
+                remote_row_width,
+                remote_cols,
+                app.marked_remote.contains(&e.path),
+                badge,
+                &t,
+            )
+        })
         .collect();
 
     let local_style = if app.focus == FocusPane::Local {
@@ -245,12 +278,13 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     frame.render_widget(local_path, path_panes[0]);
     frame.render_widget(remote_path, path_panes[1]);
 
+    let local_title = format!(" [1] Local  {} ", app.sort_title_suffix());
     let local = List::new(local_items)
         .style(Style::default().bg(t.body_background).fg(t.text_primary))
         .block(
             Block::default()
                 .title(Line::from(vec![Span::styled(
-                    " [1] Local ",
+                    local_title,
                     local_title_style,
                 )]))
                 .borders(Borders::ALL)
@@ -273,12 +307,13 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         Style::default().fg(t.text_labels)
     };
 
+    let remote_title = format!(" [2] Remote  {} ", app.sort_title_suffix());
     let remote = List::new(remote_items)
         .style(Style::default().bg(t.body_background).fg(t.text_primary))
         .block(
             Block::default()
                 .title(Line::from(vec![Span::styled(
-                    " [2] Remote ",
+                    remote_title,
                     remote_title_style,
                 )]))
                 .borders(Borders::ALL)
@@ -356,10 +391,6 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         height: queue_area.height,
     };
 
-    if app.show_compare {
-        render_compare_view(frame, content_area, app, &t);
-    }
-
     let queue_style = if app.focus == FocusPane::Queue {
         Style::default().fg(t.border_active)
     } else {
@@ -398,7 +429,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     "A ",
                     Style::default().fg(t.info).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format_job_summary(job)),
+                Span::raw(format_job_summary(job, &app.queue)),
             ]));
         }
         for job in app.queue.pending.iter().take(row_cap) {
@@ -409,7 +440,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                         .fg(t.text_secondary)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format_job_summary(job)),
+                Span::raw(format_job_summary(job, &app.queue)),
             ]));
         }
         for job in app.queue.failed.iter().rev().take(row_cap) {
@@ -418,7 +449,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     "F ",
                     Style::default().fg(t.error).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format_job_summary(job)),
+                Span::raw(format_job_summary(job, &app.queue)),
             ]));
         }
     }
@@ -506,7 +537,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             area,
         );
 
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![Span::styled(
                 "Controls",
                 Style::default()
@@ -514,77 +545,23 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     .add_modifier(Modifier::BOLD),
             )]),
             Line::from(""),
-            Line::from("Global"),
-            Line::from("  F1 -> toggle this help (opening closes theme debug)"),
-            Line::from("  Esc -> close current modal; if compare is on, close compare"),
-            Line::from("  F2 -> toggle theme debug overlay (opening closes help)"),
-            Line::from("  q -> quit (confirms if transfers are active)"),
-            Line::from("  Ctrl+C -> cancel in-flight transfers"),
-            Line::from("  C -> toggle directory compare"),
-            Line::from(""),
-            Line::from("Navigation"),
-            Line::from("  1 -> focus Local pane"),
-            Line::from("  2 -> focus Remote pane"),
-            Line::from("  3 -> focus Queue pane"),
-            Line::from("  Tab -> cycle pane focus"),
-            Line::from("  j / Down -> move down"),
-            Line::from("  k / Up -> move up"),
-            Line::from("  l -> enter selected directory"),
-            Line::from("  h -> go to parent directory"),
-            Line::from("  r -> refresh listing(s)"),
-            Line::from("  Enter -> enter directory, or queue upload/download of a file"),
-            Line::from(""),
-            Line::from("Connection / bookmarks"),
-            Line::from("  o -> open quick connect"),
-            Line::from("  m -> open bookmarks modal"),
-            Line::from("  b -> cycle bookmarks"),
-            Line::from("  c -> connect using the quick-connect form / disconnect"),
-            Line::from("  c (bookmarks) -> connect highlighted bookmark (disconnect first)"),
-            Line::from("  d (bookmarks) -> delete bookmark with confirm"),
-            Line::from("  e (bookmarks) -> edit bookmark"),
-            Line::from("  D (bookmarks) -> set default bookmark"),
-            Line::from("  B -> save current quick-connect as bookmark"),
-            Line::from("  Ctrl+K -> keyring health check"),
-            Line::from(""),
-            Line::from("Transfers"),
-            Line::from("  u -> queue upload (directories recurse)"),
-            Line::from("  d -> queue download (directories recurse)"),
-            Line::from("  R -> retry last failed transfer"),
-            Line::from("  X -> clear pending queue"),
-            Line::from("  Ctrl+C -> cancel in-flight transfers"),
-            Line::from("  Enter (file) -> queue upload (local) or download (remote)"),
-            Line::from("  Overwrite: Enter/s skip  o overwrite  a overwrite-all  n skip-all  r rename  Esc abort"),
-            Line::from(""),
-            Line::from("Filters / compare"),
-            Line::from("  / -> toggle filter (Esc closes and clears the pattern)"),
-            Line::from("  C -> toggle directory compare"),
-            Line::from("  Esc -> close compare when no modal is open"),
-            Line::from(""),
-            Line::from("File operations"),
-            Line::from("  n / Ctrl+n -> new file/folder (Tab toggles)"),
-            Line::from("  e / Ctrl+Alt+e -> rename selected item"),
-            Line::from("  Delete / Ctrl+Delete -> delete selected item with confirm"),
-            Line::from(""),
-            Line::from("Selection / sort"),
-            Line::from("  Space -> toggle multi-select mark on the focused row"),
-            Line::from("  p -> SFTP chmod prompt (remote pane)"),
-            Line::from("  s -> cycle sort key: name -> size -> date -> name"),
-            Line::from("  S -> toggle sort direction"),
-            Line::from("  . -> toggle hide-dotfiles"),
-            Line::from(""),
-            Line::from("Mouse"),
-            Line::from("  Wheel -> scroll list / queue / help (also over the scrollbar rail)"),
-            Line::from("  Click row -> focus pane, select visible row"),
-            Line::from("  Double-click directory -> enter it"),
-            Line::from("  Double-click file -> queue transfer (same as Enter)"),
-            Line::from("  Drag scrollbar -> scroll"),
-            Line::from("  QC / prompt field click-drag -> cursor / selection"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Press F1 or Esc to close",
-                Style::default().fg(t.warning),
-            )]),
         ];
+        let mut last_group: Option<KeyGroup> = None;
+        for kb in KEYMAP {
+            if last_group != Some(kb.group) {
+                if last_group.is_some() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(kb.group.title()));
+                last_group = Some(kb.group);
+            }
+            lines.push(Line::from(format!("  {} -> {}", kb.keys, kb.action)));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Press F1 or Esc to close",
+            Style::default().fg(t.warning),
+        )]));
 
         let help = Paragraph::new(lines.clone())
             .style(Style::default().bg(t.modal_background).fg(t.modal_text))
@@ -1136,6 +1113,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     TextPromptKind::CreateFile => (" Create File ", "Enter file name:"),
                     TextPromptKind::CreateFolder => (" Create Folder ", "Enter folder name:"),
                     TextPromptKind::Rename => (" Rename ", "Enter new name:"),
+                    TextPromptKind::Chmod => (" Chmod ", "Enter octal mode (e.g. 755):"),
                     TextPromptKind::OverwriteRename => (" Rename destination ", "Enter new name:"),
                 };
 
@@ -1255,7 +1233,25 @@ fn render_toast(frame: &mut Frame, area: Rect, toast: &dd_ftp_app::Toast, t: &Th
     frame.render_widget(toast_widget, toast_area);
 }
 
-fn format_job_summary(job: &TransferJob) -> String {
+fn format_speed(bps: f64) -> String {
+    const K: f64 = 1024.0;
+    if bps >= K * K * K {
+        format!("{:.1} GB/s", bps / (K * K * K))
+    } else if bps >= K * K {
+        format!("{:.1} MB/s", bps / (K * K))
+    } else if bps >= K {
+        format!("{:.1} KB/s", bps / K)
+    } else {
+        format!("{:.0} B/s", bps)
+    }
+}
+
+fn format_eta(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn format_job_summary(job: &TransferJob, queue: &TransferQueue) -> String {
     let direction = match job.direction {
         dd_ftp_core::TransferDirection::Upload => "up",
         dd_ftp_core::TransferDirection::Download => "down",
@@ -1266,9 +1262,16 @@ fn format_job_summary(job: &TransferJob) -> String {
     let local = shorten_middle(&job.local_path, 22);
     let remote = shorten_middle(&job.remote_path, 22);
 
+    let speed_eta = match queue.speed_and_eta(job.id) {
+        Some((speed, Some(eta))) if speed > 0.0 && job.size_bytes.is_some() => {
+            format!("{} ETA {}", format_speed(speed), format_eta(eta))
+        }
+        _ => "ETA --:--".to_string(),
+    };
+
     format!(
-        "{} {} -> {} [{}] r{}",
-        direction, local, remote, progress, job.retries
+        "{} {} -> {} [{}] {} r{}",
+        direction, local, remote, progress, speed_eta, job.retries
     )
 }
 
@@ -1344,6 +1347,8 @@ fn file_list_item(
     entry: &dd_ftp_core::FileEntry,
     width: usize,
     cols: MetaColumns,
+    marked: bool,
+    badge: Option<CompareBadge>,
     t: &Theme,
 ) -> ListItem<'static> {
     let color = match entry.kind {
@@ -1356,16 +1361,30 @@ fn file_list_item(
     } else {
         "  "
     };
+    let badge_text = match badge {
+        Some(b) if !is_dot_or_dotdot(&entry.name) => format!("{} ", b.label()),
+        _ => String::new(),
+    };
+    let mark = if marked { "*" } else { "" };
     let meta = entry_meta(entry, cols);
     let meta_len = meta.chars().count();
-    let name_max = width
-        .saturating_sub(prefix.chars().count() + meta_len)
-        .max(1);
+    let lead_len = badge_text.chars().count() + mark.chars().count() + prefix.chars().count();
+    let name_max = width.saturating_sub(lead_len + meta_len).max(1);
     let name = shorten_middle(&entry.name, name_max);
-    let pad = width.saturating_sub(prefix.chars().count() + name.chars().count() + meta_len);
+    let pad = width.saturating_sub(lead_len + name.chars().count() + meta_len);
     let padding = " ".repeat(pad);
 
+    let badge_style = match badge {
+        Some(CompareBadge::LocalOnly) => Style::default().fg(t.warning),
+        Some(CompareBadge::RemoteOnly) => Style::default().fg(t.info),
+        Some(CompareBadge::Equal) => Style::default().fg(t.success),
+        Some(CompareBadge::Differ) => Style::default().fg(t.error),
+        None => Style::default(),
+    };
+
     ListItem::new(Line::from(vec![
+        Span::styled(badge_text, badge_style),
+        Span::styled(mark.to_string(), Style::default().fg(t.text_active_focus)),
         Span::styled(format!("{prefix}{name}"), Style::default().fg(color)),
         Span::styled(
             format!("{padding}{meta}"),
@@ -1496,90 +1515,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn render_compare_view(frame: &mut Frame, area: Rect, app: &AppState, t: &Theme) {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum CompareStatus {
-        LocalOnly,
-        RemoteOnly,
-        Same,
-    }
-
-    let local_names: std::collections::HashSet<_> = app
-        .local_entries
-        .iter()
-        .map(|e| e.name.to_lowercase())
-        .collect();
-    let remote_names: std::collections::HashSet<_> = app
-        .remote_entries
-        .iter()
-        .map(|e| e.name.to_lowercase())
-        .collect();
-
-    let mut compare_items: Vec<(String, CompareStatus)> = Vec::new();
-
-    for entry in &app.local_entries {
-        let status = if remote_names.contains(&entry.name.to_lowercase()) {
-            CompareStatus::Same
-        } else {
-            CompareStatus::LocalOnly
-        };
-        compare_items.push((entry.name.clone(), status));
-    }
-
-    for entry in &app.remote_entries {
-        if !local_names.contains(&entry.name.to_lowercase()) {
-            compare_items.push((entry.name.clone(), CompareStatus::RemoteOnly));
-        }
-    }
-
-    compare_items.sort_by(|a, b| {
-        let a_dir = app
-            .local_entries
-            .iter()
-            .any(|e| e.name.eq_ignore_ascii_case(&a.0) && e.is_dir());
-        let b_dir = app
-            .local_entries
-            .iter()
-            .any(|e| e.name.eq_ignore_ascii_case(&b.0) && e.is_dir());
-        match (a_dir, b_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-        }
-    });
-
-    let compare_items: Vec<ListItem> = compare_items
-        .iter()
-        .map(|(name, status)| {
-            let (prefix, color) = match status {
-                CompareStatus::LocalOnly => ("[L] ", t.warning),
-                CompareStatus::RemoteOnly => ("[R] ", t.info),
-                CompareStatus::Same => ("[=] ", t.success),
-            };
-            ListItem::new(Span::styled(
-                format!("{}{}", prefix, name),
-                Style::default().fg(color),
-            ))
-        })
-        .collect();
-
-    let compare_block = List::new(compare_items)
-        .style(Style::default().bg(t.body_background).fg(t.text_primary))
-        .block(
-            Block::default()
-                .title(Line::from(vec![Span::styled(
-                    " Compare | [L] local only | [R] remote only | [=] same ",
-                    Style::default()
-                        .fg(t.text_labels)
-                        .add_modifier(Modifier::BOLD),
-                )]))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(t.border_active)),
-        );
-
-    frame.render_widget(compare_block, area);
-}
-
 #[cfg(test)]
 mod column_tests {
     use super::*;
@@ -1617,5 +1552,26 @@ mod column_tests {
         assert!(meta_columns(25).date && !meta_columns(25).perms);
         assert!(meta_columns(7).size && !meta_columns(7).date);
         assert!(!meta_columns(6).size);
+    }
+
+    #[test]
+    fn format_job_summary_uses_queue_helper_not_job_field() {
+        use dd_ftp_core::{TransferDirection, TransferJob};
+        use std::time::{Duration, Instant};
+
+        let mut queue = TransferQueue::default();
+        let job = TransferJob::new("/tmp/a", "/pub/a", TransferDirection::Upload);
+        queue.enqueue(job);
+        let started = queue.start_next().unwrap();
+        let t0 = Instant::now();
+        queue.update_active_progress_at(started.id, 0, None, t0);
+        queue.update_active_progress_at(started.id, 1_000, None, t0 + Duration::from_millis(150));
+        let summary = format_job_summary(&queue.active[0], &queue);
+        assert!(
+            summary.contains("ETA --:--"),
+            "missing size must render ETA --:--; got {summary}"
+        );
+        // Speed lives on the queue, not TransferJob.
+        let _ = queue.speed_and_eta(started.id);
     }
 }

@@ -78,8 +78,18 @@ pub enum Action {
     DeleteItem(String),
     ShowCreatePrompt,
     ShowRenamePrompt,
+    ShowChmodPrompt {
+        mode: String,
+    },
     ShowDeletePrompt,
     ShowChoicePrompt(ChoicePromptKind),
+    ToggleMark,
+    ClearMarks {
+        pane: FocusPane,
+    },
+    CycleSort,
+    ToggleSortDir,
+    ToggleHideDotfiles,
     SetOverwritePolicy(OverwritePolicy),
     PromptInput(char),
     PromptBackspace,

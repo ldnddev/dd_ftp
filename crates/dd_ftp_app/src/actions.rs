@@ -1,15 +1,21 @@
 use dd_ftp_core::{ConnectionInfo, FileEntry, TransferJob};
 use uuid::Uuid;
 
-use crate::ChoicePromptKind;
+use crate::{ChoicePromptKind, SelectPolicy};
 
 #[derive(Debug)]
 pub enum Action {
     Connect(ConnectionInfo),
     Disconnect,
     SetConnected(bool),
-    SetLocalEntries(Vec<FileEntry>),
-    SetRemoteEntries(Vec<FileEntry>),
+    SetLocalEntries {
+        entries: Vec<FileEntry>,
+        select: SelectPolicy,
+    },
+    SetRemoteEntries {
+        entries: Vec<FileEntry>,
+        select: SelectPolicy,
+    },
     SetBookmarks(Vec<ConnectionInfo>),
     SelectNextBookmark,
     SelectPrevBookmark,

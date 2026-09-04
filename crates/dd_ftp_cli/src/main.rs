@@ -20,7 +20,7 @@ use crossterm::{
 };
 use dd_ftp_app::{
     reduce, Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField,
-    TextPromptKind,
+    SelectPolicy, TextPromptKind,
 };
 use dd_ftp_core::{
     ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob,
@@ -649,15 +649,15 @@ async fn run(
                         }
                         KeyCode::Tab => reduce(app, Action::FocusNextPane),
                         KeyCode::Char('1') => {
-                            app.focus = FocusPane::Local;
+                            app.set_focus(FocusPane::Local);
                             reduce(app, Action::SetStatus("Focus: Local".to_string()));
                         }
                         KeyCode::Char('2') => {
-                            app.focus = FocusPane::Remote;
+                            app.set_focus(FocusPane::Remote);
                             reduce(app, Action::SetStatus("Focus: Remote".to_string()));
                         }
                         KeyCode::Char('3') => {
-                            app.focus = FocusPane::Queue;
+                            app.set_focus(FocusPane::Queue);
                             reduce(app, Action::SetStatus("Focus: Queue".to_string()));
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -681,30 +681,25 @@ async fn run(
                             navigate_parent_directory(app, session).await;
                         }
                         KeyCode::Char('r') => {
-                            app.local_entries = local_list(&app.local_cwd);
+                            reduce(
+                                app,
+                                Action::SetLocalEntries {
+                                    entries: local_list(&app.local_cwd),
+                                    select: SelectPolicy::PreserveName,
+                                },
+                            );
 
                             if app.connected {
-                                let variant_opt =
-                                    app.active_connection.as_ref().map(|c| c.protocol.clone());
-                                let result = match (&mut app.ftp_session, variant_opt) {
-                                    (Some(ftp), Some(Protocol::Ftp)) => {
-                                        ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
-                                    }
-                                    (Some(ftp), Some(Protocol::Ftps)) => {
-                                        ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
-                                    }
-                                    (Some(_), _) => {
+                                let path = app.remote_cwd.clone();
+                                match list_remote(app, session, &path).await {
+                                    Ok(entries) => {
                                         reduce(
                                             app,
-                                            Action::SetStatus("Unknown FTP variant".to_string()),
+                                            Action::SetRemoteEntries {
+                                                entries,
+                                                select: SelectPolicy::PreserveName,
+                                            },
                                         );
-                                        Ok(Vec::new())
-                                    }
-                                    (None, _) => session.list_dir(&app.remote_cwd).await,
-                                };
-                                match result {
-                                    Ok(entries) if !entries.is_empty() => {
-                                        reduce(app, Action::SetRemoteEntries(entries));
                                         reduce(
                                             app,
                                             Action::SetStatus(
@@ -712,7 +707,6 @@ async fn run(
                                             ),
                                         );
                                     }
-                                    Ok(_) => {}
                                     Err(err) => {
                                         reduce(
                                             app,
@@ -777,7 +771,7 @@ async fn run(
                                 | Some(Region::Scrollbar(ScrollRegion::ListLocal))
                                     if !app.any_modal_open() =>
                                 {
-                                    app.focus = FocusPane::Local;
+                                    app.set_focus(FocusPane::Local);
                                     for _ in 0..SCROLL_STEP {
                                         reduce(
                                             app,
@@ -793,7 +787,7 @@ async fn run(
                                 | Some(Region::Scrollbar(ScrollRegion::ListRemote))
                                     if !app.any_modal_open() =>
                                 {
-                                    app.focus = FocusPane::Remote;
+                                    app.set_focus(FocusPane::Remote);
                                     for _ in 0..SCROLL_STEP {
                                         reduce(
                                             app,
@@ -834,20 +828,20 @@ async fn run(
                             last_click = Some((mx, my, now));
                             match hit_test(&app_layout, mx, my) {
                                 Some(Region::List(pane)) if !app.any_modal_open() => {
-                                    app.focus = match pane {
+                                    app.set_focus(match pane {
                                         Pane::Local => FocusPane::Local,
                                         Pane::Remote => FocusPane::Remote,
-                                    };
+                                    });
                                     let (list_rect, offset, len) = match pane {
                                         Pane::Local => (
                                             app_layout.local_list,
                                             app_layout.local_list_offset,
-                                            app.local_entries.len(),
+                                            app.visible_local().len(),
                                         ),
                                         Pane::Remote => (
                                             app_layout.remote_list,
                                             app_layout.remote_list_offset,
-                                            app.remote_entries.len(),
+                                            app.visible_remote().len(),
                                         ),
                                     };
                                     let content_top = list_rect.y + 1; // top border
@@ -863,15 +857,13 @@ async fn run(
                                                 last_click = None;
                                                 let is_dir = match pane {
                                                     Pane::Local => app
-                                                        .local_entries
-                                                        .get(idx)
+                                                        .selected_local_entry()
                                                         .is_some_and(|e| {
                                                             e.kind
                                                                 == dd_ftp_core::EntryKind::Directory
                                                         }),
                                                     Pane::Remote => app
-                                                        .remote_entries
-                                                        .get(idx)
+                                                        .selected_remote_entry()
                                                         .is_some_and(|e| {
                                                             e.kind
                                                                 == dd_ftp_core::EntryKind::Directory
@@ -1030,11 +1022,11 @@ fn apply_scrollbar_drag(
     let frac = rel as f32 / denom;
     match sr {
         ScrollRegion::ListLocal => {
-            let n = app.local_entries.len().saturating_sub(1);
+            let n = app.visible_local().len().saturating_sub(1);
             app.selected_local = (frac * n as f32).round() as usize;
         }
         ScrollRegion::ListRemote => {
-            let n = app.remote_entries.len().saturating_sub(1);
+            let n = app.visible_remote().len().saturating_sub(1);
             app.selected_remote = (frac * n as f32).round() as usize;
         }
         ScrollRegion::Queue => {
@@ -1054,10 +1046,16 @@ fn apply_scrollbar_drag(
 async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) {
     match app.focus {
         dd_ftp_app::FocusPane::Local => {
-            if let Some(entry) = app.local_entries.get(app.selected_local).cloned() {
+            if let Some(entry) = app.selected_local_entry().cloned() {
                 if entry.kind == dd_ftp_core::EntryKind::Directory {
                     app.local_cwd = entry.path;
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::Reset,
+                        },
+                    );
                     reduce(
                         app,
                         Action::SetStatus(format!("Local cwd: {}", app.local_cwd)),
@@ -1071,26 +1069,19 @@ async fn navigate_into_directory(app: &mut AppState, session: &mut SftpSession) 
                 return;
             }
 
-            if let Some(entry) = app.remote_entries.get(app.selected_remote).cloned() {
+            if let Some(entry) = app.selected_remote_entry().cloned() {
                 if entry.kind == dd_ftp_core::EntryKind::Directory {
                     app.remote_cwd = join_remote_path(&app.remote_cwd, &entry.name);
-                    let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
-                    let result = match (&mut app.ftp_session, variant_opt) {
-                        (Some(ftp), Some(Protocol::Ftp)) => {
-                            ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
-                        }
-                        (Some(ftp), Some(Protocol::Ftps)) => {
-                            ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
-                        }
-                        (Some(_), _) => {
-                            reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
-                            Ok(Vec::new())
-                        }
-                        (None, _) => session.list_dir(&app.remote_cwd).await,
-                    };
-                    match result {
+                    let path = app.remote_cwd.clone();
+                    match list_remote(app, session, &path).await {
                         Ok(entries) => {
-                            reduce(app, Action::SetRemoteEntries(entries));
+                            reduce(
+                                app,
+                                Action::SetRemoteEntries {
+                                    entries,
+                                    select: SelectPolicy::Reset,
+                                },
+                            );
                             reduce(
                                 app,
                                 Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)),
@@ -1125,7 +1116,13 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
                 .unwrap_or_else(|| app.local_cwd.clone());
 
             app.local_cwd = parent;
-            app.local_entries = local_list(&app.local_cwd);
+            reduce(
+                app,
+                Action::SetLocalEntries {
+                    entries: local_list(&app.local_cwd),
+                    select: SelectPolicy::Reset,
+                },
+            );
             reduce(
                 app,
                 Action::SetStatus(format!("Local cwd: {}", app.local_cwd)),
@@ -1138,23 +1135,16 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
             }
 
             app.remote_cwd = parent_remote_path(&app.remote_cwd);
-            let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
-            let result = match (&mut app.ftp_session, variant_opt) {
-                (Some(ftp), Some(Protocol::Ftp)) => {
-                    ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await
-                }
-                (Some(ftp), Some(Protocol::Ftps)) => {
-                    ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await
-                }
-                (Some(_), _) => {
-                    reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
-                    Ok(Vec::new())
-                }
-                (None, _) => session.list_dir(&app.remote_cwd).await,
-            };
-            match result {
+            let path = app.remote_cwd.clone();
+            match list_remote(app, session, &path).await {
                 Ok(entries) => {
-                    reduce(app, Action::SetRemoteEntries(entries));
+                    reduce(
+                        app,
+                        Action::SetRemoteEntries {
+                            entries,
+                            select: SelectPolicy::Reset,
+                        },
+                    );
                     reduce(
                         app,
                         Action::SetStatus(format!("Remote cwd: {}", app.remote_cwd)),
@@ -1172,16 +1162,33 @@ async fn navigate_parent_directory(app: &mut AppState, session: &mut SftpSession
     }
 }
 
-async fn relist_remote(app: &mut AppState, session: &mut SftpSession) {
+async fn list_remote(
+    app: &mut AppState,
+    session: &mut SftpSession,
+    path: &str,
+) -> Result<Vec<FileEntry>> {
     let variant_opt = app.active_connection.as_ref().map(|c| c.protocol.clone());
-    let result = match (&mut app.ftp_session, variant_opt) {
-        (Some(ftp), Some(Protocol::Ftp)) => ftp.list_dir(FtpVariant::Ftp, &app.remote_cwd).await,
-        (Some(ftp), Some(Protocol::Ftps)) => ftp.list_dir(FtpVariant::Ftps, &app.remote_cwd).await,
-        (Some(_), _) => Ok(Vec::new()),
-        (None, _) => session.list_dir(&app.remote_cwd).await,
-    };
-    if let Ok(entries) = result {
-        reduce(app, Action::SetRemoteEntries(entries));
+    match (&mut app.ftp_session, variant_opt) {
+        (Some(ftp), Some(Protocol::Ftp)) => ftp.list_dir(FtpVariant::Ftp, path).await,
+        (Some(ftp), Some(Protocol::Ftps)) => ftp.list_dir(FtpVariant::Ftps, path).await,
+        (Some(_), _) => {
+            reduce(app, Action::SetStatus("Unknown FTP variant".to_string()));
+            Ok(Vec::new())
+        }
+        (None, _) => session.list_dir(path).await,
+    }
+}
+
+async fn relist_remote(app: &mut AppState, session: &mut SftpSession) {
+    let path = app.remote_cwd.clone();
+    if let Ok(entries) = list_remote(app, session, &path).await {
+        reduce(
+            app,
+            Action::SetRemoteEntries {
+                entries,
+                select: SelectPolicy::PreserveName,
+            },
+        );
     }
 }
 
@@ -1231,10 +1238,23 @@ async fn handle_worker_result(
             reduce(app, Action::MarkTransferCompleted(msg.job));
             reduce(app, Action::SetStatus(format!("{name} complete")));
 
-            app.local_entries = local_list(&app.local_cwd);
+            reduce(
+                app,
+                Action::SetLocalEntries {
+                    entries: local_list(&app.local_cwd),
+                    select: SelectPolicy::PreserveName,
+                },
+            );
             if app.connected {
-                if let Ok(entries) = session.list_dir(&app.remote_cwd).await {
-                    reduce(app, Action::SetRemoteEntries(entries));
+                let path = app.remote_cwd.clone();
+                if let Ok(entries) = list_remote(app, session, &path).await {
+                    reduce(
+                        app,
+                        Action::SetRemoteEntries {
+                            entries,
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                 }
             }
         }
@@ -1310,7 +1330,13 @@ async fn connect_with_info(app: &mut AppState, session: &mut SftpSession, info: 
     match result {
         Ok(entries) => {
             reduce(app, Action::SetConnected(true));
-            reduce(app, Action::SetRemoteEntries(entries));
+            reduce(
+                app,
+                Action::SetRemoteEntries {
+                    entries,
+                    select: SelectPolicy::Reset,
+                },
+            );
             app.active_connection = Some(info.clone());
             reduce(
                 app,
@@ -1385,7 +1411,7 @@ fn queue_upload_selected(app: &mut AppState) {
         return;
     }
 
-    let selected = app.local_entries.get(app.selected_local).cloned();
+    let selected = app.selected_local_entry().cloned();
     if let Some(local) = selected {
         if local.kind == dd_ftp_core::EntryKind::Directory {
             reduce(
@@ -1407,7 +1433,7 @@ fn queue_download_selected(app: &mut AppState) {
         return;
     }
 
-    let selected = app.remote_entries.get(app.selected_remote).cloned();
+    let selected = app.selected_remote_entry().cloned();
     if let Some(remote) = selected {
         if remote.kind == dd_ftp_core::EntryKind::Directory {
             reduce(
@@ -1418,7 +1444,8 @@ fn queue_download_selected(app: &mut AppState) {
         }
 
         let local_target = format!("{}/{}", app.local_cwd.trim_end_matches('/'), remote.name);
-        let job = TransferJob::new(local_target, remote.path, TransferDirection::Download);
+        let remote_path = join_remote_path(&app.remote_cwd, &remote.name);
+        let job = TransferJob::new(local_target, remote_path, TransferDirection::Download);
         reduce(app, Action::QueueTransfer(job));
     }
 }
@@ -1778,8 +1805,8 @@ fn local_list(path: &str) -> Vec<FileEntry> {
 
 fn get_selected_entry(app: &AppState) -> Option<dd_ftp_core::FileEntry> {
     match app.focus {
-        dd_ftp_app::FocusPane::Local => app.local_entries.get(app.selected_local).cloned(),
-        dd_ftp_app::FocusPane::Remote => app.remote_entries.get(app.selected_remote).cloned(),
+        dd_ftp_app::FocusPane::Local => app.selected_local_entry().cloned(),
+        dd_ftp_app::FocusPane::Remote => app.selected_remote_entry().cloned(),
         _ => None,
     }
 }
@@ -1810,7 +1837,13 @@ async fn create_file(app: &mut AppState, session: &mut SftpSession, name: &str) 
             let path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), name);
             match std::fs::File::create(&path) {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Created file: {}", name)));
                 }
                 Err(err) => {
@@ -1887,7 +1920,13 @@ async fn create_folder(app: &mut AppState, session: &mut SftpSession, name: &str
             let path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), name);
             match std::fs::create_dir(&path) {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Created folder: {}", name)));
                 }
                 Err(err) => {
@@ -1947,7 +1986,13 @@ async fn rename_item(app: &mut AppState, session: &mut SftpSession, target: &str
             let new_path = format!("{}/{}", app.local_cwd.trim_end_matches('/'), new_name);
             match std::fs::rename(target, &new_path) {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Renamed to: {}", new_name)));
                 }
                 Err(err) => {
@@ -1961,7 +2006,7 @@ async fn rename_item(app: &mut AppState, session: &mut SftpSession, target: &str
                 return;
             }
 
-            let old_name = match app.remote_entries.get(app.selected_remote) {
+            let old_name = match app.selected_remote_entry() {
                 Some(e) => e.name.clone(),
                 None => {
                     reduce(app, Action::SetStatus("No item selected".to_string()));
@@ -2002,13 +2047,11 @@ async fn rename_item(app: &mut AppState, session: &mut SftpSession, target: &str
 async fn delete_item(app: &mut AppState, session: &mut SftpSession, target: &str) {
     let is_dir = match app.focus {
         dd_ftp_app::FocusPane::Local => app
-            .local_entries
-            .get(app.selected_local)
+            .selected_local_entry()
             .map(|e| e.kind == dd_ftp_core::EntryKind::Directory)
             .unwrap_or(false),
         dd_ftp_app::FocusPane::Remote => app
-            .remote_entries
-            .get(app.selected_remote)
+            .selected_remote_entry()
             .map(|e| e.kind == dd_ftp_core::EntryKind::Directory)
             .unwrap_or(false),
         _ => false,
@@ -2039,7 +2082,13 @@ async fn delete_item(app: &mut AppState, session: &mut SftpSession, target: &str
             };
             match result {
                 Ok(_) => {
-                    app.local_entries = local_list(&app.local_cwd);
+                    reduce(
+                        app,
+                        Action::SetLocalEntries {
+                            entries: local_list(&app.local_cwd),
+                            select: SelectPolicy::PreserveName,
+                        },
+                    );
                     reduce(app, Action::SetStatus(format!("Deleted: {}", target_str)));
                 }
                 Err(err) => {
@@ -2056,7 +2105,7 @@ async fn delete_item(app: &mut AppState, session: &mut SftpSession, target: &str
                 return;
             }
 
-            let name = match app.remote_entries.get(app.selected_remote) {
+            let name = match app.selected_remote_entry() {
                 Some(e) => e.name.clone(),
                 None => {
                     reduce(app, Action::SetStatus("No item selected".to_string()));
@@ -2145,5 +2194,45 @@ mod connect_info_tests {
         let info = quick_connect_info(&mut app);
         assert_eq!(info.host, "form.example");
         assert_eq!(info.username, "formuser");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn join_remote_path_joins_base_and_name() {
+        assert_eq!(join_remote_path("/pub", "file.bin"), "/pub/file.bin");
+        assert_eq!(join_remote_path("/", "file.bin"), "/file.bin");
+    }
+
+    #[test]
+    fn download_jobs_must_not_contain_a_list_line_path() {
+        let mut app = AppState {
+            connected: true,
+            local_cwd: "/tmp".into(),
+            remote_cwd: "/pub".into(),
+            remote_entries: vec![FileEntry {
+                name: "file.bin".into(),
+                path: "-rw-r--r-- 1 user group 123 Jan 01 file.bin".into(),
+                kind: dd_ftp_core::EntryKind::File,
+                size: 123,
+                modified: None,
+                permissions: None,
+            }],
+            selected_remote: 0,
+            ..Default::default()
+        };
+
+        queue_download_selected(&mut app);
+
+        let job = app.queue.pending.first().expect("download job queued");
+        assert_eq!(job.remote_path, "/pub/file.bin");
+        assert!(
+            !job.remote_path.contains("-rw-"),
+            "download remote_path must not be a LIST line, got {}",
+            job.remote_path
+        );
     }
 }

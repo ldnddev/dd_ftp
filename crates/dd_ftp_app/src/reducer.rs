@@ -1,8 +1,51 @@
 use crate::{
-    Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField, TextField,
-    TextPromptKind, Toast,
+    Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField, SelectPolicy,
+    TextField, TextPromptKind, Toast,
 };
-use dd_ftp_core::Protocol;
+use dd_ftp_core::{FileEntry, Protocol};
+
+fn resolve_select(
+    current: usize,
+    visible: &[&FileEntry],
+    previous_name: Option<&str>,
+    policy: SelectPolicy,
+) -> usize {
+    let last = visible.len().saturating_sub(1);
+    match policy {
+        SelectPolicy::Reset => 0,
+        SelectPolicy::Clamp => current.min(last),
+        SelectPolicy::PreserveName => previous_name
+            .and_then(|name| visible.iter().position(|e| e.name == name))
+            .unwrap_or(current.min(last)),
+    }
+}
+
+fn preserve_filter_selection(
+    state: &mut AppState,
+    local_name: Option<String>,
+    remote_name: Option<String>,
+) {
+    let idx = {
+        let visible = state.visible_local();
+        resolve_select(
+            state.selected_local,
+            &visible,
+            local_name.as_deref(),
+            SelectPolicy::PreserveName,
+        )
+    };
+    state.selected_local = idx;
+    let idx = {
+        let visible = state.visible_remote();
+        resolve_select(
+            state.selected_remote,
+            &visible,
+            remote_name.as_deref(),
+            SelectPolicy::PreserveName,
+        )
+    };
+    state.selected_remote = idx;
+}
 
 pub fn reduce(state: &mut AppState, action: Action) {
     match action {
@@ -21,13 +64,33 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 "Disconnected".to_string()
             };
         }
-        Action::SetLocalEntries(entries) => {
+        Action::SetLocalEntries { entries, select } => {
+            let previous_name = state.selected_local_entry().map(|e| e.name.clone());
             state.local_entries = entries;
-            state.selected_local = 0;
+            let idx = {
+                let visible = state.visible_local();
+                resolve_select(
+                    state.selected_local,
+                    &visible,
+                    previous_name.as_deref(),
+                    select,
+                )
+            };
+            state.selected_local = idx;
         }
-        Action::SetRemoteEntries(entries) => {
+        Action::SetRemoteEntries { entries, select } => {
+            let previous_name = state.selected_remote_entry().map(|e| e.name.clone());
             state.remote_entries = entries;
-            state.selected_remote = 0;
+            let idx = {
+                let visible = state.visible_remote();
+                resolve_select(
+                    state.selected_remote,
+                    &visible,
+                    previous_name.as_deref(),
+                    select,
+                )
+            };
+            state.selected_remote = idx;
         }
         Action::SetBookmarks(bookmarks) => {
             state.bookmarks = bookmarks;
@@ -188,11 +251,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.toast = None;
         }
         Action::FocusNextPane => {
-            state.focus = match state.focus {
+            let next = match state.focus {
                 FocusPane::Local => FocusPane::Remote,
                 FocusPane::Remote => FocusPane::Queue,
                 FocusPane::Queue => FocusPane::Local,
             };
+            state.set_focus(next);
         }
         Action::ToggleHelp => {
             state.show_help = !state.show_help;
@@ -221,31 +285,43 @@ pub fn reduce(state: &mut AppState, action: Action) {
         },
         Action::SelectDown => match state.focus {
             FocusPane::Local => {
-                if state.selected_local < state.local_entries.len().saturating_sub(1) {
+                if state.selected_local < state.visible_local().len().saturating_sub(1) {
                     state.selected_local += 1;
                 }
             }
             FocusPane::Remote => {
-                if state.selected_remote < state.remote_entries.len().saturating_sub(1) {
+                if state.selected_remote < state.visible_remote().len().saturating_sub(1) {
                     state.selected_remote += 1;
                 }
             }
             FocusPane::Queue => {}
         },
         Action::ToggleFilter => {
+            let local_name = state.selected_local_entry().map(|e| e.name.clone());
+            let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
             state.show_filter = !state.show_filter;
             if !state.show_filter {
                 state.filter_pattern.clear();
             }
+            preserve_filter_selection(state, local_name, remote_name);
         }
         Action::FilterInput(ch) => {
+            let local_name = state.selected_local_entry().map(|e| e.name.clone());
+            let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
             state.filter_pattern.push(ch);
+            preserve_filter_selection(state, local_name, remote_name);
         }
         Action::FilterBackspace => {
+            let local_name = state.selected_local_entry().map(|e| e.name.clone());
+            let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
             state.filter_pattern.pop();
+            preserve_filter_selection(state, local_name, remote_name);
         }
         Action::ClearFilter => {
+            let local_name = state.selected_local_entry().map(|e| e.name.clone());
+            let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
             state.filter_pattern.clear();
+            preserve_filter_selection(state, local_name, remote_name);
         }
         Action::ToggleCompare => {
             state.show_compare = !state.show_compare;
@@ -453,5 +529,109 @@ mod overlay_tests {
         reduce(&mut s, Action::ToggleThemeDebug);
         assert!(s.show_theme_debug);
         assert!(!s.show_help);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::{AppState, SelectPolicy};
+    use dd_ftp_core::{EntryKind, FileEntry};
+
+    fn fe(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: name.to_string(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    #[test]
+    fn select_down_does_not_walk_into_filtered_out_rows() {
+        let mut s = AppState {
+            local_entries: vec![fe("foo"), fe("skip"), fe("food")],
+            filter_pattern: "foo".into(),
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::SelectDown);
+        assert_eq!(s.selected_local, 1);
+        assert_eq!(s.selected_local_entry().unwrap().name, "food");
+        reduce(&mut s, Action::SelectDown);
+        assert_eq!(s.selected_local, 1);
+        assert_eq!(s.selected_local_entry().unwrap().name, "food");
+    }
+
+    #[test]
+    fn set_remote_entries_reset_selects_index_zero() {
+        let mut s = AppState {
+            remote_entries: vec![fe("old")],
+            selected_remote: 0,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::SetRemoteEntries {
+                entries: vec![fe("a"), fe("b"), fe("c")],
+                select: SelectPolicy::Reset,
+            },
+        );
+        assert_eq!(s.selected_remote, 0);
+        assert_eq!(s.selected_remote_entry().unwrap().name, "a");
+    }
+
+    #[test]
+    fn set_remote_entries_preserve_name_keeps_row_when_refresh_prepends() {
+        let mut s = AppState {
+            remote_entries: vec![fe("keep"), fe("z")],
+            selected_remote: 0,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::SetRemoteEntries {
+                entries: vec![fe("new"), fe("keep"), fe("z")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert_eq!(s.selected_remote, 1);
+        assert_eq!(s.selected_remote_entry().unwrap().name, "keep");
+    }
+
+    #[test]
+    fn focus_next_pane_remembers_last_file_pane_across_queue() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::FocusNextPane);
+        assert_eq!(s.focus, FocusPane::Remote);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+        reduce(&mut s, Action::FocusNextPane);
+        assert_eq!(s.focus, FocusPane::Queue);
+        assert_eq!(s.last_file_pane, FocusPane::Remote);
+        assert_eq!(s.filter_count_pane(), FocusPane::Remote);
+        reduce(&mut s, Action::FocusNextPane);
+        assert_eq!(s.focus, FocusPane::Local);
+        assert_eq!(s.last_file_pane, FocusPane::Local);
+    }
+
+    #[test]
+    fn set_local_entries_preserve_name_clamps_when_row_vanishes() {
+        let mut s = AppState {
+            local_entries: vec![fe("keep"), fe("gone")],
+            selected_local: 1,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::SetLocalEntries {
+                entries: vec![fe("keep")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert_eq!(s.selected_local, 0);
+        assert_eq!(s.selected_local_entry().unwrap().name, "keep");
     }
 }

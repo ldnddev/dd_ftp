@@ -183,6 +183,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.status = "Loaded bookmark into quick connect".to_string();
         }
         Action::QueueTransfer(job) => {
+            state.worker_cancel_requested = false;
             state.queue.enqueue(job);
             state.status = format!("Queue: {} pending", state.queue.pending.len());
         }
@@ -218,6 +219,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             );
         }
         Action::RetryLastFailed => {
+            state.worker_cancel_requested = false;
             if state.queue.retry_last_failed().is_some() {
                 state.status = format!(
                     "Requeued last failed transfer. Pending: {}",
@@ -239,6 +241,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ClearPendingTransfers => {
             let removed = state.queue.clear_pending();
             state.status = format!("Cleared {removed} pending transfer(s)");
+        }
+        Action::SetWorkerView {
+            active_count,
+            running,
+            cancel_requested,
+        } => {
+            state.worker_active_count = active_count;
+            state.worker_running = running;
+            state.worker_cancel_requested = cancel_requested;
         }
         Action::SetStatus(msg) => {
             state.status = msg;
@@ -758,5 +769,78 @@ mod selection_tests {
         );
         assert_eq!(s.selected_local, 0);
         assert_eq!(s.selected_local_entry().unwrap().name, "keep");
+    }
+}
+
+#[cfg(test)]
+mod worker_flag_tests {
+    use super::*;
+    use crate::AppState;
+    use dd_ftp_core::{TransferDirection, TransferJob};
+
+    #[test]
+    fn queue_transfer_clears_worker_cancel_requested() {
+        let mut s = AppState {
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::QueueTransfer(TransferJob::new(
+                "/tmp/a",
+                "/pub/a",
+                TransferDirection::Upload,
+            )),
+        );
+        assert!(!s.worker_cancel_requested);
+        assert_eq!(s.queue.pending.len(), 1);
+    }
+
+    #[test]
+    fn retry_last_failed_clears_worker_cancel_requested() {
+        let mut s = AppState {
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        s.queue.mark_failed(TransferJob::new(
+            "/tmp/a",
+            "/pub/a",
+            TransferDirection::Upload,
+        ));
+        reduce(&mut s, Action::RetryLastFailed);
+        assert!(!s.worker_cancel_requested);
+        assert_eq!(s.queue.pending.len(), 1);
+    }
+
+    #[test]
+    fn set_connected_true_does_not_clear_worker_cancel_requested() {
+        let mut s = AppState {
+            worker_cancel_requested: true,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::SetConnected(true));
+        assert!(s.connected);
+        assert!(s.worker_cancel_requested);
+    }
+
+    #[test]
+    fn set_worker_view_zeros_and_sets_cancel() {
+        let mut s = AppState {
+            worker_active_count: 2,
+            worker_running: true,
+            worker_cancel_requested: false,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::SetWorkerView {
+                active_count: 0,
+                running: false,
+                cancel_requested: true,
+            },
+        );
+        assert_eq!(s.worker_active_count, 0);
+        assert!(!s.worker_running);
+        assert!(s.worker_cancel_requested);
     }
 }

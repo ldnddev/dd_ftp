@@ -1,13 +1,24 @@
-use std::convert::TryFrom;
-use std::time::Duration;
+use std::{
+    convert::TryFrom,
+    io,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, TransferJob};
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_rustls::rustls::{client::ServerName, ClientConfig, OwnedTrustAnchor, RootCertStore};
+use uuid::Uuid;
 
 const FTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const TRANSFER_CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub enum FtpVariant {
@@ -173,86 +184,198 @@ impl UnifiedFtpSession {
     }
 
     pub async fn upload(&mut self, _variant: FtpVariant, job: &TransferJob) -> Result<()> {
+        self.upload_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
+            .await
+    }
+
+    pub async fn download(&mut self, _variant: FtpVariant, job: &TransferJob) -> Result<()> {
+        self.download_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
+            .await
+    }
+
+    pub async fn upload_with_progress<F>(
+        &mut self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: Fn(Uuid, u64, Option<u64>) + Send + Sync + 'static,
+    {
         let stream = self.stream.as_mut().context("not connected")?;
+        cwd_to_remote_parent(stream, job).await;
 
-        let remote_path = std::path::Path::new(&job.remote_path);
-        if let Some(parent) = remote_path.parent() {
-            if parent.as_os_str() != "" {
-                stream.cwd(parent.to_string_lossy().as_ref()).await.ok();
-            }
-        }
-
-        let remote_name = Self::remote_name_from_job(job);
-        let mut local_file = tokio::fs::File::open(&job.local_path)
+        let remote_name = remote_name_from_job(job);
+        let size = transfer_size(stream, job, &remote_name).await;
+        let local_file = tokio::fs::File::open(&job.local_path)
             .await
             .with_context(|| format!("FTP upload open failed: {}", job.local_path))?;
 
-        stream
-            .put(&remote_name, &mut local_file)
-            .await
-            .with_context(|| format!("FTP upload failed to {}", job.remote_path))?;
-
-        Ok(())
-    }
-
-    pub async fn download(&mut self, variant: FtpVariant, job: &TransferJob) -> Result<()> {
-        let stream = self.stream.as_mut().context("not connected")?;
-
-        let remote_path = std::path::Path::new(&job.remote_path);
-        if let Some(parent) = remote_path.parent() {
-            if parent.as_os_str() != "" {
-                stream.cwd(parent.to_string_lossy().as_ref()).await.ok();
-            }
-        }
-
-        let remote_name = Self::remote_name_from_job(job);
-        let bytes = match variant {
-            FtpVariant::Ftp => stream
-                .simple_retr(&remote_name)
-                .await
-                .with_context(|| format!("FTP download failed from {}", job.remote_path))?
-                .into_inner(),
-            FtpVariant::Ftps => stream
-                .retr(
-                    &remote_name,
-                    |mut reader: BufReader<async_ftp::DataStream>| async move {
-                        let mut buffer = Vec::new();
-                        reader
-                            .read_to_end(&mut buffer)
-                            .await
-                            .map_err(async_ftp::FtpError::ConnectionError)?;
-                        Ok::<Vec<u8>, anyhow::Error>(buffer)
-                    },
-                )
-                .await
-                .with_context(|| format!("FTPS download failed from {}", job.remote_path))?,
+        let mut reader = ProgressReader {
+            inner: local_file,
+            transferred: 0,
+            size,
+            job_id: job.id,
+            cancel,
+            on_progress: Arc::new(on_progress),
         };
 
-        Self::write_download_bytes(job, bytes).await?;
-        Ok(())
-    }
-
-    fn remote_name_from_job(job: &TransferJob) -> String {
-        let remote_path = std::path::Path::new(&job.remote_path);
-        remote_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| job.remote_path.clone())
-    }
-
-    async fn write_download_bytes(job: &TransferJob, bytes: Vec<u8>) -> Result<()> {
-        if let Some(parent) = std::path::Path::new(&job.local_path).parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Cannot create local parent dir: {}", parent.display()))?;
+        match stream.put(&remote_name, &mut reader).await {
+            Ok(()) => Ok(()),
+            Err(_) if reader.cancel.load(Ordering::Relaxed) => bail!("cancelled"),
+            Err(err) => {
+                Err(err).with_context(|| format!("FTP upload failed to {}", job.remote_path))
+            }
         }
-
-        tokio::fs::write(&job.local_path, &bytes)
-            .await
-            .with_context(|| format!("Cannot write local file: {}", job.local_path))?;
-
-        Ok(())
     }
+
+    pub async fn download_with_progress<F>(
+        &mut self,
+        job: &TransferJob,
+        cancel: Arc<AtomicBool>,
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: Fn(Uuid, u64, Option<u64>) + Send + Sync + 'static,
+    {
+        let stream = self.stream.as_mut().context("not connected")?;
+        cwd_to_remote_parent(stream, job).await;
+
+        let remote_name = remote_name_from_job(job);
+        let size = transfer_size(stream, job, &remote_name).await;
+        let local_path = job.local_path.clone();
+        let job_id = job.id;
+        let remote_path = job.remote_path.clone();
+        let on_progress = Arc::new(on_progress);
+
+        stream
+            .retr(&remote_name, move |mut reader| {
+                let cancel = Arc::clone(&cancel);
+                let on_progress = Arc::clone(&on_progress);
+                let local_path = local_path.clone();
+                async move {
+                    if let Some(parent) = std::path::Path::new(&local_path).parent() {
+                        tokio::fs::create_dir_all(parent).await.with_context(|| {
+                            format!("Cannot create local parent dir: {}", parent.display())
+                        })?;
+                    }
+                    let mut file = tokio::fs::File::create(&local_path)
+                        .await
+                        .with_context(|| format!("Cannot write local file: {local_path}"))?;
+                    copy_with_progress(
+                        &mut reader,
+                        &mut file,
+                        &cancel,
+                        size,
+                        job_id,
+                        on_progress.as_ref(),
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                }
+            })
+            .await
+            .with_context(|| format!("FTP download failed from {remote_path}"))
+    }
+}
+
+async fn cwd_to_remote_parent(stream: &mut async_ftp::FtpStream, job: &TransferJob) {
+    let remote_path = std::path::Path::new(&job.remote_path);
+    if let Some(parent) = remote_path.parent() {
+        if parent.as_os_str() != "" {
+            stream.cwd(parent.to_string_lossy().as_ref()).await.ok();
+        }
+    }
+}
+
+fn remote_name_from_job(job: &TransferJob) -> String {
+    let remote_path = std::path::Path::new(&job.remote_path);
+    remote_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| job.remote_path.clone())
+}
+
+async fn transfer_size(
+    stream: &mut async_ftp::FtpStream,
+    job: &TransferJob,
+    remote_name: &str,
+) -> Option<u64> {
+    if let Some(size) = job.size_bytes {
+        return Some(size);
+    }
+    stream
+        .size(remote_name)
+        .await
+        .ok()
+        .flatten()
+        .map(|n| n as u64)
+}
+
+struct ProgressReader<R, F> {
+    inner: R,
+    transferred: u64,
+    size: Option<u64>,
+    job_id: Uuid,
+    cancel: Arc<AtomicBool>,
+    on_progress: Arc<F>,
+}
+
+impl<R: AsyncRead + Unpin, F: Fn(Uuid, u64, Option<u64>)> AsyncRead for ProgressReader<R, F> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")));
+        }
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let n = buf.filled().len().saturating_sub(before);
+                if n > 0 {
+                    self.transferred = self.transferred.saturating_add(n as u64);
+                    let transferred = self.transferred;
+                    let size = self.size;
+                    let job_id = self.job_id;
+                    (self.on_progress)(job_id, transferred, size);
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+async fn copy_with_progress<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: &AtomicBool,
+    size: Option<u64>,
+    job_id: Uuid,
+    on_progress: &F,
+) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Fn(Uuid, u64, Option<u64>) + Send + Sync,
+{
+    let mut buf = vec![0_u8; TRANSFER_CHUNK];
+    let mut transferred = 0_u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("cancelled");
+        }
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).await?;
+        transferred = transferred.saturating_add(n as u64);
+        on_progress(job_id, transferred, size);
+    }
+    Ok(transferred)
 }
 
 fn parse_list_entries(base_path: &str, lines: Vec<String>) -> Vec<FileEntry> {
@@ -561,5 +684,90 @@ mod parse_list_tests {
         assert!(e.permissions.is_none());
         assert_eq!(e.path, join_ftp_path("/pub", &e.name));
         assert!(!e.path.contains("12:00PM") || e.name.contains("12:00PM"));
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::Mutex;
+
+    struct CancelAfter<R> {
+        inner: R,
+        cancel: Arc<AtomicBool>,
+        reads: u32,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for CancelAfter<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.reads += 1;
+            if self.reads > 1 {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_with_progress_reports_monotonic_transferred() {
+        let data = vec![7_u8; 200 * 1024];
+        let mut reader = Cursor::new(data.clone());
+        let mut writer = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        let n = copy_with_progress(
+            &mut reader,
+            &mut writer,
+            &cancel,
+            Some(data.len() as u64),
+            Uuid::nil(),
+            &move |_id, transferred, _size| {
+                seen_cb.lock().unwrap().push(transferred);
+            },
+        )
+        .await
+        .expect("copy");
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(writer.len(), data.len());
+        let prog = seen.lock().unwrap();
+        assert!(!prog.is_empty());
+        assert!(
+            prog.windows(2).all(|w| w[1] >= w[0]),
+            "transferred must be monotonic: {prog:?}"
+        );
+        assert_eq!(*prog.last().unwrap(), data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn copy_with_progress_cancel_mid_stream_errors_cancelled() {
+        let data = vec![1_u8; 200 * 1024];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut reader = CancelAfter {
+            inner: Cursor::new(data),
+            cancel: Arc::clone(&cancel),
+            reads: 0,
+        };
+        let mut writer = Vec::new();
+        let err = copy_with_progress(
+            &mut reader,
+            &mut writer,
+            &cancel,
+            Some(200 * 1024),
+            Uuid::nil(),
+            &|_id, _t, _s| {},
+        )
+        .await
+        .expect_err("cancel mid-stream");
+        assert!(
+            err.to_string().to_lowercase().contains("cancelled"),
+            "expected cancelled error, got {err}"
+        );
+        assert!(writer.len() < 200 * 1024);
     }
 }

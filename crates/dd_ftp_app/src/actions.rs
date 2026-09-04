@@ -47,6 +47,11 @@ pub enum Action {
         size_bytes: Option<u64>,
     },
     ClearPendingTransfers,
+    SetWorkerView {
+        active_count: usize,
+        running: bool,
+        cancel_requested: bool,
+    },
     SetStatus(String),
     ShowError(String),
     ClearError,

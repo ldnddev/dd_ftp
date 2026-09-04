@@ -829,25 +829,8 @@ pub(crate) fn connection_info_from_env() -> ConnectionInfo {
 }
 
 fn pane_entries_for_transfer(app: &AppState, pane: dd_ftp_app::FocusPane) -> Vec<FileEntry> {
-    let (entries, marks, selected) = match pane {
-        dd_ftp_app::FocusPane::Local => (
-            &app.local_entries,
-            &app.marked_local,
-            app.selected_local_entry().cloned(),
-        ),
-        dd_ftp_app::FocusPane::Remote => (
-            &app.remote_entries,
-            &app.marked_remote,
-            app.selected_remote_entry().cloned(),
-        ),
-        dd_ftp_app::FocusPane::Queue => return Vec::new(),
-    };
-    if marks.is_empty() {
-        return selected.into_iter().collect();
-    }
-    entries
-        .iter()
-        .filter(|e| marks.contains(&e.path) && e.name != "." && e.name != "..")
+    app.entries_for_transfer(pane)
+        .into_iter()
         .cloned()
         .collect()
 }
@@ -927,6 +910,10 @@ pub(crate) fn enqueue_entries(
     direction: TransferDirection,
 ) {
     if drain_busy(runtime) {
+        return;
+    }
+    if io_busy(runtime) {
+        reduce(app, Action::SetStatus("busy".to_string()));
         return;
     }
     let entries: Vec<FileEntry> = entries
@@ -2047,5 +2034,55 @@ mod scan_tests {
             job.remote_path
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enqueue_refuses_whole_set_when_io_busy() {
+        use dd_ftp_core::{EntryKind, FileEntry};
+        let mut app = AppState {
+            connected: true,
+            local_cwd: "/tmp".into(),
+            remote_cwd: "/pub".into(),
+            ..Default::default()
+        };
+        let (mut runtime, _rx) = test_runtime();
+        runtime.in_flight = Some(InFlight::Fs {
+            generation: 1,
+            kind: FsKind::Chmod,
+        });
+        let file = FileEntry {
+            name: "a.txt".into(),
+            path: "/tmp/a.txt".into(),
+            kind: EntryKind::File,
+            size: 1,
+            modified: None,
+            permissions: None,
+        };
+        let dir = FileEntry {
+            name: "d".into(),
+            path: "/tmp/d".into(),
+            kind: EntryKind::Directory,
+            size: 0,
+            modified: None,
+            permissions: None,
+        };
+        enqueue_entries(
+            &mut app,
+            &mut runtime,
+            vec![file, dir],
+            TransferDirection::Upload,
+        );
+        assert!(
+            runtime.pending_scan.is_empty(),
+            "must not push files when dirs cannot scan"
+        );
+        assert_eq!(app.status, "busy");
+        assert!(matches!(
+            runtime.in_flight,
+            Some(InFlight::Fs {
+                kind: FsKind::Chmod,
+                ..
+            })
+        ));
     }
 }

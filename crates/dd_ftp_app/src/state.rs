@@ -421,6 +421,33 @@ impl AppState {
         self.visible_remote().get(self.selected_remote).copied()
     }
 
+    /// Marked live rows for `u`/`d`/Enter. If no current listing path is marked,
+    /// fall back to the focused row (stale marks after rename/delete/refresh).
+    pub fn entries_for_transfer(&self, pane: FocusPane) -> Vec<&FileEntry> {
+        let (entries, marks, selected) = match pane {
+            FocusPane::Local => (
+                &self.local_entries,
+                &self.marked_local,
+                self.selected_local_entry(),
+            ),
+            FocusPane::Remote => (
+                &self.remote_entries,
+                &self.marked_remote,
+                self.selected_remote_entry(),
+            ),
+            FocusPane::Queue => return Vec::new(),
+        };
+        let live: Vec<&FileEntry> = entries
+            .iter()
+            .filter(|e| marks.contains(&e.path) && !is_dot_or_dotdot(&e.name))
+            .collect();
+        if live.is_empty() {
+            selected.into_iter().collect()
+        } else {
+            live
+        }
+    }
+
     pub fn set_focus(&mut self, pane: FocusPane) {
         if pane != FocusPane::Queue {
             self.last_file_pane = pane;
@@ -577,6 +604,37 @@ mod visible_tests {
         };
         let names: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn entries_for_transfer_falls_back_when_no_live_marked_path() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b")],
+            selected_local: 1,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        s.marked_local.insert("/gone".into());
+        let names: Vec<&str> = s
+            .entries_for_transfer(FocusPane::Local)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["b"],
+            "stale marks must fall back to focused row"
+        );
+
+        s.marked_local.clear();
+        s.marked_local.insert("a".into());
+        s.local_entries[0].path = "a".into();
+        let names: Vec<&str> = s
+            .entries_for_transfer(FocusPane::Local)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a"]);
     }
 
     #[test]

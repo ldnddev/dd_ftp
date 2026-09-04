@@ -69,6 +69,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.local_entries = entries;
             if select == SelectPolicy::Reset {
                 state.marked_local.clear();
+            } else {
+                state
+                    .marked_local
+                    .retain(|p| state.local_entries.iter().any(|e| &e.path == p));
             }
             let idx = {
                 let visible = state.visible_local();
@@ -86,6 +90,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.remote_entries = entries;
             if select == SelectPolicy::Reset {
                 state.marked_remote.clear();
+            } else {
+                state
+                    .marked_remote
+                    .retain(|p| state.remote_entries.iter().any(|e| &e.path == p));
             }
             let idx = {
                 let visible = state.visible_remote();
@@ -1322,6 +1330,43 @@ mod mark_sort_chmod_tests {
             },
         );
         assert!(s.marked_local.contains("/a"));
+    }
+
+    #[test]
+    fn set_entries_preserve_name_prunes_stale_marks() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleMark);
+        s.selected_local = 1;
+        reduce(&mut s, Action::ToggleMark);
+        assert!(s.marked_local.contains("/a"));
+        assert!(s.marked_local.contains("/b"));
+        reduce(
+            &mut s,
+            Action::SetLocalEntries {
+                entries: vec![fe("b"), fe("c")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert!(!s.marked_local.contains("/a"));
+        assert!(s.marked_local.contains("/b"));
+
+        s.remote_entries = vec![fe("r")];
+        s.selected_remote = 0;
+        s.focus = FocusPane::Remote;
+        reduce(&mut s, Action::ToggleMark);
+        reduce(
+            &mut s,
+            Action::SetRemoteEntries {
+                entries: vec![fe("other")],
+                select: SelectPolicy::PreserveName,
+            },
+        );
+        assert!(s.marked_remote.is_empty());
     }
 
     #[test]

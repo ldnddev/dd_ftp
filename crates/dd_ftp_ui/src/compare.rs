@@ -31,7 +31,8 @@ fn same_meta(a: &FileEntry, b: &FileEntry) -> bool {
     }
     match (a.modified, b.modified) {
         (None, None) => true,
-        (Some(x), Some(y)) => x == y,
+        // SFTP mtimes are whole seconds; local listings keep subseconds.
+        (Some(x), Some(y)) => x.timestamp() == y.timestamp(),
         _ => false,
     }
 }
@@ -83,6 +84,23 @@ mod tests {
         assert_eq!(
             classify_compare("a.txt", &local, &remote),
             Some(CompareBadge::Equal)
+        );
+    }
+
+    #[test]
+    fn mtime_compared_at_second_resolution() {
+        let mut local = fe("a.txt", 10, Some(100));
+        local.modified = Some(Utc.timestamp_opt(100, 250_000_000).unwrap());
+        let mut remote = fe("a.txt", 10, Some(100));
+        remote.modified = Some(Utc.timestamp_opt(100, 0).unwrap());
+        assert_eq!(
+            classify_compare("a.txt", &[local.clone()], &[remote]),
+            Some(CompareBadge::Equal)
+        );
+        let later = fe("a.txt", 10, Some(101));
+        assert_eq!(
+            classify_compare("a.txt", &[local], &[later]),
+            Some(CompareBadge::Differ)
         );
     }
 

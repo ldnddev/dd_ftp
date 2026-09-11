@@ -158,6 +158,11 @@ pub const KEYMAP: &[KeyBinding] = &[
         group: KeyGroup::Connection,
     },
     KeyBinding {
+        keys: "Ctrl+P (SSH Key)",
+        action: "Open SSH key file picker from the SSH Key field",
+        group: KeyGroup::Connection,
+    },
+    KeyBinding {
         keys: "u",
         action: "Queue upload (directories recurse; marked set or focused row)",
         group: KeyGroup::Transfers,

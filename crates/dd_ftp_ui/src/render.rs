@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use dd_ftp_app::{
-    is_dot_or_dotdot, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField,
-    TextPromptKind, ToastLevel,
+    is_dot_or_dotdot, is_public_key_name, AppState, ChoicePromptKind, FocusPane, PromptKind,
+    QuickConnectField, TextPromptKind, ToastLevel,
 };
 use dd_ftp_core::{Protocol, TransferJob};
 use dd_ftp_transfer::TransferQueue;
@@ -735,6 +735,17 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     Line::from(Span::styled(value.clone(), Style::default().fg(text_color)))
                 };
 
+                let cell = cols[col_idx];
+                let (input_area, browse_area) = if *field == QuickConnectField::PrivateKey {
+                    let split = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Min(8), Constraint::Length(10)])
+                        .split(cell);
+                    (split[0], Some(split[1]))
+                } else {
+                    (cell, None)
+                };
+
                 let input = Paragraph::new(input_content)
                     .style(Style::default().bg(t.modal_background))
                     .block(
@@ -747,32 +758,66 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                             .border_style(Style::default().fg(border_color)),
                     );
 
-                frame.render_widget(input, cols[col_idx]);
+                frame.render_widget(input, input_area);
 
-                let cell = cols[col_idx];
-                match field {
-                    QuickConnectField::Protocol => {
-                        map.controls.push(ControlRegion {
-                            id: ControlId::QcProtocol,
-                            area: cell,
-                        });
-                    }
-                    other => {
-                        let fid = match other {
-                            QuickConnectField::Name => FieldId::QcName,
-                            QuickConnectField::Host => FieldId::QcHost,
-                            QuickConnectField::Port => FieldId::QcPort,
-                            QuickConnectField::Username => FieldId::QcUsername,
-                            QuickConnectField::Password => FieldId::QcPassword,
-                            QuickConnectField::PrivateKey => FieldId::QcPrivateKey,
-                            QuickConnectField::Path => FieldId::QcPath,
-                            QuickConnectField::Protocol => unreachable!(),
-                        };
-                        map.fields.push(FieldRegion {
-                            id: fid,
-                            area: cell,
-                            text_x: cell.x + 1,
-                        });
+                if let Some(browse) = browse_area {
+                    let browse_widget = Paragraph::new(Line::from(Span::styled(
+                        "…",
+                        Style::default().fg(t.modal_text),
+                    )))
+                    .alignment(Alignment::Center)
+                    .style(Style::default().bg(t.modal_background))
+                    .block(
+                        Block::default()
+                            .title(Line::from(vec![Span::styled(
+                                " Browse ",
+                                Style::default().fg(t.text_labels_active),
+                            )]))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(t.input_border_default)),
+                    );
+                    frame.render_widget(browse_widget, browse);
+                }
+
+                if !app.show_key_picker {
+                    match field {
+                        QuickConnectField::Protocol => {
+                            map.controls.push(ControlRegion {
+                                id: ControlId::QcProtocol,
+                                area: cell,
+                            });
+                        }
+                        QuickConnectField::PrivateKey => {
+                            map.fields.push(FieldRegion {
+                                id: FieldId::QcPrivateKey,
+                                area: input_area,
+                                text_x: input_area.x + 1,
+                            });
+                            if let Some(browse) = browse_area {
+                                map.controls.push(ControlRegion {
+                                    id: ControlId::QcBrowseKey,
+                                    area: browse,
+                                });
+                            }
+                        }
+                        other => {
+                            let fid = match other {
+                                QuickConnectField::Name => FieldId::QcName,
+                                QuickConnectField::Host => FieldId::QcHost,
+                                QuickConnectField::Port => FieldId::QcPort,
+                                QuickConnectField::Username => FieldId::QcUsername,
+                                QuickConnectField::Password => FieldId::QcPassword,
+                                QuickConnectField::Path => FieldId::QcPath,
+                                QuickConnectField::PrivateKey | QuickConnectField::Protocol => {
+                                    unreachable!()
+                                }
+                            };
+                            map.fields.push(FieldRegion {
+                                id: fid,
+                                area: cell,
+                                text_x: cell.x + 1,
+                            });
+                        }
                     }
                 }
             }
@@ -780,7 +825,106 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
 
         let footer = Paragraph::new(vec![
             Line::from("Tab/Shift+Tab move field | ←/→ protocol | Enter connect"),
-            Line::from("Ctrl+S save bookmark | Esc close"),
+            Line::from("Ctrl+S save bookmark | Ctrl+P browse key | Esc close"),
+        ])
+        .style(Style::default().fg(t.modal_text).bg(t.modal_background));
+        frame.render_widget(footer, chunks[2]);
+    }
+
+    if app.show_key_picker {
+        let area = centered_rect(70, 65, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(t.modal_background)),
+            area,
+        );
+
+        let outer = Block::default()
+            .title(Line::from(vec![Span::styled(
+                " SSH Key ",
+                Style::default()
+                    .fg(t.modal_labels)
+                    .add_modifier(Modifier::BOLD),
+            )]))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.border_active));
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(5),
+                Constraint::Length(3),
+            ])
+            .split(inner);
+
+        let cwd = Paragraph::new(shorten_middle(&app.key_picker_cwd, 70))
+            .style(Style::default().fg(t.modal_labels).bg(t.modal_background));
+        frame.render_widget(cwd, chunks[0]);
+
+        let visible = app.visible_key_picker();
+        let visible_len = visible.len();
+        let items: Vec<ListItem> = visible
+            .into_iter()
+            .map(|e| {
+                let mut color = match e.kind {
+                    dd_ftp_core::EntryKind::Directory => t.folder,
+                    dd_ftp_core::EntryKind::Symlink => t.link,
+                    _ => t.file,
+                };
+                if is_public_key_name(&e.name) {
+                    color = t.text_secondary;
+                }
+                let suffix = if e.is_dir() { "/" } else { "" };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{}{suffix}", e.name),
+                    Style::default().fg(color),
+                )))
+            })
+            .collect();
+
+        let list = List::new(items)
+            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.border_active)),
+            )
+            .highlight_symbol("▶ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(
+                Style::default()
+                    .bg(t.selected_background)
+                    .fg(t.text_active_focus)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(app.key_picker_selected));
+        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+        map.key_picker_list = chunks[1];
+        map.key_picker_list_offset = list_state.offset();
+        map.key_picker_scrollbar = Rect {
+            x: chunks[1].x + chunks[1].width.saturating_sub(1),
+            y: chunks[1].y,
+            width: 1,
+            height: chunks[1].height,
+        };
+        render_scrollbar(
+            frame,
+            chunks[1],
+            app.key_picker_selected,
+            visible_len,
+            t.scrollbar,
+            t.scrollbar_hover,
+            app.mouse_pos,
+        );
+
+        let footer = Paragraph::new(vec![
+            Line::from("j/k move | Enter open/select | l enter dir | h parent"),
+            Line::from("Esc cancel"),
         ])
         .style(Style::default().fg(t.modal_text).bg(t.modal_background));
         frame.render_widget(footer, chunks[2]);

@@ -21,6 +21,7 @@ pub enum FieldId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlId {
     QcProtocol,
+    QcBrowseKey,
     BookmarkRow(usize),
 }
 
@@ -30,6 +31,7 @@ pub enum ScrollRegion {
     ListRemote,
     Queue,
     Help,
+    KeyPicker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,7 @@ pub enum Region {
     Scrollbar(ScrollRegion),
     Field(FieldId),
     Control(ControlId),
+    KeyPickerList,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +70,9 @@ pub struct LayoutMap {
     pub controls: Vec<ControlRegion>,
     pub local_list_offset: usize,
     pub remote_list_offset: usize,
+    pub key_picker_list: Rect,
+    pub key_picker_scrollbar: Rect,
+    pub key_picker_list_offset: usize,
 }
 
 fn contains(r: Rect, x: u16, y: u16) -> bool {
@@ -76,6 +82,12 @@ fn contains(r: Rect, x: u16, y: u16) -> bool {
 /// Hit-test a point. Modal regions (fields, controls, help) win over the
 /// background lists so a wheel/click over an open modal never leaks through.
 pub fn hit_test(m: &LayoutMap, x: u16, y: u16) -> Option<Region> {
+    if contains(m.key_picker_scrollbar, x, y) {
+        return Some(Region::Scrollbar(ScrollRegion::KeyPicker));
+    }
+    if contains(m.key_picker_list, x, y) {
+        return Some(Region::KeyPickerList);
+    }
     for f in &m.fields {
         if contains(f.area, x, y) {
             return Some(Region::Field(f.id));
@@ -151,6 +163,24 @@ mod tests {
         assert_eq!(hit_test(&m, 2, 5), Some(Region::List(Pane::Local)));
         // point in nothing
         assert_eq!(hit_test(&m, 200, 200), None);
+    }
+
+    #[test]
+    fn hit_test_prefers_key_picker_over_qc_field() {
+        let mut m = LayoutMap {
+            key_picker_list: r(8, 8, 30, 12),
+            ..Default::default()
+        };
+        m.fields.push(FieldRegion {
+            id: FieldId::QcPrivateKey,
+            area: r(10, 22, 20, 3),
+            text_x: 11,
+        });
+        assert_eq!(hit_test(&m, 12, 10), Some(Region::KeyPickerList));
+        assert_eq!(
+            hit_test(&m, 12, 23),
+            Some(Region::Field(FieldId::QcPrivateKey))
+        );
     }
 
     #[test]

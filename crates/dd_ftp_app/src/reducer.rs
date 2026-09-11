@@ -1,6 +1,6 @@
 use crate::{
-    is_dot_or_dotdot, Action, AppState, ChoicePromptKind, FocusPane, PromptKind, QuickConnectField,
-    SelectPolicy, TextField, TextPromptKind, Toast,
+    is_dot_or_dotdot, is_public_key_name, Action, AppState, ChoicePromptKind, FocusPane,
+    PromptKind, QuickConnectField, SelectPolicy, TextField, TextPromptKind, Toast,
 };
 use dd_ftp_core::{FileEntry, Protocol};
 
@@ -18,6 +18,29 @@ fn resolve_select(
             .and_then(|name| visible.iter().position(|e| e.name == name))
             .unwrap_or(current.min(last)),
     }
+}
+
+fn close_key_picker(state: &mut AppState) {
+    state.show_key_picker = false;
+    state.key_picker_entries.clear();
+    state.key_picker_selected = 0;
+}
+
+fn key_picker_index(visible: &[&FileEntry], prefer: Option<&str>, prefer_ssh: bool) -> usize {
+    if let Some(name) = prefer {
+        if let Some(i) = visible.iter().position(|e| e.name == name) {
+            return i;
+        }
+    }
+    if prefer_ssh {
+        if let Some(i) = visible.iter().position(|e| e.name == ".ssh" && e.is_dir()) {
+            return i;
+        }
+    }
+    visible
+        .iter()
+        .position(|e| !is_dot_or_dotdot(&e.name))
+        .unwrap_or(0)
 }
 
 fn preserve_filter_selection(
@@ -138,12 +161,97 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.show_bookmarks = false;
                 state.quick_connect_field = QuickConnectField::Name;
                 state.qc_hydrate();
+            } else {
+                close_key_picker(state);
             }
         }
         Action::ToggleBookmarks => {
             state.show_bookmarks = !state.show_bookmarks;
             if state.show_bookmarks {
                 state.show_quick_connect = false;
+                close_key_picker(state);
+            }
+        }
+        Action::OpenKeyPicker {
+            cwd,
+            entries,
+            prefer,
+        } => {
+            state.show_key_picker = true;
+            state.key_picker_cwd = cwd;
+            state.key_picker_entries = entries;
+            let idx = {
+                let visible = state.visible_key_picker();
+                key_picker_index(&visible, prefer.as_deref(), true)
+            };
+            state.key_picker_selected = idx;
+            state.quick_connect_field = QuickConnectField::PrivateKey;
+            state.qc_hydrate();
+        }
+        Action::CloseKeyPicker => {
+            close_key_picker(state);
+        }
+        Action::SetKeyPickerEntries {
+            cwd,
+            entries,
+            select,
+            prefer,
+        } => {
+            let previous_name = state.selected_key_picker_entry().map(|e| e.name.clone());
+            state.key_picker_cwd = cwd;
+            state.key_picker_entries = entries;
+            let idx = {
+                let visible = state.visible_key_picker();
+                match select {
+                    SelectPolicy::PreserveName => resolve_select(
+                        state.key_picker_selected,
+                        &visible,
+                        previous_name.as_deref(),
+                        SelectPolicy::PreserveName,
+                    ),
+                    SelectPolicy::Clamp => resolve_select(
+                        state.key_picker_selected,
+                        &visible,
+                        None,
+                        SelectPolicy::Clamp,
+                    ),
+                    SelectPolicy::Reset => key_picker_index(&visible, prefer.as_deref(), false),
+                }
+            };
+            state.key_picker_selected = idx;
+        }
+        Action::KeyPickerSelectUp => {
+            if state.key_picker_selected > 0 {
+                state.key_picker_selected -= 1;
+            }
+        }
+        Action::KeyPickerSelectDown => {
+            let last = state.visible_key_picker().len().saturating_sub(1);
+            if state.key_picker_selected < last {
+                state.key_picker_selected += 1;
+            }
+        }
+        Action::KeyPickerSelectIndex(index) => {
+            let last = state.visible_key_picker().len().saturating_sub(1);
+            state.key_picker_selected = index.min(last);
+        }
+        Action::KeyPickerConfirm => {
+            let Some(entry) = state.selected_key_picker_entry().cloned() else {
+                return;
+            };
+            if is_dot_or_dotdot(&entry.name) || entry.is_dir() {
+                return;
+            }
+            let warn_pub = is_public_key_name(&entry.name);
+            state.quick_connect.private_key = Some(entry.path);
+            state.quick_connect_field = QuickConnectField::PrivateKey;
+            state.qc_hydrate();
+            close_key_picker(state);
+            if warn_pub {
+                state.toast = Some(Toast::warning(
+                    "This looks like a public key; SSH needs the private key (no .pub)."
+                        .to_string(),
+                ));
             }
         }
         Action::QuickConnectNextField => {
@@ -1423,5 +1531,268 @@ mod mark_sort_chmod_tests {
         assert!(!s.sort_asc);
         reduce(&mut s, Action::ToggleHideDotfiles);
         assert!(s.hide_dotfiles);
+    }
+}
+
+#[cfg(test)]
+mod key_picker_tests {
+    use super::*;
+    use crate::{is_public_key_name, AppState, QuickConnectField, SelectPolicy};
+    use dd_ftp_core::{EntryKind, FileEntry};
+
+    fn file(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: format!("/home/u/{name}"),
+            kind: EntryKind::File,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    fn dir(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: format!("/home/u/{name}"),
+            kind: EntryKind::Directory,
+            size: 0,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    fn listing() -> Vec<FileEntry> {
+        vec![
+            dir("."),
+            dir(".."),
+            dir(".ssh"),
+            file("id_ed25519"),
+            file("id_ed25519.pub"),
+            file(".bashrc"),
+        ]
+    }
+
+    #[test]
+    fn open_prefers_ssh_dir_when_no_name() {
+        let mut s = AppState {
+            show_quick_connect: true,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: None,
+            },
+        );
+        assert!(s.show_key_picker);
+        assert_eq!(s.quick_connect_field, QuickConnectField::PrivateKey);
+        assert_eq!(
+            s.selected_key_picker_entry().map(|e| e.name.as_str()),
+            Some(".ssh")
+        );
+    }
+
+    #[test]
+    fn open_prefers_existing_key_name() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: Some("id_ed25519".into()),
+            },
+        );
+        assert_eq!(
+            s.selected_key_picker_entry().map(|e| e.name.as_str()),
+            Some("id_ed25519")
+        );
+    }
+
+    #[test]
+    fn visible_picker_shows_dotfiles_even_when_hidden_in_panes() {
+        let mut s = AppState {
+            hide_dotfiles: true,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: None,
+            },
+        );
+        let names: Vec<_> = s
+            .visible_key_picker()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(names.contains(&".ssh"));
+        assert!(names.contains(&".bashrc"));
+    }
+
+    #[test]
+    fn confirm_file_sets_path_and_closes() {
+        let mut s = AppState {
+            show_quick_connect: true,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: Some("id_ed25519".into()),
+            },
+        );
+        reduce(&mut s, Action::KeyPickerConfirm);
+        assert!(!s.show_key_picker);
+        assert!(s.show_quick_connect);
+        assert_eq!(
+            s.quick_connect.private_key.as_deref(),
+            Some("/home/u/id_ed25519")
+        );
+        assert_eq!(s.qc_field.value, "/home/u/id_ed25519");
+        assert!(s.toast.is_none());
+    }
+
+    #[test]
+    fn confirm_pub_sets_path_with_warning() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: Some("id_ed25519.pub".into()),
+            },
+        );
+        reduce(&mut s, Action::KeyPickerConfirm);
+        assert_eq!(
+            s.quick_connect.private_key.as_deref(),
+            Some("/home/u/id_ed25519.pub")
+        );
+        assert!(s.toast.is_some());
+        assert!(is_public_key_name("id_ed25519.pub"));
+    }
+
+    #[test]
+    fn confirm_directory_is_noop() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: Some(".ssh".into()),
+            },
+        );
+        reduce(&mut s, Action::KeyPickerConfirm);
+        assert!(s.show_key_picker);
+        assert!(s.quick_connect.private_key.is_none());
+    }
+
+    #[test]
+    fn confirm_dot_is_noop() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: Some(".".into()),
+            },
+        );
+        reduce(&mut s, Action::KeyPickerConfirm);
+        assert!(s.show_key_picker);
+        assert!(s.quick_connect.private_key.is_none());
+    }
+
+    #[test]
+    fn close_picker_leaves_quick_connect_open() {
+        let mut s = AppState {
+            show_quick_connect: true,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: None,
+            },
+        );
+        reduce(&mut s, Action::CloseKeyPicker);
+        assert!(!s.show_key_picker);
+        assert!(s.show_quick_connect);
+    }
+
+    #[test]
+    fn closing_quick_connect_closes_picker() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleQuickConnect);
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: None,
+            },
+        );
+        assert!(s.show_key_picker);
+        reduce(&mut s, Action::ToggleQuickConnect);
+        assert!(!s.show_quick_connect);
+        assert!(!s.show_key_picker);
+    }
+
+    #[test]
+    fn select_up_down_clamp() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: Some(".".into()),
+            },
+        );
+        assert_eq!(s.key_picker_selected, 0);
+        reduce(&mut s, Action::KeyPickerSelectUp);
+        assert_eq!(s.key_picker_selected, 0);
+        let last = s.visible_key_picker().len().saturating_sub(1);
+        reduce(&mut s, Action::KeyPickerSelectIndex(last));
+        reduce(&mut s, Action::KeyPickerSelectDown);
+        assert_eq!(s.key_picker_selected, last);
+    }
+
+    #[test]
+    fn set_entries_reset_uses_prefer_not_ssh() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::OpenKeyPicker {
+                cwd: "/home/u".into(),
+                entries: listing(),
+                prefer: None,
+            },
+        );
+        reduce(
+            &mut s,
+            Action::SetKeyPickerEntries {
+                cwd: "/home/u/.ssh".into(),
+                entries: vec![dir("."), dir(".."), file("id_ed25519")],
+                select: SelectPolicy::Reset,
+                prefer: None,
+            },
+        );
+        assert_eq!(s.key_picker_cwd, "/home/u/.ssh");
+        assert_eq!(
+            s.selected_key_picker_entry().map(|e| e.name.as_str()),
+            Some("id_ed25519")
+        );
     }
 }

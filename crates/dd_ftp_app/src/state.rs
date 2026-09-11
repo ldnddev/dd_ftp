@@ -51,6 +51,11 @@ pub fn is_dot_or_dotdot(name: &str) -> bool {
     name == "." || name == ".."
 }
 
+/// True for `*.pub` names. The picker dims these; SSH auth wants the private key.
+pub fn is_public_key_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".pub")
+}
+
 /// How to place `selected_*` after a listing or filter change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectPolicy {
@@ -221,6 +226,10 @@ pub struct AppState {
     pub show_theme_debug: bool,
     pub help_scroll: usize,
     pub show_quick_connect: bool,
+    pub show_key_picker: bool,
+    pub key_picker_cwd: String,
+    pub key_picker_entries: Vec<FileEntry>,
+    pub key_picker_selected: usize,
     pub show_bookmarks: bool,
     pub show_filter: bool,
     pub show_compare: bool,
@@ -305,6 +314,7 @@ impl AppState {
             || self.show_prompt
             || self.show_quick_connect
             || self.show_bookmarks
+            || self.show_key_picker
     }
 
     pub fn is_text_prompt(&self) -> bool {
@@ -404,6 +414,11 @@ impl AppState {
         )
     }
 
+    /// Picker always shows dotfiles and sorts by name (dirs first).
+    pub fn visible_key_picker(&self) -> Vec<&FileEntry> {
+        Self::visible_entries(&self.key_picker_entries, "", false, SortKey::Name, true)
+    }
+
     pub fn sort_title_suffix(&self) -> String {
         let arrow = if self.sort_asc { "↑" } else { "↓" };
         let mut s = format!("sort: {}{}", self.sort_key.label(), arrow);
@@ -419,6 +434,12 @@ impl AppState {
 
     pub fn selected_remote_entry(&self) -> Option<&FileEntry> {
         self.visible_remote().get(self.selected_remote).copied()
+    }
+
+    pub fn selected_key_picker_entry(&self) -> Option<&FileEntry> {
+        self.visible_key_picker()
+            .get(self.key_picker_selected)
+            .copied()
     }
 
     /// Marked live rows for `u`/`d`/Enter. If no current listing path is marked,
@@ -480,6 +501,10 @@ impl Default for AppState {
             show_theme_debug: false,
             help_scroll: 0,
             show_quick_connect: false,
+            show_key_picker: false,
+            key_picker_cwd: String::new(),
+            key_picker_entries: vec![],
+            key_picker_selected: 0,
             show_bookmarks: false,
             show_filter: false,
             show_compare: false,

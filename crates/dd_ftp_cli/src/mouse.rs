@@ -77,6 +77,20 @@ pub(crate) fn handle_mouse(
                         }),
                     );
                 }
+                Some(Region::KeyPickerList) | Some(Region::Scrollbar(ScrollRegion::KeyPicker))
+                    if app.show_key_picker =>
+                {
+                    for _ in 0..SCROLL_STEP {
+                        reduce(
+                            app,
+                            if up {
+                                Action::KeyPickerSelectUp
+                            } else {
+                                Action::KeyPickerSelectDown
+                            },
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -151,6 +165,25 @@ pub(crate) fn handle_mouse(
                     }
                 }
                 Some(Region::Control(_)) if app.show_prompt => {}
+                Some(Region::Control(ControlId::QcBrowseKey)) if app.show_quick_connect => {
+                    crate::events::open_key_picker(app);
+                }
+                Some(Region::KeyPickerList) if app.show_key_picker => {
+                    let list_rect = app_layout.key_picker_list;
+                    let content_top = list_rect.y + 1;
+                    if my >= content_top {
+                        let row = (my - content_top) as usize;
+                        let idx = app_layout.key_picker_list_offset + row;
+                        let len = app.visible_key_picker().len();
+                        if idx < len {
+                            reduce(app, Action::KeyPickerSelectIndex(idx));
+                            if is_double {
+                                *last_click = None;
+                                crate::events::key_picker_activate_selected(app);
+                            }
+                        }
+                    }
+                }
                 Some(Region::Control(ControlId::QcProtocol)) => {
                     reduce(app, Action::QuickConnectSetProtocolNext);
                 }
@@ -172,7 +205,7 @@ pub(crate) fn handle_mouse(
                 }
                 Some(Region::Scrollbar(sr)) => {
                     let allow = match sr {
-                        ScrollRegion::Help => true,
+                        ScrollRegion::Help | ScrollRegion::KeyPicker => true,
                         _ => !app.any_modal_open(),
                     };
                     if allow {
@@ -262,6 +295,7 @@ pub(crate) fn apply_scrollbar_drag(
         ScrollRegion::ListRemote => layout.remote_scrollbar,
         ScrollRegion::Queue => layout.queue_scrollbar,
         ScrollRegion::Help => layout.help_scrollbar.unwrap_or_default(),
+        ScrollRegion::KeyPicker => layout.key_picker_scrollbar,
     };
     if track.height == 0 {
         return;
@@ -309,6 +343,13 @@ pub(crate) fn apply_scrollbar_drag(
             reduce(
                 app,
                 Action::HelpScroll(target as i32 - app.help_scroll as i32),
+            );
+        }
+        ScrollRegion::KeyPicker => {
+            let n = app.visible_key_picker().len().saturating_sub(1);
+            reduce(
+                app,
+                Action::KeyPickerSelectIndex((frac * n as f32).round() as usize),
             );
         }
     }

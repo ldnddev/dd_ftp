@@ -79,6 +79,7 @@ export DD_FTP_PATH=/
 - `D` set default bookmark
 - `B` save current quick-connect as bookmark
 - `Ctrl+K` keyring health check
+- `Ctrl+P (SSH Key)` open SSH key file picker from the SSH Key field
 
 ### Transfers
 - `u` queue upload (directories recurse; marked set or focused row)
@@ -116,6 +117,7 @@ export DD_FTP_PATH=/
 - `Mouse: QC / prompt field click-drag` cursor / selection
 - Bookmarks modal: single-click selects a bookmark; double-click loads it into quick connect
 - Quick connect: click the Protocol field to cycle SFTP → FTP → FTPS
+- Quick connect: click Browse next to SSH Key to open the key picker
 - Input fields (quick connect + text prompts): click to position the cursor; click-drag to select a range; typing or `Backspace` replaces the selection. Choice prompts have no text field.
 
 ### Keyboard field editing (quick-connect fields and prompts)

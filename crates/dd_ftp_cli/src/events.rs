@@ -330,6 +330,19 @@ pub(crate) async fn handle_key(
         return Ok(LoopControl::Continue);
     }
 
+    if app.show_key_picker {
+        match key.code {
+            KeyCode::Esc => reduce(app, Action::CloseKeyPicker),
+            KeyCode::Up | KeyCode::Char('k') => reduce(app, Action::KeyPickerSelectUp),
+            KeyCode::Down | KeyCode::Char('j') => reduce(app, Action::KeyPickerSelectDown),
+            KeyCode::Enter => key_picker_activate_selected(app),
+            KeyCode::Char('l') | KeyCode::Right => key_picker_enter_dir(app),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => key_picker_go_parent(app),
+            _ => {}
+        }
+        return Ok(LoopControl::Continue);
+    }
+
     if app.show_quick_connect {
         match key.code {
             KeyCode::Esc => reduce(app, Action::ToggleQuickConnect),
@@ -385,6 +398,13 @@ pub(crate) async fn handle_key(
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 crate::bookmarks::save_quick_connect_bookmark(app);
+            }
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if app.quick_connect_field == QuickConnectField::PrivateKey {
+                    open_key_picker(app);
+                }
             }
             KeyCode::Char(ch) => {
                 reduce(app, Action::QuickConnectInput(ch));
@@ -762,6 +782,81 @@ pub(crate) fn open_delete_prompt(app: &mut AppState) {
     }
 }
 
+pub(crate) fn open_key_picker(app: &mut AppState) {
+    app.qc_flush();
+    let start = crate::paths::key_picker_start_dir(app.quick_connect.private_key.as_deref());
+    let entries = crate::paths::local_list(&start);
+    let prefer =
+        crate::paths::key_picker_prefer_name(app.quick_connect.private_key.as_deref(), &start);
+    reduce(
+        app,
+        Action::OpenKeyPicker {
+            cwd: start,
+            entries,
+            prefer,
+        },
+    );
+}
+
+fn key_picker_load(app: &mut AppState, cwd: String, select: SelectPolicy, prefer: Option<String>) {
+    let entries = crate::paths::local_list(&cwd);
+    reduce(
+        app,
+        Action::SetKeyPickerEntries {
+            cwd,
+            entries,
+            select,
+            prefer,
+        },
+    );
+}
+
+pub(crate) fn key_picker_activate_selected(app: &mut AppState) {
+    let Some(entry) = app.selected_key_picker_entry().cloned() else {
+        return;
+    };
+    if entry.is_dir() {
+        if entry.name == "." {
+            key_picker_load(
+                app,
+                app.key_picker_cwd.clone(),
+                SelectPolicy::PreserveName,
+                None,
+            );
+            return;
+        }
+        let came_from = if entry.name == ".." {
+            Path::new(&app.key_picker_cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        key_picker_load(app, entry.path, SelectPolicy::Reset, came_from);
+        return;
+    }
+    reduce(app, Action::KeyPickerConfirm);
+}
+
+fn key_picker_enter_dir(app: &mut AppState) {
+    if app.selected_key_picker_entry().is_some_and(|e| e.is_dir()) {
+        key_picker_activate_selected(app);
+    }
+}
+
+pub(crate) fn key_picker_go_parent(app: &mut AppState) {
+    let parent = Path::new(&app.key_picker_cwd)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned());
+    let Some(parent) = parent.filter(|p| !p.is_empty() && p != &app.key_picker_cwd) else {
+        return;
+    };
+    let came_from = Path::new(&app.key_picker_cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    key_picker_load(app, parent, SelectPolicy::Reset, came_from);
+}
+
 #[cfg(test)]
 mod connect_info_tests {
     use super::*;
@@ -797,5 +892,82 @@ mod connect_info_tests {
         let info = quick_connect_info(&mut app);
         assert_eq!(info.host, "form.example");
         assert_eq!(info.username, "formuser");
+    }
+}
+
+#[cfg(test)]
+mod key_picker_io_tests {
+    use super::*;
+    use dd_ftp_core::ConnectionInfo;
+
+    fn unique_temp(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn open_key_picker_starts_in_existing_key_parent() {
+        let dir = unique_temp("dd_ftp_picker_open");
+        let ssh = dir.join(".ssh");
+        std::fs::create_dir(&ssh).expect(".ssh");
+        let key = ssh.join("id_ed25519");
+        std::fs::write(&key, b"x").expect("key");
+
+        let mut app = AppState {
+            show_quick_connect: true,
+            quick_connect: ConnectionInfo {
+                private_key: Some(key.to_string_lossy().into_owned()),
+                ..ConnectionInfo::default()
+            },
+            quick_connect_field: QuickConnectField::PrivateKey,
+            ..Default::default()
+        };
+        app.qc_hydrate();
+        open_key_picker(&mut app);
+
+        assert!(app.show_key_picker);
+        assert_eq!(
+            Path::new(&app.key_picker_cwd),
+            ssh.canonicalize().expect("canon").as_path()
+        );
+        assert_eq!(
+            app.selected_key_picker_entry().map(|e| e.name.as_str()),
+            Some("id_ed25519")
+        );
+
+        key_picker_go_parent(&mut app);
+        assert_eq!(
+            Path::new(&app.key_picker_cwd),
+            dir.canonicalize().expect("canon parent").as_path()
+        );
+        assert_eq!(
+            app.selected_key_picker_entry().map(|e| e.name.as_str()),
+            Some(".ssh")
+        );
+
+        key_picker_activate_selected(&mut app);
+        assert_eq!(
+            Path::new(&app.key_picker_cwd),
+            ssh.canonicalize().expect("canon ssh").as_path()
+        );
+
+        key_picker_activate_selected(&mut app);
+        assert!(!app.show_key_picker);
+        let got = app.quick_connect.private_key.expect("key path");
+        assert_eq!(
+            Path::new(&got).file_name().and_then(|n| n.to_str()),
+            Some("id_ed25519")
+        );
+        assert!(Path::new(&got).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

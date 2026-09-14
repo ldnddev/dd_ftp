@@ -18,6 +18,9 @@ cargo build -p dd_ftp_app
 # Release build + install to ~/.local/bin/dd_ftp
 ./install.sh
 
+# End-user curl install (picks the GitHub package for this OS/CPU)
+curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
+
 # Workspace-wide
 cargo check
 cargo build

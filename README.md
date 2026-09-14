@@ -5,13 +5,32 @@ Terminal-based FTP/SFTP/FTPS client built with Rust + ratatui.
 ## Install
 
 ### Quick install (recommended)
+
+Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) and installs `dd_ftp` to `~/.local/bin`. If no package exists for your machine, the script builds from source.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
+```
+
+Pin a release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --version v1.2.0
+```
+
+Uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --uninstall
+```
+
+### From a local checkout
+
 ```bash
 ./install.sh
 ```
 
-This will:
-- build `dd_ftp_cli` in release mode
-- install binary as `dd_ftp` to `~/.local/bin` (default)
+This builds `dd_ftp_cli` in release mode and installs it as `dd_ftp` to `~/.local/bin`. Use `./install.sh --from-release` to download a GitHub package instead.
 
 Optional overrides:
 ```bash

@@ -22,6 +22,41 @@ use crate::keys::{KeyGroup, KEYMAP};
 use crate::layout::{ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap};
 use crate::theme::{cached_theme, Theme};
 
+/// Pulse bars for the working loader: ▃ d_d ▃ → ▅ d_d ▅ → █ d_d █ → ▅ d_d ▅
+const BUSY_BARS: [char; 4] = ['▃', '▅', '█', '▅'];
+const BUSY_FRAME_MS: u128 = 150;
+
+fn busy_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn busy_bar(now_ms: u128) -> char {
+    BUSY_BARS[(now_ms / BUSY_FRAME_MS) as usize % BUSY_BARS.len()]
+}
+
+#[cfg(test)]
+fn busy_label(now_ms: u128) -> String {
+    let bar = busy_bar(now_ms);
+    format!("{bar} d_d {bar}")
+}
+
+fn busy_spans(now_ms: u128, t: &Theme) -> Vec<Span<'static>> {
+    let bar = busy_bar(now_ms).to_string();
+    vec![
+        Span::styled(bar.clone(), Style::default().fg(t.info)),
+        Span::styled(
+            " d_d ",
+            Style::default()
+                .fg(t.text_active_focus)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(bar, Style::default().fg(t.info)),
+    ]
+}
+
 fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec<Span<'static>> {
     let display: Vec<char> = if masked {
         std::iter::repeat_n('*', tf.len()).collect()
@@ -121,16 +156,24 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         })
         .unwrap_or_else(|| " disconnected ".to_string());
 
+    let tick_ms = busy_now_ms();
+    let mut header_title = vec![Span::styled(
+        " dd_ftp ",
+        Style::default()
+            .fg(t.text_active_focus)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.busy {
+        header_title.push(Span::raw(" "));
+        header_title.extend(busy_spans(tick_ms, &t));
+        header_title.push(Span::raw(" "));
+    }
+
     let header_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border_active))
         .style(Style::default().bg(t.base_background))
-        .title(Line::from(vec![Span::styled(
-            " dd_ftp ",
-            Style::default()
-                .fg(t.text_active_focus)
-                .add_modifier(Modifier::BOLD),
-        )]))
+        .title(Line::from(header_title))
         .title_top(
             Line::from(vec![Span::styled(
                 conn_label,
@@ -397,26 +440,29 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         Style::default().fg(t.border_default)
     };
 
-    let worker_state = if app.worker_running {
-        "running"
+    let mut worker_spans = vec![Span::styled(
+        "Worker: ",
+        Style::default().fg(t.text_secondary),
+    )];
+    if app.busy && app.worker_running {
+        worker_spans.extend(busy_spans(tick_ms, &t));
+    } else if app.worker_running {
+        worker_spans.push(Span::styled("running", Style::default().fg(t.info)));
     } else {
-        "idle"
-    };
+        worker_spans.push(Span::styled("idle", Style::default().fg(t.info)));
+    }
 
-    let mut queue_text = vec![Line::from(vec![
-        Span::styled("Worker: ", Style::default().fg(t.text_secondary)),
-        Span::styled(worker_state, Style::default().fg(t.info)),
-        Span::raw(format!(
-            " ({}/{}) | Pending: {} | Active: {} | Complete: {} | Failed: {} | Cancelled: {}",
-            app.worker_active_count,
-            app.worker_max_concurrency,
-            app.queue.pending.len(),
-            app.queue.active.len(),
-            app.queue.completed.len(),
-            app.queue.failed.len(),
-            app.queue.cancelled.len()
-        )),
-    ])];
+    worker_spans.push(Span::raw(format!(
+        " ({}/{}) | Pending: {} | Active: {} | Complete: {} | Failed: {} | Cancelled: {}",
+        app.worker_active_count,
+        app.worker_max_concurrency,
+        app.queue.pending.len(),
+        app.queue.active.len(),
+        app.queue.completed.len(),
+        app.queue.failed.len(),
+        app.queue.cancelled.len()
+    )));
+    let mut queue_text = vec![Line::from(worker_spans)];
 
     if app.queue.active.is_empty() && app.queue.pending.is_empty() && app.queue.failed.is_empty() {
         queue_text.push(Line::from("No jobs in queue"));
@@ -500,9 +546,10 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         Paragraph::new(keys).style(Style::default().fg(t.text_secondary).bg(t.base_background));
     frame.render_widget(footer_keys, status_area);
 
-    // Right-aligned transient status, only when the terminal is wide enough
-    // that it won't collide with the key hints.
-    if status_area.width >= 90 && !app.status.is_empty() {
+    // Right-aligned working loader and/or transient status. The loader is
+    // short enough to show even on narrower terminals; status still needs room.
+    let show_status = status_area.width >= 90 && !app.status.is_empty();
+    if app.busy || show_status {
         let s = app.status.to_lowercase();
         let status_color = if s.contains("failed") || s.contains("error") {
             t.error
@@ -513,12 +560,23 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         } else {
             t.text_secondary
         };
-        let status = Paragraph::new(Line::from(Span::styled(
-            format!("{} ", app.status),
-            Style::default().fg(status_color),
-        )))
-        .alignment(Alignment::Right)
-        .style(Style::default().bg(t.base_background));
+        let mut spans: Vec<Span> = Vec::new();
+        if app.busy {
+            spans.extend(busy_spans(tick_ms, &t));
+            if show_status {
+                spans.push(Span::raw("  "));
+            }
+        }
+        if show_status {
+            spans.push(Span::styled(
+                app.status.clone(),
+                Style::default().fg(status_color),
+            ));
+        }
+        spans.push(Span::raw(" "));
+        let status = Paragraph::new(Line::from(spans))
+            .alignment(Alignment::Right)
+            .style(Style::default().bg(t.base_background));
         frame.render_widget(status, status_area);
     }
 
@@ -1688,6 +1746,16 @@ mod column_tests {
         assert_eq!(&with[..7], "   1.2K");
         assert_eq!(&without[..7], "      0");
         assert_eq!(&with[7..25], &without[7..25]);
+    }
+
+    #[test]
+    fn busy_label_pulses_through_the_four_frames() {
+        assert_eq!(busy_label(0), "▃ d_d ▃");
+        assert_eq!(busy_label(149), "▃ d_d ▃");
+        assert_eq!(busy_label(150), "▅ d_d ▅");
+        assert_eq!(busy_label(300), "█ d_d █");
+        assert_eq!(busy_label(450), "▅ d_d ▅");
+        assert_eq!(busy_label(600), "▃ d_d ▃");
     }
 
     #[test]

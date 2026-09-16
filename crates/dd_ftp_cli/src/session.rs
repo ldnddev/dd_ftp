@@ -166,6 +166,27 @@ impl Runtime {
         );
     }
 
+    /// Connect/list/fs/scan (not host-key prompts) or an active transfer worker.
+    pub fn is_working(&self) -> bool {
+        self.worker_active_count > 0
+            || matches!(
+                self.in_flight,
+                Some(
+                    InFlight::Connect { .. }
+                        | InFlight::List { .. }
+                        | InFlight::Fs { .. }
+                        | InFlight::Scan { .. }
+                )
+            )
+    }
+
+    pub fn sync_busy(&self, app: &mut AppState) {
+        let busy = self.is_working();
+        if app.busy != busy {
+            reduce(app, Action::SetBusy(busy));
+        }
+    }
+
     pub fn request_list(
         &mut self,
         app: &mut AppState,
@@ -1838,6 +1859,33 @@ mod scan_tests {
             ),
             DrainStep::Enqueue
         );
+    }
+
+    #[test]
+    fn is_working_is_true_for_io_and_workers_not_host_key() {
+        let (mut runtime, _rx) = test_runtime();
+        assert!(!runtime.is_working());
+
+        runtime.in_flight = Some(InFlight::Connect { generation: 1 });
+        assert!(runtime.is_working());
+
+        runtime.in_flight = Some(InFlight::List {
+            generation: 1,
+            path: "/".into(),
+        });
+        assert!(runtime.is_working());
+
+        runtime.in_flight = None;
+        runtime.worker_active_count = 1;
+        assert!(runtime.is_working());
+
+        runtime.worker_active_count = 0;
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        runtime.in_flight = Some(InFlight::HostKey {
+            generation: 1,
+            reply,
+        });
+        assert!(!runtime.is_working());
     }
 
     #[test]

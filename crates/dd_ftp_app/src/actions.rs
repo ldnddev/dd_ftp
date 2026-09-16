@@ -69,6 +69,7 @@ pub enum Action {
         cancel_requested: bool,
     },
     SetStatus(String),
+    SetBusy(bool),
     ShowError(String),
     ClearError,
     SetFocus(FocusPane),

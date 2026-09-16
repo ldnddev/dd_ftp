@@ -254,6 +254,8 @@ pub struct AppState {
     pub selected_bookmark: usize,
     pub active_connection: Option<ConnectionInfo>,
     pub status: String,
+    /// True while connect/list/fs/scan IO or a transfer worker is in flight.
+    pub busy: bool,
     pub toast: Option<Toast>,
     pub queue_scroll: usize,
     pub queue: TransferQueue,
@@ -525,6 +527,7 @@ impl Default for AppState {
             selected_bookmark: 0,
             active_connection: None,
             status: "Ready".to_string(),
+            busy: false,
             toast: None,
             queue_scroll: 0,
             queue: TransferQueue::default(),

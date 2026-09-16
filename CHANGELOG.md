@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-09-15
+
+### Added
+- Curl one-line installer that downloads the matching GitHub package for this OS/CPU, with a source-build fallback
+- GitHub Actions release workflow that publishes Linux, macOS, and Windows packages plus checksums
+- Working loader animation (`▃ d_d ▃` → `▅ d_d ▅` → `█ d_d █`) in the header, footer, and queue while connect, list, file ops, scan, or transfers run
+
 ## [1.2.0] - 2026-09-04
 
 ### Added

@@ -101,6 +101,8 @@ async fn run(
 
     loop {
         app.expire_toast();
+        runtime.sync_worker_view(app);
+        runtime.sync_busy(app);
         let mut app_layout = dd_ftp_ui::LayoutMap::default();
         terminal.draw(|f| dd_ftp_ui::render(f, app, &mut app_layout))?;
 
@@ -165,5 +167,6 @@ async fn run(
         }
 
         runtime.sync_worker_view(app);
+        runtime.sync_busy(app);
     }
 }

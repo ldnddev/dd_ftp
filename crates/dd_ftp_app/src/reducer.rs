@@ -376,6 +376,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SetStatus(msg) => {
             state.status = msg;
         }
+        Action::SetBusy(value) => {
+            state.busy = value;
+        }
         Action::ShowError(msg) => {
             state.toast = Some(Toast::error(msg.clone()));
             state.status = format!("Error: {msg}");
@@ -1297,6 +1300,16 @@ mod reduce_table_tests {
         reduce(&mut s, Action::QueueTransfer(job("/tmp/b", "/pub/b")));
         reduce(&mut s, Action::ClearPendingTransfers);
         assert!(s.queue.pending.is_empty());
+    }
+
+    #[test]
+    fn set_busy_toggles_working_flag() {
+        let mut s = AppState::default();
+        assert!(!s.busy);
+        reduce(&mut s, Action::SetBusy(true));
+        assert!(s.busy);
+        reduce(&mut s, Action::SetBusy(false));
+        assert!(!s.busy);
     }
 
     #[test]

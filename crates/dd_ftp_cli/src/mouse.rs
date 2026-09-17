@@ -238,6 +238,12 @@ pub(crate) fn handle_mouse(
                                 *drag_field = Some(fid);
                             }
                             FieldId::Prompt => {}
+                            FieldId::SettingsEditor if app.show_settings => {
+                                let len = app.settings_editor.len();
+                                let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                                reduce(app, Action::SettingsBeginSelect(idx));
+                                *drag_field = Some(fid);
+                            }
                             _ => {
                                 if let Some(qf) = qc_field_for(fid) {
                                     app.quick_connect_field = qf;
@@ -267,6 +273,11 @@ pub(crate) fn handle_mouse(
                             app.prompt_value.extend_drag(idx);
                         }
                         FieldId::Prompt => {}
+                        FieldId::SettingsEditor if app.show_settings => {
+                            let len = app.settings_editor.len();
+                            let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
+                            reduce(app, Action::SettingsExtendSelect(idx));
+                        }
                         _ if app.show_quick_connect => {
                             let len = app.qc_field.len();
                             let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
@@ -295,7 +306,7 @@ pub(crate) fn qc_field_for(fid: dd_ftp_ui::FieldId) -> Option<QuickConnectField>
         QcPassword => QuickConnectField::Password,
         QcPrivateKey => QuickConnectField::PrivateKey,
         QcPath => QuickConnectField::Path,
-        Prompt => return None,
+        Prompt | SettingsEditor => return None,
     })
 }
 

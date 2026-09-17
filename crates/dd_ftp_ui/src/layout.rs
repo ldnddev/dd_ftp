@@ -16,6 +16,7 @@ pub enum FieldId {
     QcPassword,
     QcPrivateKey,
     QcPath,
+    SettingsEditor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

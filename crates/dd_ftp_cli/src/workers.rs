@@ -186,6 +186,9 @@ pub(crate) fn handle_worker_result(
     mut msg: WorkerResult,
 ) {
     if app.worker_cancel_requested || msg.was_cancelled {
+        if msg.job.edit_after {
+            crate::session::cancel_edit(app, runtime, true);
+        }
         msg.job.last_error = Some("Cancelled by user".to_string());
         reduce(app, Action::MarkTransferCancelled(msg.job));
         return;
@@ -198,12 +201,25 @@ pub(crate) fn handle_worker_result(
                 TransferDirection::Download => "download",
             };
             let delete_source = msg.job.delete_source;
+            let edit_after = msg.job.edit_after;
             let direction = msg.job.direction;
             let local_path = msg.job.local_path.clone();
             let remote_path = msg.job.remote_path.clone();
             msg.job.last_error = None;
             reduce(app, Action::MarkTransferCompleted(msg.job));
             reduce(app, Action::SetStatus(format!("{name} complete")));
+
+            if edit_after {
+                crate::session::on_edit_download_complete(app, runtime);
+                return;
+            }
+            if runtime.edit_session.as_ref().is_some_and(|e| {
+                e.local_path.to_string_lossy() == local_path
+                    && direction == TransferDirection::Upload
+            }) {
+                let _ = std::fs::remove_file(&local_path);
+                runtime.edit_session = None;
+            }
 
             if delete_source {
                 match direction {
@@ -258,6 +274,9 @@ pub(crate) fn handle_worker_result(
             }
         }
         Err(err) => {
+            if msg.job.edit_after {
+                crate::session::cancel_edit(app, runtime, true);
+            }
             msg.job.last_error = Some(err.to_string());
             reduce(app, Action::MarkTransferFailed(msg.job));
             reduce(app, Action::ShowError(format!("Transfer failed: {err}")));

@@ -11,8 +11,8 @@ use std::{
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use dd_ftp_app::{
-    reduce, Action, AppState, ChoicePromptKind, FocusPane, HostKeyView, OverwritePolicy,
-    OverwritePrompt, PendingFile, PromptKind, SelectPolicy, TextPromptKind, Toast,
+    is_dot_or_dotdot, reduce, Action, AppState, ChoicePromptKind, FocusPane, HostKeyView,
+    OverwritePolicy, OverwritePrompt, PendingFile, PromptKind, SelectPolicy, TextPromptKind, Toast,
 };
 use dd_ftp_core::{
     ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob,
@@ -44,6 +44,15 @@ pub(crate) struct PendingDelete {
     pub path: String,
     pub is_dir: bool,
     pub remote: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingEdit {
+    pub local_path: PathBuf,
+    pub remote_path: String,
+    pub remote_modified: Option<DateTime<Utc>>,
+    pub fingerprint: Option<crate::edit::FileFingerprint>,
+    pub size_bytes: Option<u64>,
 }
 
 pub(crate) enum InFlight {
@@ -141,6 +150,9 @@ pub(crate) struct Runtime {
     pub pending_delete: VecDeque<PendingDelete>,
     pub listed_dest_names: HashSet<String>,
     pub scan_delete_source: bool,
+    pub edit_session: Option<PendingEdit>,
+    pub editor_ready: bool,
+    pub edit_check_remote: bool,
 }
 
 impl Runtime {
@@ -167,6 +179,9 @@ impl Runtime {
             pending_delete: VecDeque::new(),
             listed_dest_names: HashSet::new(),
             scan_delete_source: false,
+            edit_session: None,
+            editor_ready: false,
+            edit_check_remote: false,
         }
     }
 
@@ -185,6 +200,7 @@ impl Runtime {
     pub fn is_working(&self) -> bool {
         self.worker_active_count > 0
             || !self.pending_delete.is_empty()
+            || self.edit_session.is_some()
             || matches!(
                 self.in_flight,
                 Some(
@@ -533,6 +549,34 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                 handle_drain_list_result(app, runtime, result);
                 return;
             }
+            if runtime.edit_check_remote {
+                runtime.edit_check_remote = false;
+                match result {
+                    Ok(entries) => {
+                        let select = runtime.list_select;
+                        reduce(
+                            app,
+                            Action::SetRemoteEntries {
+                                entries: entries.clone(),
+                                select,
+                            },
+                        );
+                        finish_edit_after_relist(app, runtime, &entries);
+                    }
+                    Err(err) => {
+                        reduce(
+                            app,
+                            Action::ShowError(format!(
+                                "Could not recheck remote before upload: {err}"
+                            )),
+                        );
+                        if let Some(edit) = runtime.edit_session.clone() {
+                            enqueue_edit_upload(app, runtime, edit.remote_path);
+                        }
+                    }
+                }
+                return;
+            }
             if !runtime.pending_scan.is_empty() {
                 maybe_resume_drain(app, runtime);
                 return;
@@ -693,6 +737,9 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
 }
 
 pub(crate) async fn disconnect_session(app: &mut AppState, runtime: &mut Runtime) {
+    if runtime.edit_session.is_some() {
+        cancel_edit(app, runtime, true);
+    }
     if let Some(InFlight::HostKey { reply, .. }) = runtime.in_flight.take() {
         let _ = reply.send(false);
     }
@@ -913,6 +960,227 @@ pub(crate) fn queue_move_selected(app: &mut AppState, runtime: &mut Runtime) {
         }
         FocusPane::Queue => {}
     }
+}
+
+pub(crate) fn start_remote_edit(app: &mut AppState, runtime: &mut Runtime) {
+    if !app.connected {
+        reduce(app, Action::SetStatus("Not connected".to_string()));
+        return;
+    }
+    if app.focus != FocusPane::Remote {
+        reduce(
+            app,
+            Action::SetStatus("Focus a remote file to edit".to_string()),
+        );
+        return;
+    }
+    if runtime.edit_session.is_some() {
+        reduce(
+            app,
+            Action::SetStatus("Already preparing an edit".to_string()),
+        );
+        return;
+    }
+    if io_busy(runtime) || drain_busy(runtime) {
+        reduce(app, Action::SetStatus("busy".to_string()));
+        return;
+    }
+    let marked = app.marked_live_count(FocusPane::Remote);
+    if marked > 1 {
+        reduce(
+            app,
+            Action::SetStatus("Edit one file at a time".to_string()),
+        );
+        return;
+    }
+    let Some(entry) = pane_entries_for_action(app, FocusPane::Remote)
+        .into_iter()
+        .next()
+    else {
+        reduce(
+            app,
+            Action::SetStatus("Nothing selected to edit".to_string()),
+        );
+        return;
+    };
+    if entry.is_dir() || is_dot_or_dotdot(&entry.name) {
+        reduce(
+            app,
+            Action::SetStatus("Cannot edit a directory".to_string()),
+        );
+        return;
+    }
+    let remote_path = match safe_remote_child(&app.remote_cwd, &entry.name) {
+        Ok(p) => p,
+        Err(_) => {
+            reduce(app, Action::ShowError("path escapes directory".to_string()));
+            return;
+        }
+    };
+    let host = app
+        .active_connection
+        .as_ref()
+        .map(|c| c.host.as_str())
+        .unwrap_or("remote");
+    let port = app.active_connection.as_ref().map(|c| c.port).unwrap_or(0);
+    let local_path = crate::edit::edit_cache_path(host, port, &remote_path);
+    runtime.edit_session = Some(PendingEdit {
+        local_path,
+        remote_path,
+        remote_modified: entry.modified,
+        fingerprint: None,
+        size_bytes: Some(entry.size),
+    });
+    if entry.size > crate::edit::EDIT_SIZE_WARN_BYTES {
+        app.prompt_target = Some(format!("{:.1} MB", entry.size as f64 / (1024.0 * 1024.0)));
+        reduce(
+            app,
+            Action::ShowChoicePrompt(ChoicePromptKind::ConfirmEditLarge),
+        );
+        return;
+    }
+    begin_edit_download(app, runtime);
+}
+
+pub(crate) fn begin_edit_download(app: &mut AppState, runtime: &mut Runtime) {
+    let Some(edit) = runtime.edit_session.clone() else {
+        return;
+    };
+    if let Some(parent) = edit.local_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            runtime.edit_session = None;
+            reduce(
+                app,
+                Action::ShowError(format!("Cannot create edit cache: {err}")),
+            );
+            return;
+        }
+    }
+    reduce(
+        app,
+        Action::SetWorkerView {
+            active_count: runtime.worker_active_count,
+            running: runtime.worker_active_count > 0,
+            cancel_requested: false,
+        },
+    );
+    let mut job = TransferJob::new(
+        edit.local_path.to_string_lossy().into_owned(),
+        edit.remote_path.clone(),
+        TransferDirection::Download,
+    );
+    job.size_bytes = edit.size_bytes;
+    job.edit_after = true;
+    app.queue.pending.insert(0, job);
+    reduce(
+        app,
+        Action::SetStatus(format!("Downloading for edit: {}", edit.remote_path)),
+    );
+}
+
+pub(crate) fn on_edit_download_complete(app: &mut AppState, runtime: &mut Runtime) {
+    let Some(edit) = runtime.edit_session.as_mut() else {
+        return;
+    };
+    edit.fingerprint = crate::edit::fingerprint(&edit.local_path);
+    if crate::edit::looks_binary(&edit.local_path) {
+        reduce(
+            app,
+            Action::ShowChoicePrompt(ChoicePromptKind::ConfirmEditBinary),
+        );
+        return;
+    }
+    runtime.editor_ready = true;
+}
+
+pub(crate) fn cancel_edit(app: &mut AppState, runtime: &mut Runtime, keep_temp: bool) {
+    if let Some(edit) = runtime.edit_session.take() {
+        if !keep_temp {
+            let _ = std::fs::remove_file(&edit.local_path);
+        } else {
+            reduce(
+                app,
+                Action::SetStatus(format!(
+                    "Edit cancelled; file kept at {}",
+                    edit.local_path.display()
+                )),
+            );
+        }
+    }
+    runtime.editor_ready = false;
+    runtime.edit_check_remote = false;
+}
+
+pub(crate) fn enqueue_edit_upload(app: &mut AppState, runtime: &mut Runtime, remote_path: String) {
+    let Some(edit) = runtime.edit_session.as_ref() else {
+        return;
+    };
+    let mut job = TransferJob::new(
+        edit.local_path.to_string_lossy().into_owned(),
+        remote_path,
+        TransferDirection::Upload,
+    );
+    job.size_bytes = std::fs::metadata(&edit.local_path).ok().map(|m| m.len());
+    app.queue.pending.insert(0, job);
+    reduce(app, Action::SetStatus("Uploading edit...".to_string()));
+}
+
+pub(crate) fn finish_edit_after_editor(app: &mut AppState, runtime: &mut Runtime, changed: bool) {
+    if !changed {
+        reduce(app, Action::SetStatus("No edits to upload".to_string()));
+        cancel_edit(app, runtime, false);
+        return;
+    }
+    if !app.connected {
+        if let Some(edit) = &runtime.edit_session {
+            reduce(
+                app,
+                Action::ShowError(format!(
+                    "Disconnected; edit kept at {}",
+                    edit.local_path.display()
+                )),
+            );
+        }
+        return;
+    }
+    let parent = runtime
+        .edit_session
+        .as_ref()
+        .map(|e| parent_remote_path(&e.remote_path))
+        .unwrap_or_else(|| app.remote_cwd.clone());
+    if io_busy(runtime) {
+        if let Some(edit) = runtime.edit_session.clone() {
+            enqueue_edit_upload(app, runtime, edit.remote_path);
+        }
+        return;
+    }
+    runtime.edit_check_remote = true;
+    runtime.list_ok_status = None;
+    runtime.list_err_prefix = "Remote list failed".to_string();
+    list_remote(app, runtime, parent, SelectPolicy::PreserveName);
+}
+
+pub(crate) fn finish_edit_after_relist(
+    app: &mut AppState,
+    runtime: &mut Runtime,
+    entries: &[FileEntry],
+) {
+    let Some(edit) = runtime.edit_session.clone() else {
+        return;
+    };
+    let name = remote_basename(&edit.remote_path);
+    let remote_now = entries
+        .iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.modified);
+    if dest_is_newer(edit.remote_modified, remote_now) {
+        reduce(
+            app,
+            Action::ShowChoicePrompt(ChoicePromptKind::EditConflict),
+        );
+        return;
+    }
+    enqueue_edit_upload(app, runtime, edit.remote_path);
 }
 
 fn enqueue_selected(

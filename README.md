@@ -72,6 +72,7 @@ export DD_FTP_PATH=/
 - `F1` toggle help (opening closes theme debug)
 - `Esc` close current modal; when compare is on and no modal is open, close compare; otherwise clear marks
 - `F2` toggle theme debug (opening closes help)
+- `F3` toggle settings (editor command; saved to `~/.config/ldnddev/dd_ftp.toml`)
 - `Ctrl+q` quit (confirms if transfers are active)
 - `Ctrl+C` cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)
 - `C` toggle directory compare
@@ -118,6 +119,7 @@ export DD_FTP_PATH=/
 - `n` create (alias of `Ctrl+n`)
 - `Ctrl+n` create file/folder prompt (`Tab` toggles file/folder)
 - `e` rename selected item
+- `E` edit remote file in `$VISUAL`/`$EDITOR` (or the editor saved in Settings), then upload on change
 - `Ctrl+Alt+e` rename (alias)
 - `Delete` delete marked set or focused row with confirm
 - `Ctrl+Delete` delete with confirm (alias)
@@ -163,6 +165,25 @@ Notable tokens:
 - `folders`
 - `files`
 - `links`
+
+## Settings
+
+`F3` opens a settings panel. Today it has one field: **Editor**.
+
+Saved to `~/.config/ldnddev/dd_ftp.toml` (not the theme file):
+
+```toml
+editor = "hx"
+```
+
+When you press `E` to edit a remote file, the editor is:
+
+1. `$VISUAL` if set
+2. `$EDITOR` if set
+3. the saved `editor` value
+4. `vi`
+
+Leave the field empty to use the environment / `vi`. Enter saves, Esc cancels.
 
 ## Protocol status
 - SFTP: ✅

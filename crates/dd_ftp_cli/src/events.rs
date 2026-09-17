@@ -67,6 +67,13 @@ pub(crate) async fn handle_key(
                         reduce(app, Action::CancelPrompt);
                     }
                     _ => {
+                        if runtime.edit_session.is_some() {
+                            let keep = runtime
+                                .edit_session
+                                .as_ref()
+                                .is_some_and(|e| e.fingerprint.is_some());
+                            crate::session::cancel_edit(app, runtime, keep);
+                        }
                         reduce(app, Action::CancelPrompt);
                     }
                 }
@@ -99,6 +106,13 @@ pub(crate) async fn handle_key(
         return Ok(LoopControl::Continue);
     }
 
+    if key.code == KeyCode::F(3)
+        && (!app.any_modal_open() || app.show_settings || app.show_help || app.show_theme_debug)
+    {
+        reduce(app, Action::ToggleSettings);
+        return Ok(LoopControl::Continue);
+    }
+
     if !app.any_modal_open() && key.code == KeyCode::Char('/') {
         reduce(app, Action::ToggleFilter);
         return Ok(LoopControl::Continue);
@@ -128,6 +142,36 @@ pub(crate) async fn handle_key(
         return Ok(LoopControl::Continue);
     }
 
+    if app.show_settings {
+        match key.code {
+            KeyCode::Esc | KeyCode::F(3) => reduce(app, Action::ToggleSettings),
+            KeyCode::Enter => save_settings(app),
+            KeyCode::Backspace => reduce(app, Action::SettingsBackspace),
+            KeyCode::Left => {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                reduce(app, Action::SettingsMoveCursor { dir: -1, shift });
+            }
+            KeyCode::Right => {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                reduce(app, Action::SettingsMoveCursor { dir: 1, shift });
+            }
+            KeyCode::Home => {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                app.settings_editor.move_home(shift);
+            }
+            KeyCode::End => {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                app.settings_editor.move_end(shift);
+            }
+            KeyCode::Delete => {
+                app.settings_editor.delete();
+            }
+            KeyCode::Char(ch) => reduce(app, Action::SettingsInput(ch)),
+            _ => {}
+        }
+        return Ok(LoopControl::Continue);
+    }
+
     if !app.any_modal_open() && key.code == KeyCode::Char('C') {
         reduce(app, Action::ToggleCompare);
         return Ok(LoopControl::Continue);
@@ -137,6 +181,43 @@ pub(crate) async fn handle_key(
         let Some(PromptKind::Choice(kind)) = app.prompt_kind else {
             return Ok(LoopControl::Continue);
         };
+        if kind == ChoicePromptKind::EditConflict {
+            match key.code {
+                KeyCode::Char('o') | KeyCode::Char('O') | KeyCode::Char('y') => {
+                    reduce(app, Action::ConfirmPrompt);
+                    if let Some(edit) = runtime.edit_session.clone() {
+                        crate::session::enqueue_edit_upload(app, runtime, edit.remote_path);
+                    }
+                }
+                KeyCode::Char('s')
+                | KeyCode::Char('S')
+                | KeyCode::Char('n')
+                | KeyCode::Char('N')
+                | KeyCode::Esc => {
+                    reduce(app, Action::CancelPrompt);
+                    crate::session::cancel_edit(app, runtime, true);
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    reduce(app, Action::CancelPrompt);
+                    app.show_prompt = true;
+                    app.prompt_kind = Some(PromptKind::Text(TextPromptKind::EditSaveAs));
+                    let name = runtime
+                        .edit_session
+                        .as_ref()
+                        .map(|e| {
+                            e.remote_path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&e.remote_path)
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    app.prompt_value = dd_ftp_app::TextField::from_str(&name);
+                }
+                _ => {}
+            }
+            return Ok(LoopControl::Continue);
+        }
         if kind == ChoicePromptKind::Overwrite {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -195,6 +276,12 @@ pub(crate) async fn handle_key(
                 if kind == ChoicePromptKind::ConfirmDelete {
                     runtime.pending_delete.clear();
                 }
+                if kind == ChoicePromptKind::ConfirmEditLarge {
+                    crate::session::cancel_edit(app, runtime, false);
+                }
+                if kind == ChoicePromptKind::ConfirmEditBinary {
+                    crate::session::cancel_edit(app, runtime, true);
+                }
                 crate::session::reject_host_key(runtime);
                 reduce(app, Action::CancelPrompt);
             }
@@ -218,7 +305,15 @@ pub(crate) async fn handle_key(
                     crate::session::accept_host_key(runtime);
                     reduce(app, Action::ConfirmPrompt);
                 }
-                ChoicePromptKind::Overwrite => {}
+                ChoicePromptKind::Overwrite | ChoicePromptKind::EditConflict => {}
+                ChoicePromptKind::ConfirmEditLarge => {
+                    reduce(app, Action::ConfirmPrompt);
+                    crate::session::begin_edit_download(app, runtime);
+                }
+                ChoicePromptKind::ConfirmEditBinary => {
+                    reduce(app, Action::ConfirmPrompt);
+                    runtime.editor_ready = true;
+                }
             },
             _ => {}
         }
@@ -232,9 +327,16 @@ pub(crate) async fn handle_key(
                     app.prompt_kind,
                     Some(PromptKind::Text(TextPromptKind::OverwriteRename))
                 );
+                let edit_save = matches!(
+                    app.prompt_kind,
+                    Some(PromptKind::Text(TextPromptKind::EditSaveAs))
+                );
                 reduce(app, Action::CancelPrompt);
                 if renaming {
                     crate::session::show_overwrite_prompt(app, runtime);
+                }
+                if edit_save {
+                    crate::session::cancel_edit(app, runtime, true);
                 }
             }
             KeyCode::Tab => {
@@ -287,6 +389,22 @@ pub(crate) async fn handle_key(
                                     }
                                 }
                                 Err(err) => reduce(app, Action::ShowError(err)),
+                            }
+                        }
+                        TextPromptKind::EditSaveAs => {
+                            let new_name = app.prompt_value.value.clone();
+                            reduce(app, Action::ConfirmPrompt);
+                            match crate::paths::safe_remote_child(&app.remote_cwd, &new_name) {
+                                Ok(path) => {
+                                    crate::session::enqueue_edit_upload(app, runtime, path);
+                                }
+                                Err(_) => {
+                                    crate::session::cancel_edit(app, runtime, true);
+                                    reduce(
+                                        app,
+                                        Action::ShowError("path escapes directory".to_string()),
+                                    );
+                                }
                             }
                         }
                     }
@@ -526,6 +644,9 @@ pub(crate) async fn handle_key(
                 app.prompt_value = dd_ftp_app::TextField::from_str(&entry.name);
             }
         }
+        KeyCode::Char('E') => {
+            crate::session::start_remote_edit(app, runtime);
+        }
         KeyCode::Delete => {
             open_delete_prompt(app, runtime);
         }
@@ -745,6 +866,26 @@ pub(crate) fn navigate_parent_directory(app: &mut AppState, runtime: &mut Runtim
             crate::session::list_remote(app, runtime, app.remote_cwd.clone(), SelectPolicy::Reset);
         }
         dd_ftp_app::FocusPane::Queue => {}
+    }
+}
+
+fn save_settings(app: &mut AppState) {
+    let cfg = dd_ftp_storage::AppConfig::with_editor(&app.settings_editor.value);
+    match cfg.save_to_default_path() {
+        Ok(path) => {
+            reduce(app, Action::SetEditor(cfg.editor_or_empty()));
+            reduce(app, Action::ToggleSettings);
+            reduce(
+                app,
+                Action::SetStatus(format!("Settings saved to {}", path.display())),
+            );
+        }
+        Err(err) => {
+            reduce(
+                app,
+                Action::ShowError(format!("Could not save settings: {err}")),
+            );
+        }
     }
 }
 

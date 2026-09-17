@@ -459,13 +459,41 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.show_help = !state.show_help;
             if state.show_help {
                 state.show_theme_debug = false;
+                state.show_settings = false;
             }
         }
         Action::ToggleThemeDebug => {
             state.show_theme_debug = !state.show_theme_debug;
             if state.show_theme_debug {
                 state.show_help = false;
+                state.show_settings = false;
             }
+        }
+        Action::ToggleSettings => {
+            state.show_settings = !state.show_settings;
+            if state.show_settings {
+                state.show_help = false;
+                state.show_theme_debug = false;
+                state.settings_editor = TextField::from_str(&state.editor);
+            }
+        }
+        Action::SettingsInput(ch) => {
+            state.settings_editor.insert_char(ch);
+        }
+        Action::SettingsBackspace => {
+            state.settings_editor.backspace();
+        }
+        Action::SettingsMoveCursor { dir, shift } => {
+            state.settings_editor.move_cursor(dir, shift);
+        }
+        Action::SettingsBeginSelect(idx) => {
+            state.settings_editor.begin_drag(idx);
+        }
+        Action::SettingsExtendSelect(idx) => {
+            state.settings_editor.extend_drag(idx);
+        }
+        Action::SetEditor(value) => {
+            state.editor = value;
         }
         Action::SelectUp => match state.focus {
             FocusPane::Local => {
@@ -942,6 +970,25 @@ mod overlay_tests {
         assert!(s.show_theme_debug);
         reduce(&mut s, Action::ToggleThemeDebug);
         assert!(!s.show_theme_debug);
+    }
+
+    #[test]
+    fn toggle_settings_hydrates_editor_and_closes_other_overlays() {
+        let mut s = AppState {
+            editor: "hx".into(),
+            show_help: true,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleSettings);
+        assert!(s.show_settings);
+        assert!(!s.show_help);
+        assert_eq!(s.settings_editor.value, "hx");
+        reduce(&mut s, Action::SettingsInput('x'));
+        assert_eq!(s.settings_editor.value, "hxx");
+        reduce(&mut s, Action::SetEditor("nvim".into()));
+        assert_eq!(s.editor, "nvim");
+        reduce(&mut s, Action::ToggleSettings);
+        assert!(!s.show_settings);
     }
 
     #[test]

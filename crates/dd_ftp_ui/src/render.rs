@@ -554,11 +554,11 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     // Always leads with F1:Help. Connection state lives in the header; the
     // transient status string is shown right-aligned only when there is room.
     let keys = if status_area.width < 75 {
-        "F1:Help  Tab:Pane  j/k:Nav  /:Filter  u/d:Xfer  m:Sites  ^Q:Quit"
+        "F1:Help  F3:Set  Tab:Pane  j/k:Nav  /:Filter  u/d:Xfer  m:Sites  ^Q:Quit"
     } else if status_area.width < 110 {
-        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u/d: Up/Down   m: Bookmarks   o: Connect   Ctrl+q: Quit"
+        "F1: Help   F3: Settings   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u/d: Up/Down   m: Bookmarks   o: Connect   Ctrl+q: Quit"
     } else {
-        "F1: Help   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   r: Refresh   Ctrl+q: Quit   (mouse: click/scroll/drag)"
+        "F1: Help   F3: Settings   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   r: Refresh   Ctrl+q: Quit   (mouse: click/scroll/drag)"
     };
     let footer_keys =
         Paragraph::new(keys).style(Style::default().fg(t.text_secondary).bg(t.base_background));
@@ -1098,6 +1098,86 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         }
     }
 
+    if app.show_settings {
+        let area = centered_rect(70, 40, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(t.modal_background)),
+            area,
+        );
+
+        let env_override = std::env::var("VISUAL")
+            .ok()
+            .or_else(|| std::env::var("EDITOR").ok())
+            .filter(|s| !s.trim().is_empty());
+        let active = env_override.as_deref().unwrap_or_else(|| {
+            if app.editor.trim().is_empty() {
+                "vi"
+            } else {
+                app.editor.trim()
+            }
+        });
+
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                "Editor  (empty = $VISUAL, then $EDITOR, then vi)",
+                Style::default().fg(t.modal_labels),
+            )]),
+            Line::from(""),
+        ];
+        let mut editor_spans = vec![Span::styled("> ", Style::default().fg(t.input_text_focus))];
+        editor_spans.extend(render_field_line(&app.settings_editor, false, &t));
+        lines.push(Line::from(editor_spans));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("Active now: {active}"),
+            Style::default().fg(t.text_secondary),
+        )]));
+        if env_override.is_some() {
+            lines.push(Line::from(vec![Span::styled(
+                "Environment variable overrides the saved editor",
+                Style::default().fg(t.warning),
+            )]));
+        }
+        lines.push(Line::from(vec![Span::styled(
+            "Saved to ~/.config/ldnddev/dd_ftp.toml (not the theme file)",
+            Style::default().fg(t.text_secondary),
+        )]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Enter save | Esc cancel",
+            Style::default().fg(t.warning),
+        )]));
+
+        let modal = Paragraph::new(lines)
+            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(Line::from(vec![Span::styled(
+                        " Settings ",
+                        Style::default()
+                            .fg(t.modal_labels)
+                            .add_modifier(Modifier::BOLD),
+                    )]))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.border_active)),
+            );
+        frame.render_widget(modal, area);
+
+        let editor_input_area = Rect {
+            x: area.x + 1,
+            y: area.y + 3,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        map.fields.push(FieldRegion {
+            id: FieldId::SettingsEditor,
+            area: editor_input_area,
+            text_x: area.x + 3,
+        });
+    }
+
     if app.show_theme_debug {
         let area = centered_rect(60, 70, frame.area());
         frame.render_widget(Clear, area);
@@ -1280,6 +1360,48 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                             ],
                         )
                     }
+                    ChoicePromptKind::ConfirmEditLarge => (
+                        " Edit large file ",
+                        vec![
+                            Line::from(vec![Span::styled(
+                                format!("File is {target}. Download and edit anyway? (y/n)"),
+                                Style::default().fg(t.modal_labels),
+                            )]),
+                            Line::from(""),
+                            Line::from(vec![Span::styled(
+                                "y confirm | n / Esc cancel",
+                                Style::default().fg(t.warning),
+                            )]),
+                        ],
+                    ),
+                    ChoicePromptKind::ConfirmEditBinary => (
+                        " Binary file ",
+                        vec![
+                            Line::from(vec![Span::styled(
+                                "This file looks binary. Open it in $EDITOR anyway? (y/n)",
+                                Style::default().fg(t.modal_labels),
+                            )]),
+                            Line::from(""),
+                            Line::from(vec![Span::styled(
+                                "y confirm | n / Esc cancel (keeps the downloaded copy)",
+                                Style::default().fg(t.warning),
+                            )]),
+                        ],
+                    ),
+                    ChoicePromptKind::EditConflict => (
+                        " Remote changed ",
+                        vec![
+                            Line::from(vec![Span::styled(
+                                "The remote file changed while you were editing.",
+                                Style::default().fg(t.warning),
+                            )]),
+                            Line::from(""),
+                            Line::from(vec![Span::styled(
+                                "o overwrite  s skip  r save as  Esc cancel",
+                                Style::default().fg(t.warning),
+                            )]),
+                        ],
+                    ),
                     ChoicePromptKind::HostKey => {
                         let hk = app.host_key.as_ref();
                         let host = hk.map(|h| h.host.as_str()).unwrap_or("");
@@ -1354,6 +1476,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     TextPromptKind::Rename => (" Rename ", "Enter new name:"),
                     TextPromptKind::Chmod => (" Chmod ", "Enter octal mode (e.g. 755):"),
                     TextPromptKind::OverwriteRename => (" Rename destination ", "Enter new name:"),
+                    TextPromptKind::EditSaveAs => (" Save edit as ", "Enter remote file name:"),
                 };
 
                 let mut lines = vec![Line::from(vec![Span::styled(

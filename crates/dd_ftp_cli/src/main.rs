@@ -1,4 +1,5 @@
 mod bookmarks;
+mod edit;
 mod events;
 mod fs_ops;
 mod mouse;
@@ -15,7 +16,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dd_ftp_app::{reduce, Action, AppState};
-use dd_ftp_storage::SiteManager;
+use dd_ftp_storage::{AppConfig, SiteManager};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
@@ -46,6 +47,17 @@ async fn main() -> Result<()> {
     app.qc_hydrate();
 
     run_keyring_health_check(&mut app);
+
+    match AppConfig::load_or_default() {
+        Ok(cfg) => {
+            reduce(&mut app, Action::SetEditor(cfg.editor_or_empty()));
+        }
+        Err(err) => {
+            app.toast = Some(dd_ftp_app::Toast::warning(format!(
+                "Could not load settings: {err}"
+            )));
+        }
+    }
 
     let theme_loaded = dd_ftp_ui::reload_theme();
     reduce(
@@ -143,6 +155,11 @@ async fn run(
             handle_io_message(app, &mut runtime, msg);
         }
 
+        if runtime.editor_ready {
+            runtime.editor_ready = false;
+            run_blocking_editor(terminal, app, &mut runtime).await?;
+        }
+
         spawn_pending_workers(app, &mut runtime, &tx);
 
         if event::poll(Duration::from_millis(150))? {
@@ -169,4 +186,80 @@ async fn run(
         runtime.sync_worker_view(app);
         runtime.sync_busy(app);
     }
+}
+
+fn suspend_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read();
+    }
+    Ok(())
+}
+
+fn resume_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read();
+    }
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    Ok(())
+}
+
+async fn run_blocking_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut AppState,
+    runtime: &mut crate::session::Runtime,
+) -> Result<()> {
+    let Some(edit) = runtime.edit_session.clone() else {
+        return Ok(());
+    };
+    suspend_tui(terminal)?;
+    let path = edit.local_path.clone();
+    let before = edit.fingerprint;
+    let configured = app.editor.clone();
+    let editor_result =
+        tokio::task::spawn_blocking(move || crate::edit::run_editor(&path, &configured)).await;
+    resume_tui(terminal)?;
+    match editor_result {
+        Ok(Ok(status)) if status.success() => {
+            let after = crate::edit::fingerprint(&edit.local_path);
+            let changed = after != before;
+            crate::session::finish_edit_after_editor(app, runtime, changed);
+        }
+        Ok(Ok(status)) => {
+            reduce(
+                app,
+                Action::ShowError(format!(
+                    "Editor exited {}; file kept at {}",
+                    status.code().unwrap_or(-1),
+                    edit.local_path.display()
+                )),
+            );
+        }
+        Ok(Err(err)) => {
+            reduce(
+                app,
+                Action::ShowError(format!(
+                    "Could not run editor ({err}); file kept at {}",
+                    edit.local_path.display()
+                )),
+            );
+        }
+        Err(err) => {
+            reduce(app, Action::ShowError(format!("Editor task failed: {err}")));
+        }
+    }
+    Ok(())
 }

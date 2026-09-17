@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2026-09-17
+
+### Added
+- Remote edit (`E`): download to cache, open `$VISUAL`/`$EDITOR`, upload on change; prompts for large/binary files and remote-changed conflicts
+- Settings panel (`F3`) saves `editor` to `~/.config/ldnddev/dd_ftp.toml` (`$VISUAL`/`$EDITOR` still override)
+
 ## [1.4.0] - 2026-09-16
 
 ### Added

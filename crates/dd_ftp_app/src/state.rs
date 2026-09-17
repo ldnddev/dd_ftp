@@ -119,6 +119,7 @@ pub enum TextPromptKind {
     Rename,
     Chmod,
     OverwriteRename,
+    EditSaveAs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +129,9 @@ pub enum ChoicePromptKind {
     ConfirmBookmarkDelete,
     HostKey,
     Overwrite,
+    ConfirmEditLarge,
+    ConfirmEditBinary,
+    EditConflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -259,6 +263,7 @@ pub struct AppState {
     pub header_copy: String,
     pub show_help: bool,
     pub show_theme_debug: bool,
+    pub show_settings: bool,
     pub help_scroll: usize,
     pub show_quick_connect: bool,
     pub show_key_picker: bool,
@@ -281,6 +286,9 @@ pub struct AppState {
     /// mutating, and re-hydrate whenever `quick_connect` or
     /// `quick_connect_field` is changed directly.
     pub qc_field: TextField,
+    /// Configured editor from `~/.config/ldnddev/dd_ftp.toml` (env still wins at use).
+    pub editor: String,
+    pub settings_editor: TextField,
     pub worker_running: bool,
     pub worker_active_count: usize,
     pub worker_max_concurrency: usize,
@@ -354,6 +362,7 @@ impl AppState {
             || self.show_quick_connect
             || self.show_bookmarks
             || self.show_key_picker
+            || self.show_settings
     }
 
     pub fn is_text_prompt(&self) -> bool {
@@ -554,6 +563,7 @@ impl Default for AppState {
             header_copy: random_header_copy(),
             show_help: false,
             show_theme_debug: false,
+            show_settings: false,
             help_scroll: 0,
             show_quick_connect: false,
             show_key_picker: false,
@@ -572,6 +582,8 @@ impl Default for AppState {
             quick_connect: ConnectionInfo::default(),
             quick_connect_field: QuickConnectField::Name,
             qc_field: TextField::default(),
+            editor: String::new(),
+            settings_editor: TextField::default(),
             worker_running: false,
             worker_active_count: 0,
             worker_max_concurrency: 2,

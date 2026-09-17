@@ -48,6 +48,11 @@ pub const KEYMAP: &[KeyBinding] = &[
         group: KeyGroup::Global,
     },
     KeyBinding {
+        keys: "F3",
+        action: "Toggle settings (editor command; saved to ~/.config/ldnddev/dd_ftp.toml)",
+        group: KeyGroup::Global,
+    },
+    KeyBinding {
         keys: "Ctrl+q",
         action: "Quit (confirms if transfers are active)",
         group: KeyGroup::Global,
@@ -225,6 +230,11 @@ pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "e",
         action: "Rename selected item",
+        group: KeyGroup::FileOps,
+    },
+    KeyBinding {
+        keys: "E",
+        action: "Edit remote file in $VISUAL/$EDITOR, then upload on change",
         group: KeyGroup::FileOps,
     },
     KeyBinding {

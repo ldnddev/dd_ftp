@@ -32,6 +32,8 @@ pub struct TransferJob {
     pub last_error: Option<String>,
     /// After a successful transfer, delete the source (move).
     pub delete_source: bool,
+    /// After a successful download, open the local file in $EDITOR and upload on change.
+    pub edit_after: bool,
 }
 
 impl TransferJob {
@@ -54,6 +56,7 @@ impl TransferJob {
             updated_at: now,
             last_error: None,
             delete_source: false,
+            edit_after: false,
         }
     }
 }

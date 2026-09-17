@@ -197,9 +197,45 @@ pub(crate) fn handle_worker_result(
                 TransferDirection::Upload => "upload",
                 TransferDirection::Download => "download",
             };
+            let delete_source = msg.job.delete_source;
+            let direction = msg.job.direction;
+            let local_path = msg.job.local_path.clone();
+            let remote_path = msg.job.remote_path.clone();
             msg.job.last_error = None;
             reduce(app, Action::MarkTransferCompleted(msg.job));
             reduce(app, Action::SetStatus(format!("{name} complete")));
+
+            if delete_source {
+                match direction {
+                    TransferDirection::Upload => {
+                        runtime
+                            .pending_delete
+                            .push_back(crate::session::PendingDelete {
+                                name: std::path::Path::new(&local_path)
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| local_path.clone()),
+                                path: local_path,
+                                is_dir: false,
+                                remote: false,
+                            });
+                    }
+                    TransferDirection::Download => {
+                        runtime
+                            .pending_delete
+                            .push_back(crate::session::PendingDelete {
+                                name: remote_path
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&remote_path)
+                                    .to_string(),
+                                path: remote_path,
+                                is_dir: false,
+                                remote: true,
+                            });
+                    }
+                }
+            }
 
             reduce(
                 app,
@@ -208,7 +244,9 @@ pub(crate) fn handle_worker_result(
                     select: SelectPolicy::PreserveName,
                 },
             );
-            if app.connected && runtime.pending_scan.is_empty() {
+            if !runtime.pending_delete.is_empty() && runtime.in_flight.is_none() {
+                crate::fs_ops::start_next_delete(app, runtime);
+            } else if app.connected && runtime.pending_scan.is_empty() {
                 runtime.list_ok_status = None;
                 runtime.list_err_prefix = "Remote list failed".to_string();
                 list_remote(
@@ -251,12 +289,9 @@ mod worker_gate_tests {
     }
 
     fn pending_upload(local: &str, remote: &str) -> PendingFile {
-        PendingFile {
-            local_path: local.to_string(),
-            remote_path: remote.to_string(),
-            direction: TransferDirection::Upload,
-            size_bytes: Some(1),
-        }
+        let mut file = PendingFile::new(local, remote, TransferDirection::Upload);
+        file.size_bytes = Some(1);
+        file
     }
 
     #[test]

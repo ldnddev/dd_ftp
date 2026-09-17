@@ -30,6 +30,8 @@ pub struct TransferJob {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_error: Option<String>,
+    /// After a successful transfer, delete the source (move).
+    pub delete_source: bool,
 }
 
 impl TransferJob {
@@ -51,6 +53,7 @@ impl TransferJob {
             created_at: now,
             updated_at: now,
             last_error: None,
+            delete_source: false,
         }
     }
 }

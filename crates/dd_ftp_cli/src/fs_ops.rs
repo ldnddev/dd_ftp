@@ -5,7 +5,7 @@ use dd_ftp_core::{RemoteSession, TransferDirection, TransferJob};
 
 use crate::paths::safe_local_child;
 use crate::paths::safe_remote_child;
-use crate::session::{io_busy, FsKind, Runtime, SessionHandle};
+use crate::session::{io_busy, FsKind, PendingDelete, Runtime, SessionHandle};
 
 pub(crate) fn chmod(app: &mut AppState, runtime: &mut Runtime, path: &str, mode: u32) {
     if io_busy(runtime) {
@@ -233,92 +233,115 @@ pub(crate) fn rename_item(
     }
 }
 
-pub(crate) fn delete_item(app: &mut AppState, runtime: &mut Runtime, target: &str) {
+pub(crate) fn queue_deletes_for_pane(app: &mut AppState, runtime: &mut Runtime) -> usize {
+    let remote = matches!(app.focus, dd_ftp_app::FocusPane::Remote);
+    let cwd_local = app.local_cwd.clone();
+    let cwd_remote = app.remote_cwd.clone();
+    let entries: Vec<dd_ftp_core::FileEntry> = app
+        .entries_for_action(app.focus)
+        .into_iter()
+        .cloned()
+        .collect();
+    runtime.pending_delete.clear();
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        let path = if remote {
+            match safe_remote_child(&cwd_remote, &entry.name) {
+                Ok(p) => p,
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    continue;
+                }
+            }
+        } else {
+            match safe_local_child(Path::new(&cwd_local), &entry.name) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => {
+                    reduce(app, Action::ShowError("path escapes directory".to_string()));
+                    continue;
+                }
+            }
+        };
+        runtime.pending_delete.push_back(PendingDelete {
+            name: entry.name.clone(),
+            path,
+            is_dir: entry.is_dir(),
+            remote,
+        });
+    }
+    runtime.pending_delete.len()
+}
+
+pub(crate) fn delete_summary(runtime: &Runtime) -> String {
+    let n = runtime.pending_delete.len();
+    let dirs = runtime.pending_delete.iter().filter(|d| d.is_dir).count();
+    let files = n.saturating_sub(dirs);
+    match (n, files, dirs) {
+        (0, _, _) => "nothing".to_string(),
+        (1, _, _) => format!("'{}'", runtime.pending_delete[0].name),
+        (_, _, 0) => format!("{n} files"),
+        (_, 0, _) => format!("{n} folders"),
+        _ => format!("{n} items ({files} files, {dirs} folders)"),
+    }
+}
+
+pub(crate) fn start_next_delete(app: &mut AppState, runtime: &mut Runtime) {
     if io_busy(runtime) {
         return;
     }
-    let is_dir = match app.focus {
-        dd_ftp_app::FocusPane::Local => app
-            .selected_local_entry()
-            .map(|e| e.kind == dd_ftp_core::EntryKind::Directory)
-            .unwrap_or(false),
-        dd_ftp_app::FocusPane::Remote => app
-            .selected_remote_entry()
-            .map(|e| e.kind == dd_ftp_core::EntryKind::Directory)
-            .unwrap_or(false),
-        _ => false,
+    let Some(job) = runtime.pending_delete.front().cloned() else {
+        return;
     };
+    delete_pending(app, runtime, job);
+}
 
-    match app.focus {
-        dd_ftp_app::FocusPane::Local => {
-            let name = app
-                .selected_local_entry()
-                .map(|e| e.name.clone())
-                .unwrap_or_else(|| {
-                    Path::new(target)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                });
-            let target_path = match safe_local_child(Path::new(&app.local_cwd), &name) {
-                Ok(p) => p,
-                Err(_) => {
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
-                }
-            };
-            let target_str = target_path.to_string_lossy().to_string();
-            runtime.begin_fs(app, FsKind::Delete, false, format!("Deleted: {target_str}"));
-            runtime.spawn_local_fs(FsKind::Delete, move || {
-                if is_dir {
-                    std::fs::remove_dir(&target_path).map_err(Into::into)
-                } else {
-                    std::fs::remove_file(&target_path).map_err(Into::into)
-                }
-            });
+pub(crate) fn delete_pending(app: &mut AppState, runtime: &mut Runtime, job: PendingDelete) {
+    if io_busy(runtime) {
+        return;
+    }
+    if job.remote {
+        if !app.connected {
+            reduce(app, Action::SetStatus("Not connected".to_string()));
+            runtime.pending_delete.clear();
+            return;
         }
-        dd_ftp_app::FocusPane::Remote => {
-            if !app.connected {
-                reduce(app, Action::SetStatus("Not connected".to_string()));
-                return;
+        let path = job.path.clone();
+        let is_dir = job.is_dir;
+        runtime.begin_fs(app, FsKind::Delete, true, format!("Deleted: {path}"));
+        runtime.spawn_remote_fs(FsKind::Delete, move |handle| async move {
+            let mut handle = handle;
+            let result = match &mut handle {
+                Some(SessionHandle::Ftp(f)) => {
+                    if is_dir {
+                        f.remove_dir(&path).await
+                    } else {
+                        f.remove_file(&path).await
+                    }
+                }
+                Some(SessionHandle::Sftp(s)) => {
+                    if is_dir {
+                        s.remove_dir(&path).await
+                    } else {
+                        s.remove_file(&path).await
+                    }
+                }
+                None => Err(anyhow::anyhow!("not connected")),
+            };
+            (handle, result)
+        });
+    } else {
+        let target_path = Path::new(&job.path).to_path_buf();
+        let target_str = job.path.clone();
+        let is_dir = job.is_dir;
+        runtime.begin_fs(app, FsKind::Delete, false, format!("Deleted: {target_str}"));
+        runtime.spawn_local_fs(FsKind::Delete, move || {
+            if is_dir {
+                std::fs::remove_dir(&target_path).map_err(Into::into)
+            } else {
+                std::fs::remove_file(&target_path).map_err(Into::into)
             }
-            let name = match app.selected_remote_entry() {
-                Some(e) => e.name.clone(),
-                None => {
-                    reduce(app, Action::SetStatus("No item selected".to_string()));
-                    return;
-                }
-            };
-            let path = match safe_remote_child(&app.remote_cwd, &name) {
-                Ok(p) => p,
-                Err(_) => {
-                    reduce(app, Action::ShowError("path escapes directory".to_string()));
-                    return;
-                }
-            };
-            runtime.begin_fs(app, FsKind::Delete, true, format!("Deleted: {path}"));
-            runtime.spawn_remote_fs(FsKind::Delete, move |handle| async move {
-                let mut handle = handle;
-                let result = match &mut handle {
-                    Some(SessionHandle::Ftp(f)) => {
-                        if is_dir {
-                            f.remove_dir(&path).await
-                        } else {
-                            f.remove_file(&path).await
-                        }
-                    }
-                    Some(SessionHandle::Sftp(s)) => {
-                        if is_dir {
-                            s.remove_dir(&path).await
-                        } else {
-                            s.remove_file(&path).await
-                        }
-                    }
-                    None => Err(anyhow::anyhow!("not connected")),
-                };
-                (handle, result)
-            });
-        }
-        _ => {}
+        });
     }
 }

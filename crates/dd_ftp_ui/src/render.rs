@@ -321,7 +321,16 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     frame.render_widget(local_path, path_panes[0]);
     frame.render_widget(remote_path, path_panes[1]);
 
-    let local_title = format!(" [1] Local  {} ", app.sort_title_suffix());
+    let local_marked = app.marked_live_count(FocusPane::Local);
+    let local_title = if local_marked > 0 {
+        format!(
+            " [1] Local  {}  {} marked ",
+            app.sort_title_suffix(),
+            local_marked
+        )
+    } else {
+        format!(" [1] Local  {} ", app.sort_title_suffix())
+    };
     let local = List::new(local_items)
         .style(Style::default().bg(t.body_background).fg(t.text_primary))
         .block(
@@ -350,7 +359,16 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         Style::default().fg(t.text_labels)
     };
 
-    let remote_title = format!(" [2] Remote  {} ", app.sort_title_suffix());
+    let remote_marked = app.marked_live_count(FocusPane::Remote);
+    let remote_title = if remote_marked > 0 {
+        format!(
+            " [2] Remote  {}  {} marked ",
+            app.sort_title_suffix(),
+            remote_marked
+        )
+    } else {
+        format!(" [2] Remote  {} ", app.sort_title_suffix())
+    };
     let remote = List::new(remote_items)
         .style(Style::default().bg(t.body_background).fg(t.text_primary))
         .block(
@@ -1165,7 +1183,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     if app.show_prompt {
         match app.prompt_kind {
             Some(PromptKind::Choice(kind)) => {
-                let area = centered_rect(60, 24, frame.area());
+                let area = centered_rect(70, 32, frame.area());
                 frame.render_widget(Clear, area);
                 frame.render_widget(
                     Block::default().style(Style::default().bg(t.modal_background)),
@@ -1220,12 +1238,23 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                         let ow = app.overwrite.as_ref();
                         let local = ow.map(|o| o.current.local_path.as_str()).unwrap_or("");
                         let remote = ow.map(|o| o.current.remote_path.as_str()).unwrap_or("");
+                        let dest_newer = ow.is_some_and(|o| o.current.dest_is_newer());
+                        let remaining = ow.map(|o| o.remaining.len()).unwrap_or(0);
+                        let header = if dest_newer {
+                            "Destination exists and is newer"
+                        } else {
+                            "Destination exists"
+                        };
                         (
                             " Overwrite ",
                             vec![
                                 Line::from(vec![Span::styled(
-                                    "Destination exists",
-                                    Style::default().fg(t.modal_labels),
+                                    header,
+                                    Style::default().fg(if dest_newer {
+                                        t.warning
+                                    } else {
+                                        t.modal_labels
+                                    }),
                                 )]),
                                 Line::from(vec![Span::styled(
                                     format!("local: {local}"),
@@ -1235,9 +1264,17 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                                     format!("remote: {remote}"),
                                     Style::default().fg(t.modal_text),
                                 )]),
+                                Line::from(vec![Span::styled(
+                                    format!("{remaining} more in queue"),
+                                    Style::default().fg(t.text_secondary),
+                                )]),
                                 Line::from(""),
                                 Line::from(vec![Span::styled(
-                                    "Enter/s skip  o overwrite  a overwrite-all  n skip-all  r rename  Esc abort",
+                                    "s skip  o overwrite  r rename this",
+                                    Style::default().fg(t.warning),
+                                )]),
+                                Line::from(vec![Span::styled(
+                                    "a overwrite-all  n skip-all  A overwrite-newer  N skip-newer  t rename-newer  Esc abort",
                                     Style::default().fg(t.warning),
                                 )]),
                             ],

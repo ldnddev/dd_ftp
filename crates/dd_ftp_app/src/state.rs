@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use dd_ftp_core::{ConnectionInfo, FileEntry, TransferDirection};
 use dd_ftp_transfer::TransferQueue;
 
@@ -135,6 +136,12 @@ pub enum OverwritePolicy {
     Ask,
     OverwriteAll,
     SkipAll,
+    /// Remaining dest-newer conflicts are overwritten; other conflicts still ask.
+    OverwriteNewer,
+    /// Remaining dest-newer conflicts are skipped; other conflicts still ask.
+    SkipNewer,
+    /// Remaining dest-newer conflicts get an auto unique name; other conflicts still ask.
+    RenameNewer,
 }
 
 /// One file discovered by a folder scan. Enqueued only after drain + overwrite.
@@ -144,6 +151,34 @@ pub struct PendingFile {
     pub remote_path: String,
     pub direction: TransferDirection,
     pub size_bytes: Option<u64>,
+    pub source_modified: Option<DateTime<Utc>>,
+    pub dest_modified: Option<DateTime<Utc>>,
+    pub delete_source: bool,
+}
+
+impl PendingFile {
+    pub fn new(
+        local_path: impl Into<String>,
+        remote_path: impl Into<String>,
+        direction: TransferDirection,
+    ) -> Self {
+        Self {
+            local_path: local_path.into(),
+            remote_path: remote_path.into(),
+            direction,
+            size_bytes: None,
+            source_modified: None,
+            dest_modified: None,
+            delete_source: false,
+        }
+    }
+
+    pub fn dest_is_newer(&self) -> bool {
+        match (self.source_modified, self.dest_modified) {
+            (Some(source), Some(dest)) => dest > source,
+            _ => false,
+        }
+    }
 }
 
 /// Display snapshot of the overwrite ChoicePrompt. Remaining files live on the CLI run stack.
@@ -268,6 +303,8 @@ pub struct AppState {
     pub sort_asc: bool,
     pub marked_local: HashSet<String>,
     pub marked_remote: HashSet<String>,
+    pub mark_anchor_local: Option<usize>,
+    pub mark_anchor_remote: Option<usize>,
 }
 
 impl AppState {
@@ -444,9 +481,21 @@ impl AppState {
             .copied()
     }
 
-    /// Marked live rows for `u`/`d`/Enter. If no current listing path is marked,
-    /// fall back to the focused row (stale marks after rename/delete/refresh).
-    pub fn entries_for_transfer(&self, pane: FocusPane) -> Vec<&FileEntry> {
+    pub fn marked_live_count(&self, pane: FocusPane) -> usize {
+        let (entries, marks) = match pane {
+            FocusPane::Local => (&self.local_entries, &self.marked_local),
+            FocusPane::Remote => (&self.remote_entries, &self.marked_remote),
+            FocusPane::Queue => return 0,
+        };
+        entries
+            .iter()
+            .filter(|e| marks.contains(&e.path) && !is_dot_or_dotdot(&e.name))
+            .count()
+    }
+
+    /// Marked live rows for transfer/delete/move. If no current listing path is
+    /// marked, fall back to the focused row (stale marks after rename/delete/refresh).
+    pub fn entries_for_action(&self, pane: FocusPane) -> Vec<&FileEntry> {
         let (entries, marks, selected) = match pane {
             FocusPane::Local => (
                 &self.local_entries,
@@ -469,6 +518,10 @@ impl AppState {
         } else {
             live
         }
+    }
+
+    pub fn entries_for_transfer(&self, pane: FocusPane) -> Vec<&FileEntry> {
+        self.entries_for_action(pane)
     }
 
     pub fn set_focus(&mut self, pane: FocusPane) {
@@ -538,6 +591,8 @@ impl Default for AppState {
             sort_asc: true,
             marked_local: HashSet::new(),
             marked_remote: HashSet::new(),
+            mark_anchor_local: None,
+            mark_anchor_remote: None,
         }
     }
 }

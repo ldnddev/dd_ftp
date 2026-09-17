@@ -43,6 +43,35 @@ fn key_picker_index(visible: &[&FileEntry], prefer: Option<&str>, prefer_ssh: bo
         .unwrap_or(0)
 }
 
+fn mark_visible_range(state: &mut AppState, pane: FocusPane, from: usize, to: usize) {
+    let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+    let paths: Vec<String> = match pane {
+        FocusPane::Local => state
+            .visible_local()
+            .into_iter()
+            .enumerate()
+            .filter(|(i, e)| *i >= lo && *i <= hi && !is_dot_or_dotdot(&e.name))
+            .map(|(_, e)| e.path.clone())
+            .collect(),
+        FocusPane::Remote => state
+            .visible_remote()
+            .into_iter()
+            .enumerate()
+            .filter(|(i, e)| *i >= lo && *i <= hi && !is_dot_or_dotdot(&e.name))
+            .map(|(_, e)| e.path.clone())
+            .collect(),
+        FocusPane::Queue => return,
+    };
+    let marks = match pane {
+        FocusPane::Local => &mut state.marked_local,
+        FocusPane::Remote => &mut state.marked_remote,
+        FocusPane::Queue => return,
+    };
+    for path in paths {
+        marks.insert(path);
+    }
+}
+
 fn preserve_filter_selection(
     state: &mut AppState,
     local_name: Option<String>,
@@ -525,20 +554,87 @@ pub fn reduce(state: &mut AppState, action: Action) {
             };
             if let Some((path, skip)) = info {
                 if !skip {
-                    let marks = match state.focus {
-                        FocusPane::Local => &mut state.marked_local,
-                        FocusPane::Remote => &mut state.marked_remote,
+                    let (marks, anchor, selected) = match state.focus {
+                        FocusPane::Local => (
+                            &mut state.marked_local,
+                            &mut state.mark_anchor_local,
+                            state.selected_local,
+                        ),
+                        FocusPane::Remote => (
+                            &mut state.marked_remote,
+                            &mut state.mark_anchor_remote,
+                            state.selected_remote,
+                        ),
                         FocusPane::Queue => return,
                     };
                     if !marks.remove(&path) {
                         marks.insert(path);
                     }
+                    *anchor = Some(selected);
                 }
             }
         }
+        Action::ExtendMark { dir } => {
+            let pane = state.focus;
+            if pane == FocusPane::Queue {
+                return;
+            }
+            let (selected, visible_len) = match pane {
+                FocusPane::Local => (state.selected_local, state.visible_local().len()),
+                FocusPane::Remote => (state.selected_remote, state.visible_remote().len()),
+                FocusPane::Queue => return,
+            };
+            if dir < 0 && selected == 0 {
+                return;
+            }
+            if dir > 0 && selected >= visible_len.saturating_sub(1) {
+                return;
+            }
+            match pane {
+                FocusPane::Local => {
+                    if state.mark_anchor_local.is_none() {
+                        state.mark_anchor_local = Some(selected);
+                    }
+                    if dir < 0 {
+                        state.selected_local = selected - 1;
+                    } else {
+                        state.selected_local = selected + 1;
+                    }
+                    let from = state.mark_anchor_local.unwrap_or(state.selected_local);
+                    mark_visible_range(state, pane, from, state.selected_local);
+                }
+                FocusPane::Remote => {
+                    if state.mark_anchor_remote.is_none() {
+                        state.mark_anchor_remote = Some(selected);
+                    }
+                    if dir < 0 {
+                        state.selected_remote = selected - 1;
+                    } else {
+                        state.selected_remote = selected + 1;
+                    }
+                    let from = state.mark_anchor_remote.unwrap_or(state.selected_remote);
+                    mark_visible_range(state, pane, from, state.selected_remote);
+                }
+                FocusPane::Queue => {}
+            }
+        }
+        Action::MarkRange { pane, from, to } => {
+            match pane {
+                FocusPane::Local => state.mark_anchor_local = Some(from),
+                FocusPane::Remote => state.mark_anchor_remote = Some(from),
+                FocusPane::Queue => {}
+            }
+            mark_visible_range(state, pane, from, to);
+        }
         Action::ClearMarks { pane } => match pane {
-            FocusPane::Local => state.marked_local.clear(),
-            FocusPane::Remote => state.marked_remote.clear(),
+            FocusPane::Local => {
+                state.marked_local.clear();
+                state.mark_anchor_local = None;
+            }
+            FocusPane::Remote => {
+                state.marked_remote.clear();
+                state.mark_anchor_remote = None;
+            }
             FocusPane::Queue => {}
         },
         Action::CycleSort => {
@@ -733,12 +829,13 @@ mod prompt_tests {
     }
 
     fn pending(name: &str) -> crate::PendingFile {
-        crate::PendingFile {
-            local_path: format!("/tmp/{name}"),
-            remote_path: format!("/pub/{name}"),
-            direction: dd_ftp_core::TransferDirection::Upload,
-            size_bytes: Some(1),
-        }
+        let mut file = crate::PendingFile::new(
+            format!("/tmp/{name}"),
+            format!("/pub/{name}"),
+            dd_ftp_core::TransferDirection::Upload,
+        );
+        file.size_bytes = Some(1);
+        file
     }
 
     #[test]
@@ -1398,6 +1495,24 @@ mod mark_sort_chmod_tests {
         reduce(&mut s, Action::ToggleMark);
         assert!(!s.marked_local.contains("/a"));
         assert!(s.marked_local.is_empty());
+    }
+
+    #[test]
+    fn extend_mark_covers_range_from_anchor() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b"), fe("c")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ExtendMark { dir: 1 });
+        assert_eq!(s.selected_local, 1);
+        assert!(s.marked_local.contains("/a"));
+        assert!(s.marked_local.contains("/b"));
+        reduce(&mut s, Action::ExtendMark { dir: 1 });
+        assert_eq!(s.selected_local, 2);
+        assert!(s.marked_local.contains("/c"));
+        assert_eq!(s.marked_live_count(FocusPane::Local), 3);
     }
 
     #[test]

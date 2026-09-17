@@ -149,21 +149,42 @@ pub(crate) async fn handle_key(
                         OverwriteChoice::Overwrite,
                     );
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
+                KeyCode::Char('a') => {
                     crate::session::apply_overwrite_choice(
                         app,
                         runtime,
                         OverwriteChoice::OverwriteAll,
                     );
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
+                KeyCode::Char('A') => {
+                    crate::session::apply_overwrite_choice(
+                        app,
+                        runtime,
+                        OverwriteChoice::OverwriteNewer,
+                    );
+                }
+                KeyCode::Char('n') => {
                     crate::session::apply_overwrite_choice(app, runtime, OverwriteChoice::SkipAll);
+                }
+                KeyCode::Char('N') => {
+                    crate::session::apply_overwrite_choice(
+                        app,
+                        runtime,
+                        OverwriteChoice::SkipNewer,
+                    );
                 }
                 KeyCode::Esc => {
                     crate::session::apply_overwrite_choice(app, runtime, OverwriteChoice::Abort);
                 }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
+                KeyCode::Char('r') => {
                     crate::session::apply_overwrite_choice(app, runtime, OverwriteChoice::Rename);
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    crate::session::apply_overwrite_choice(
+                        app,
+                        runtime,
+                        OverwriteChoice::RenameNewer,
+                    );
                 }
                 _ => {}
             }
@@ -171,6 +192,9 @@ pub(crate) async fn handle_key(
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                if kind == ChoicePromptKind::ConfirmDelete {
+                    runtime.pending_delete.clear();
+                }
                 crate::session::reject_host_key(runtime);
                 reduce(app, Action::CancelPrompt);
             }
@@ -180,11 +204,8 @@ pub(crate) async fn handle_key(
                     return Ok(LoopControl::Quit);
                 }
                 ChoicePromptKind::ConfirmDelete => {
-                    let target = app.prompt_target.clone();
                     reduce(app, Action::ConfirmPrompt);
-                    if let Some(t) = target {
-                        crate::fs_ops::delete_item(app, runtime, &t);
-                    }
+                    crate::fs_ops::start_next_delete(app, runtime);
                 }
                 ChoicePromptKind::ConfirmBookmarkDelete => {
                     let name = app.prompt_target.clone();
@@ -326,7 +347,7 @@ pub(crate) async fn handle_key(
         && key.code == KeyCode::Delete
         && key.modifiers.contains(KeyModifiers::CONTROL)
     {
-        open_delete_prompt(app);
+        open_delete_prompt(app, runtime);
         return Ok(LoopControl::Continue);
     }
 
@@ -477,6 +498,8 @@ pub(crate) async fn handle_key(
         KeyCode::Esc => {
             if app.show_compare {
                 reduce(app, Action::ToggleCompare);
+            } else if app.marked_live_count(app.focus) > 0 {
+                reduce(app, Action::ClearMarks { pane: app.focus });
             }
         }
         KeyCode::Enter => match app.focus {
@@ -504,7 +527,7 @@ pub(crate) async fn handle_key(
             }
         }
         KeyCode::Delete => {
-            open_delete_prompt(app);
+            open_delete_prompt(app, runtime);
         }
         KeyCode::Tab => reduce(app, Action::FocusNextPane),
         KeyCode::Char('1') => {
@@ -522,6 +545,8 @@ pub(crate) async fn handle_key(
         KeyCode::Up | KeyCode::Char('k') => {
             if app.focus == FocusPane::Queue {
                 reduce(app, Action::QueueScroll(-1));
+            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                reduce(app, Action::ExtendMark { dir: -1 });
             } else {
                 reduce(app, Action::SelectUp)
             }
@@ -529,6 +554,8 @@ pub(crate) async fn handle_key(
         KeyCode::Down | KeyCode::Char('j') => {
             if app.focus == FocusPane::Queue {
                 reduce(app, Action::QueueScroll(1));
+            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                reduce(app, Action::ExtendMark { dir: 1 });
             } else {
                 reduce(app, Action::SelectDown)
             }
@@ -578,6 +605,9 @@ pub(crate) async fn handle_key(
         }
         KeyCode::Char('m') => {
             reduce(app, Action::ToggleBookmarks);
+        }
+        KeyCode::Char('M') => {
+            crate::session::queue_move_selected(app, runtime);
         }
         KeyCode::Char('c') => {
             if app.connected {
@@ -770,16 +800,18 @@ pub(crate) fn open_chmod_prompt(app: &mut AppState, runtime: &Runtime) {
     }
 }
 
-pub(crate) fn open_delete_prompt(app: &mut AppState) {
-    if let Some(entry) = get_selected_entry(app) {
-        reduce(app, Action::ShowDeletePrompt);
-        app.prompt_target = Some(entry.path.clone());
-    } else {
+pub(crate) fn open_delete_prompt(app: &mut AppState, runtime: &mut Runtime) {
+    let n = crate::fs_ops::queue_deletes_for_pane(app, runtime);
+    if n == 0 {
         reduce(
             app,
             Action::SetStatus("Nothing selected to delete".to_string()),
         );
+        return;
     }
+    let summary = crate::fs_ops::delete_summary(runtime);
+    reduce(app, Action::ShowDeletePrompt);
+    app.prompt_target = Some(summary);
 }
 
 pub(crate) fn open_key_picker(app: &mut AppState) {

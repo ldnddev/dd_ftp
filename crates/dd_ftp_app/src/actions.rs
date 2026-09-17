@@ -101,6 +101,14 @@ pub enum Action {
     ShowDeletePrompt,
     ShowChoicePrompt(ChoicePromptKind),
     ToggleMark,
+    ExtendMark {
+        dir: i32,
+    },
+    MarkRange {
+        pane: FocusPane,
+        from: usize,
+        to: usize,
+    },
     ClearMarks {
         pane: FocusPane,
     },

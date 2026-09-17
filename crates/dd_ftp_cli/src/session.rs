@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,9 +9,10 @@ use std::{
 };
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use dd_ftp_app::{
-    reduce, Action, AppState, ChoicePromptKind, HostKeyView, OverwritePolicy, OverwritePrompt,
-    PendingFile, PromptKind, SelectPolicy, TextPromptKind, Toast,
+    reduce, Action, AppState, ChoicePromptKind, FocusPane, HostKeyView, OverwritePolicy,
+    OverwritePrompt, PendingFile, PromptKind, SelectPolicy, TextPromptKind, Toast,
 };
 use dd_ftp_core::{
     ConnectionInfo, FileEntry, Protocol, RemoteSession, TransferDirection, TransferJob,
@@ -35,6 +36,14 @@ pub(crate) enum FsKind {
     Rename,
     Delete,
     Chmod,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingDelete {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub remote: bool,
 }
 
 pub(crate) enum InFlight {
@@ -129,6 +138,9 @@ pub(crate) struct Runtime {
     pub drain_mkdir: bool,
     pub mkdir_queue: VecDeque<String>,
     pub worker_active_count: usize,
+    pub pending_delete: VecDeque<PendingDelete>,
+    pub listed_dest_names: HashSet<String>,
+    pub scan_delete_source: bool,
 }
 
 impl Runtime {
@@ -152,6 +164,9 @@ impl Runtime {
             drain_mkdir: false,
             mkdir_queue: VecDeque::new(),
             worker_active_count: 0,
+            pending_delete: VecDeque::new(),
+            listed_dest_names: HashSet::new(),
+            scan_delete_source: false,
         }
     }
 
@@ -169,6 +184,7 @@ impl Runtime {
     /// Connect/list/fs/scan (not host-key prompts) or an active transfer worker.
     pub fn is_working(&self) -> bool {
         self.worker_active_count > 0
+            || !self.pending_delete.is_empty()
             || matches!(
                 self.in_flight,
                 Some(
@@ -566,8 +582,13 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                 Ok(()) => {
                     let status = runtime.fs_ok_status.clone();
                     reduce(app, Action::SetStatus(status));
+                    if kind == FsKind::Delete && !runtime.pending_delete.is_empty() {
+                        runtime.pending_delete.pop_front();
+                    }
                     if !runtime.pending_scan.is_empty() {
                         maybe_resume_drain(app, runtime);
+                    } else if !runtime.pending_delete.is_empty() {
+                        crate::fs_ops::start_next_delete(app, runtime);
                     } else if runtime.fs_remote {
                         if app.connected {
                             relist_remote(app, runtime);
@@ -584,6 +605,9 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                 }
                 Err(err) => {
                     reduce(app, Action::ShowError(format!("{err}")));
+                    if kind == FsKind::Delete {
+                        runtime.pending_delete.clear();
+                    }
                     maybe_resume_drain(app, runtime);
                 }
             }
@@ -630,7 +654,7 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                 enqueue_pending_file(app, file);
                 return;
             }
-            apply_scan_item(&mut runtime.pending_scan, file);
+            apply_scan_item(&mut runtime.pending_scan, file, runtime.scan_delete_source);
         }
         IoMessage::ScanDone { generation } => {
             if generation != runtime.generation {
@@ -849,11 +873,8 @@ pub(crate) fn connection_info_from_env() -> ConnectionInfo {
     }
 }
 
-fn pane_entries_for_transfer(app: &AppState, pane: dd_ftp_app::FocusPane) -> Vec<FileEntry> {
-    app.entries_for_transfer(pane)
-        .into_iter()
-        .cloned()
-        .collect()
+fn pane_entries_for_action(app: &AppState, pane: FocusPane) -> Vec<FileEntry> {
+    app.entries_for_action(pane).into_iter().cloned().collect()
 }
 
 pub(crate) fn queue_upload_selected(app: &mut AppState, runtime: &mut Runtime) {
@@ -862,8 +883,8 @@ pub(crate) fn queue_upload_selected(app: &mut AppState, runtime: &mut Runtime) {
         return;
     }
 
-    let entries = pane_entries_for_transfer(app, dd_ftp_app::FocusPane::Local);
-    enqueue_selected(app, runtime, entries, TransferDirection::Upload);
+    let entries = pane_entries_for_action(app, FocusPane::Local);
+    enqueue_selected(app, runtime, entries, TransferDirection::Upload, false);
 }
 
 pub(crate) fn queue_download_selected(app: &mut AppState, runtime: &mut Runtime) {
@@ -872,8 +893,26 @@ pub(crate) fn queue_download_selected(app: &mut AppState, runtime: &mut Runtime)
         return;
     }
 
-    let entries = pane_entries_for_transfer(app, dd_ftp_app::FocusPane::Remote);
-    enqueue_selected(app, runtime, entries, TransferDirection::Download);
+    let entries = pane_entries_for_action(app, FocusPane::Remote);
+    enqueue_selected(app, runtime, entries, TransferDirection::Download, false);
+}
+
+pub(crate) fn queue_move_selected(app: &mut AppState, runtime: &mut Runtime) {
+    if !app.connected {
+        reduce(app, Action::SetStatus("Not connected".to_string()));
+        return;
+    }
+    match app.focus {
+        FocusPane::Local => {
+            let entries = pane_entries_for_action(app, FocusPane::Local);
+            enqueue_selected(app, runtime, entries, TransferDirection::Upload, true);
+        }
+        FocusPane::Remote => {
+            let entries = pane_entries_for_action(app, FocusPane::Remote);
+            enqueue_selected(app, runtime, entries, TransferDirection::Download, true);
+        }
+        FocusPane::Queue => {}
+    }
 }
 
 fn enqueue_selected(
@@ -881,11 +920,12 @@ fn enqueue_selected(
     runtime: &mut Runtime,
     mut entries: Vec<FileEntry>,
     direction: TransferDirection,
+    delete_source: bool,
 ) {
     match entries.len() {
         0 => {}
-        1 => enqueue_entry(app, runtime, entries.remove(0), direction),
-        _ => enqueue_entries(app, runtime, entries, direction),
+        1 => enqueue_entry(app, runtime, entries.remove(0), direction, delete_source),
+        _ => enqueue_entries(app, runtime, entries, direction, delete_source),
     }
 }
 
@@ -894,8 +934,9 @@ pub(crate) fn enqueue_entry(
     runtime: &mut Runtime,
     entry: FileEntry,
     direction: TransferDirection,
+    delete_source: bool,
 ) {
-    enqueue_entries(app, runtime, vec![entry], direction);
+    enqueue_entries(app, runtime, vec![entry], direction, delete_source);
 }
 
 fn pending_from_entry(
@@ -921,6 +962,9 @@ fn pending_from_entry(
         remote_path,
         direction,
         size_bytes: Some(entry.size),
+        source_modified: entry.modified,
+        dest_modified: None,
+        delete_source: false,
     })
 }
 
@@ -929,6 +973,7 @@ pub(crate) fn enqueue_entries(
     runtime: &mut Runtime,
     entries: Vec<FileEntry>,
     direction: TransferDirection,
+    delete_source: bool,
 ) {
     if drain_busy(runtime) {
         return;
@@ -966,19 +1011,27 @@ pub(crate) fn enqueue_entries(
 
     for file in files {
         match pending_from_entry(app, &file, direction) {
-            Ok(pending) => runtime.pending_scan.push_back(pending),
+            Ok(mut pending) => {
+                pending.delete_source = delete_source;
+                runtime.pending_scan.push_back(pending);
+            }
             Err(_) => reduce(app, Action::ShowError("path escapes directory".to_string())),
         }
     }
 
     if !dirs.is_empty() {
-        start_scan_entries(app, runtime, dirs, direction);
+        start_scan_entries(app, runtime, dirs, direction, delete_source);
         return;
     }
     drain_scan_next(app, runtime);
 }
 
-pub(crate) fn apply_scan_item(pending_scan: &mut VecDeque<PendingFile>, file: PendingFile) {
+pub(crate) fn apply_scan_item(
+    pending_scan: &mut VecDeque<PendingFile>,
+    mut file: PendingFile,
+    delete_source: bool,
+) {
+    file.delete_source = delete_source;
     pending_scan.push_back(file);
 }
 
@@ -990,13 +1043,16 @@ pub(crate) enum OverwriteChoice {
     SkipAll,
     Abort,
     Rename,
+    OverwriteNewer,
+    SkipNewer,
+    RenameNewer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DrainEvent {
-    BeginDownload { dest_exists: bool },
+    BeginDownload { dest_exists: bool, dest_newer: bool },
     BeginUpload,
-    UploadList { dest_exists: bool },
+    UploadList { dest_exists: bool, dest_newer: bool },
     UploadParentMissing,
     UploadParentsCreated,
 }
@@ -1008,16 +1064,74 @@ pub(crate) enum DrainStep {
     Enqueue,
     Skip,
     Prompt,
+    RenameAuto,
 }
 
-pub(crate) fn resolve_conflict(dest_exists: bool, policy: OverwritePolicy) -> DrainStep {
+pub(crate) fn dest_is_newer(source: Option<DateTime<Utc>>, dest: Option<DateTime<Utc>>) -> bool {
+    match (source, dest) {
+        (Some(source), Some(dest)) => dest > source,
+        _ => false,
+    }
+}
+
+pub(crate) fn local_mtime(path: &str) -> Option<DateTime<Utc>> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from)
+}
+
+pub(crate) fn uniquify_filename(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() && !e.contains('/') => {
+            (s.to_string(), format!(".{e}"))
+        }
+        _ => (name.to_string(), String::new()),
+    };
+    for n in 1..10_000 {
+        let candidate = format!("{stem}-{n}{ext}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{stem}-copy{ext}")
+}
+
+pub(crate) fn resolve_conflict(
+    dest_exists: bool,
+    dest_newer: bool,
+    policy: OverwritePolicy,
+) -> DrainStep {
     if !dest_exists {
-        DrainStep::Enqueue
-    } else {
-        match policy {
-            OverwritePolicy::Ask => DrainStep::Prompt,
-            OverwritePolicy::OverwriteAll => DrainStep::Enqueue,
-            OverwritePolicy::SkipAll => DrainStep::Skip,
+        return DrainStep::Enqueue;
+    }
+    match policy {
+        OverwritePolicy::Ask => DrainStep::Prompt,
+        OverwritePolicy::OverwriteAll => DrainStep::Enqueue,
+        OverwritePolicy::SkipAll => DrainStep::Skip,
+        OverwritePolicy::OverwriteNewer => {
+            if dest_newer {
+                DrainStep::Enqueue
+            } else {
+                DrainStep::Prompt
+            }
+        }
+        OverwritePolicy::SkipNewer => {
+            if dest_newer {
+                DrainStep::Skip
+            } else {
+                DrainStep::Prompt
+            }
+        }
+        OverwritePolicy::RenameNewer => {
+            if dest_newer {
+                DrainStep::RenameAuto
+            } else {
+                DrainStep::Prompt
+            }
         }
     }
 }
@@ -1028,18 +1142,26 @@ pub(crate) fn drain_step(
     policy: OverwritePolicy,
 ) -> DrainStep {
     match (file.direction, event) {
-        (TransferDirection::Download, DrainEvent::BeginDownload { dest_exists }) => {
-            resolve_conflict(dest_exists, policy)
-        }
+        (
+            TransferDirection::Download,
+            DrainEvent::BeginDownload {
+                dest_exists,
+                dest_newer,
+            },
+        ) => resolve_conflict(dest_exists, dest_newer, policy),
         (TransferDirection::Upload, DrainEvent::BeginUpload) => {
             DrainStep::ListParent(parent_remote_path(&file.remote_path))
         }
-        (TransferDirection::Upload, DrainEvent::UploadList { dest_exists }) => {
-            resolve_conflict(dest_exists, policy)
-        }
+        (
+            TransferDirection::Upload,
+            DrainEvent::UploadList {
+                dest_exists,
+                dest_newer,
+            },
+        ) => resolve_conflict(dest_exists, dest_newer, policy),
         (TransferDirection::Upload, DrainEvent::UploadParentMissing) => DrainStep::CreateParents,
         (TransferDirection::Upload, DrainEvent::UploadParentsCreated) => {
-            resolve_conflict(false, policy)
+            resolve_conflict(false, false, policy)
         }
         _ => DrainStep::Skip,
     }
@@ -1081,6 +1203,7 @@ fn remote_basename(path: &str) -> String {
 pub(crate) fn enqueue_pending_file(app: &mut AppState, file: PendingFile) {
     let mut job = TransferJob::new(file.local_path, file.remote_path, file.direction);
     job.size_bytes = file.size_bytes;
+    job.delete_source = file.delete_source;
     // Drain enqueue must not clear worker_cancel_requested (QueueTransfer does).
     app.queue.enqueue(job);
     reduce(
@@ -1104,6 +1227,10 @@ pub(crate) fn maybe_resume_drain(app: &mut AppState, runtime: &mut Runtime) {
     }
     if !runtime.pending_scan.is_empty() {
         drain_scan_next(app, runtime);
+        return;
+    }
+    if !runtime.pending_delete.is_empty() {
+        crate::fs_ops::start_next_delete(app, runtime);
     }
 }
 
@@ -1132,9 +1259,21 @@ pub(crate) fn drain_scan_next(app: &mut AppState, runtime: &mut Runtime) {
         match file.direction {
             TransferDirection::Download => {
                 let dest_exists = Path::new(&file.local_path).exists();
+                let dest_modified = if dest_exists {
+                    local_mtime(&file.local_path)
+                } else {
+                    None
+                };
+                if let Some(front) = runtime.pending_scan.front_mut() {
+                    front.dest_modified = dest_modified;
+                }
+                let dest_newer = dest_is_newer(file.source_modified, dest_modified);
                 match drain_step(
                     &file,
-                    DrainEvent::BeginDownload { dest_exists },
+                    DrainEvent::BeginDownload {
+                        dest_exists,
+                        dest_newer,
+                    },
                     runtime.overwrite_policy,
                 ) {
                     DrainStep::Enqueue => {
@@ -1147,6 +1286,12 @@ pub(crate) fn drain_scan_next(app: &mut AppState, runtime: &mut Runtime) {
                     DrainStep::Prompt => {
                         show_overwrite_prompt(app, runtime);
                         return;
+                    }
+                    DrainStep::RenameAuto => {
+                        if let Some(mut file) = runtime.pending_scan.pop_front() {
+                            apply_auto_rename(app, runtime, &mut file);
+                            enqueue_pending_file(app, file);
+                        }
                     }
                     _ => return,
                 }
@@ -1178,8 +1323,15 @@ pub(crate) fn handle_drain_list_result(
     let dest_name = remote_basename(&file.remote_path);
     match result {
         Ok(entries) => {
-            let dest_exists = entries.iter().any(|e| e.name == dest_name);
-            apply_drain_conflict(app, runtime, file, dest_exists);
+            runtime.listed_dest_names = entries.iter().map(|e| e.name.clone()).collect();
+            let dest_entry = entries.iter().find(|e| e.name == dest_name);
+            let dest_exists = dest_entry.is_some();
+            let dest_modified = dest_entry.and_then(|e| e.modified);
+            if let Some(front) = runtime.pending_scan.front_mut() {
+                front.dest_modified = dest_modified;
+            }
+            let dest_newer = dest_is_newer(file.source_modified, dest_modified);
+            apply_drain_conflict(app, runtime, file, dest_exists, dest_newer);
         }
         Err(err) => {
             let parent = parent_remote_path(&file.remote_path);
@@ -1199,7 +1351,7 @@ pub(crate) fn handle_drain_list_result(
                         runtime.mkdir_queue = chain.into();
                         drain_mkdir_next(app, runtime);
                     }
-                    Ok(_) => apply_drain_conflict(app, runtime, file, false),
+                    Ok(_) => apply_drain_conflict(app, runtime, file, false, false),
                     Err(_) => {
                         reduce(app, Action::ShowError("path escapes directory".to_string()));
                         runtime.pending_scan.pop_front();
@@ -1220,10 +1372,14 @@ fn apply_drain_conflict(
     runtime: &mut Runtime,
     file: PendingFile,
     dest_exists: bool,
+    dest_newer: bool,
 ) {
     match drain_step(
         &file,
-        DrainEvent::UploadList { dest_exists },
+        DrainEvent::UploadList {
+            dest_exists,
+            dest_newer,
+        },
         runtime.overwrite_policy,
     ) {
         DrainStep::Enqueue => {
@@ -1236,6 +1392,13 @@ fn apply_drain_conflict(
             drain_scan_next(app, runtime);
         }
         DrainStep::Prompt => show_overwrite_prompt(app, runtime),
+        DrainStep::RenameAuto => {
+            if let Some(mut file) = runtime.pending_scan.pop_front() {
+                apply_auto_rename(app, runtime, &mut file);
+                enqueue_pending_file(app, file);
+            }
+            drain_scan_next(app, runtime);
+        }
         _ => {}
     }
 }
@@ -1292,6 +1455,12 @@ pub(crate) fn handle_drain_mkdir_result(
                         DrainStep::Prompt => {
                             show_overwrite_prompt(app, runtime);
                             return;
+                        }
+                        DrainStep::RenameAuto => {
+                            if let Some(mut file) = runtime.pending_scan.pop_front() {
+                                apply_auto_rename(app, runtime, &mut file);
+                                enqueue_pending_file(app, file);
+                            }
                         }
                         _ => {}
                     }
@@ -1381,6 +1550,38 @@ pub(crate) fn apply_overwrite_choice(
             clear_scan_state(runtime);
             reduce(app, Action::CancelPrompt);
         }
+        OverwriteChoice::OverwriteNewer => {
+            runtime.overwrite_policy = OverwritePolicy::OverwriteNewer;
+            reduce(
+                app,
+                Action::SetOverwritePolicy(OverwritePolicy::OverwriteNewer),
+            );
+            reduce(app, Action::CancelPrompt);
+            if let Some(file) = runtime.pending_scan.pop_front() {
+                enqueue_pending_file(app, file);
+            }
+            drain_scan_next(app, runtime);
+        }
+        OverwriteChoice::SkipNewer => {
+            runtime.overwrite_policy = OverwritePolicy::SkipNewer;
+            reduce(app, Action::SetOverwritePolicy(OverwritePolicy::SkipNewer));
+            reduce(app, Action::CancelPrompt);
+            runtime.pending_scan.pop_front();
+            drain_scan_next(app, runtime);
+        }
+        OverwriteChoice::RenameNewer => {
+            runtime.overwrite_policy = OverwritePolicy::RenameNewer;
+            reduce(
+                app,
+                Action::SetOverwritePolicy(OverwritePolicy::RenameNewer),
+            );
+            reduce(app, Action::CancelPrompt);
+            if let Some(mut file) = runtime.pending_scan.pop_front() {
+                apply_auto_rename(app, runtime, &mut file);
+                enqueue_pending_file(app, file);
+            }
+            drain_scan_next(app, runtime);
+        }
         OverwriteChoice::Rename => {
             reduce(app, Action::CancelPrompt);
             app.show_prompt = true;
@@ -1441,11 +1642,47 @@ pub(crate) fn apply_overwrite_rename(
     true
 }
 
+fn apply_auto_rename(app: &AppState, runtime: &mut Runtime, file: &mut PendingFile) {
+    match file.direction {
+        TransferDirection::Download => {
+            let parent = Path::new(&file.local_path)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(&app.local_cwd));
+            let name = Path::new(&file.local_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| remote_basename(&file.local_path));
+            let unique = uniquify_filename(&name, |candidate| parent.join(candidate).exists());
+            if let Ok(p) = safe_local_child(&parent, &unique) {
+                file.local_path = p.to_string_lossy().to_string();
+            }
+        }
+        TransferDirection::Upload => {
+            let parent = parent_remote_path(&file.remote_path);
+            let name = remote_basename(&file.remote_path);
+            let queued: HashSet<String> = runtime
+                .pending_scan
+                .iter()
+                .map(|f| remote_basename(&f.remote_path))
+                .collect();
+            let unique = uniquify_filename(&name, |candidate| {
+                runtime.listed_dest_names.contains(candidate) || queued.contains(candidate)
+            });
+            if let Ok(p) = safe_remote_child(&parent, &unique) {
+                runtime.listed_dest_names.insert(unique);
+                file.remote_path = p;
+            }
+        }
+    }
+}
+
 pub(crate) fn start_scan_entries(
     app: &mut AppState,
     runtime: &mut Runtime,
     entries: Vec<FileEntry>,
     direction: TransferDirection,
+    delete_source: bool,
 ) {
     if io_busy(runtime) {
         return;
@@ -1458,6 +1695,7 @@ pub(crate) fn start_scan_entries(
         return;
     }
     let gen = runtime.generation;
+    runtime.scan_delete_source = delete_source;
     runtime.in_flight = Some(InFlight::Scan { generation: gen });
     let label = if entries.len() == 1 {
         entries[0].name.clone()
@@ -1591,6 +1829,9 @@ pub(crate) fn walk_local_files(root: &Path, remote_root: &str) -> anyhow::Result
                     remote_path,
                     direction: TransferDirection::Upload,
                     size_bytes: Some(meta.len()),
+                    source_modified: meta.modified().ok().map(DateTime::<Utc>::from),
+                    dest_modified: None,
+                    delete_source: false,
                 });
             }
         }
@@ -1682,6 +1923,9 @@ fn push_remote_entries(
                     remote_path,
                     direction: TransferDirection::Download,
                     size_bytes: Some(entry.size),
+                    source_modified: entry.modified,
+                    dest_modified: None,
+                    delete_source: false,
                 },
             });
         }
@@ -1702,18 +1946,16 @@ mod scan_tests {
     use std::path::{Component, Path};
 
     use super::*;
+    use chrono::{DateTime, Utc};
     use dd_ftp_app::{
         reduce, Action, AppState, OverwritePolicy, PendingFile, PromptKind, TextPromptKind,
     };
     use dd_ftp_core::TransferDirection;
 
     fn pending_upload(local: &str, remote: &str) -> PendingFile {
-        PendingFile {
-            local_path: local.to_string(),
-            remote_path: remote.to_string(),
-            direction: TransferDirection::Upload,
-            size_bytes: Some(1),
-        }
+        let mut file = PendingFile::new(local, remote, TransferDirection::Upload);
+        file.size_bytes = Some(1);
+        file
     }
 
     #[test]
@@ -1779,7 +2021,7 @@ mod scan_tests {
         let mut pending = VecDeque::new();
         let app = AppState::default();
         let file = pending_upload("/tmp/a/b/c.txt", "/pub/a/b/c.txt");
-        apply_scan_item(&mut pending, file);
+        apply_scan_item(&mut pending, file, false);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].remote_path, "/pub/a/b/c.txt");
         assert!(
@@ -1813,7 +2055,10 @@ mod scan_tests {
         assert!(matches!(
             drain_step(
                 &file,
-                DrainEvent::UploadList { dest_exists: false },
+                DrainEvent::UploadList {
+                    dest_exists: false,
+                    dest_newer: false,
+                },
                 OverwritePolicy::Ask
             ),
             DrainStep::Enqueue
@@ -1821,16 +2066,37 @@ mod scan_tests {
     }
 
     #[test]
+    fn uniquify_filename_inserts_numeric_suffix() {
+        let taken = |name: &str| name == "a.txt" || name == "a-1.txt";
+        assert_eq!(uniquify_filename("b.txt", taken), "b.txt");
+        assert_eq!(uniquify_filename("a.txt", taken), "a-2.txt");
+        assert_eq!(uniquify_filename(".gitignore", taken), ".gitignore");
+    }
+
+    #[test]
+    fn dest_is_newer_requires_both_timestamps() {
+        let older = DateTime::<Utc>::from_timestamp(1, 0);
+        let newer = DateTime::<Utc>::from_timestamp(2, 0);
+        assert!(!dest_is_newer(None, newer));
+        assert!(!dest_is_newer(older, None));
+        assert!(!dest_is_newer(newer, older));
+        assert!(dest_is_newer(older, newer));
+    }
+
+    #[test]
     fn overwrite_default_skip_and_overwrite_all_remaining() {
         let file = pending_upload("/tmp/a.txt", "/pub/a.txt");
         assert_eq!(
-            resolve_conflict(true, OverwritePolicy::Ask),
+            resolve_conflict(true, false, OverwritePolicy::Ask),
             DrainStep::Prompt
         );
         assert_eq!(
             drain_step(
                 &file,
-                DrainEvent::UploadList { dest_exists: true },
+                DrainEvent::UploadList {
+                    dest_exists: true,
+                    dest_newer: false
+                },
                 OverwritePolicy::Ask
             ),
             DrainStep::Prompt
@@ -1838,7 +2104,10 @@ mod scan_tests {
         assert_eq!(
             drain_step(
                 &file,
-                DrainEvent::UploadList { dest_exists: true },
+                DrainEvent::UploadList {
+                    dest_exists: true,
+                    dest_newer: false
+                },
                 OverwritePolicy::OverwriteAll
             ),
             DrainStep::Enqueue
@@ -1846,7 +2115,10 @@ mod scan_tests {
         assert_eq!(
             drain_step(
                 &file,
-                DrainEvent::UploadList { dest_exists: true },
+                DrainEvent::UploadList {
+                    dest_exists: true,
+                    dest_newer: false
+                },
                 OverwritePolicy::SkipAll
             ),
             DrainStep::Skip
@@ -1854,10 +2126,29 @@ mod scan_tests {
         assert_eq!(
             drain_step(
                 &file,
-                DrainEvent::UploadList { dest_exists: false },
+                DrainEvent::UploadList {
+                    dest_exists: false,
+                    dest_newer: false
+                },
                 OverwritePolicy::SkipAll
             ),
             DrainStep::Enqueue
+        );
+        assert_eq!(
+            resolve_conflict(true, true, OverwritePolicy::SkipNewer),
+            DrainStep::Skip
+        );
+        assert_eq!(
+            resolve_conflict(true, true, OverwritePolicy::OverwriteNewer),
+            DrainStep::Enqueue
+        );
+        assert_eq!(
+            resolve_conflict(true, true, OverwritePolicy::RenameNewer),
+            DrainStep::RenameAuto
+        );
+        assert_eq!(
+            resolve_conflict(true, false, OverwritePolicy::SkipNewer),
+            DrainStep::Prompt
         );
     }
 
@@ -2119,6 +2410,7 @@ mod scan_tests {
             &mut runtime,
             vec![file, dir],
             TransferDirection::Upload,
+            false,
         );
         assert!(
             runtime.pending_scan.is_empty(),

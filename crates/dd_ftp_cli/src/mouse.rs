@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use dd_ftp_app::{reduce, Action, AppState, FocusPane, QuickConnectField};
 use dd_ftp_ui::{hit_test, ControlId, FieldId, Pane, Region, ScrollRegion};
 
@@ -128,16 +128,31 @@ pub(crate) fn handle_mouse(
                         let row = (my - content_top) as usize;
                         let idx = offset + row;
                         if idx < len {
+                            let focus_pane = match pane {
+                                Pane::Local => FocusPane::Local,
+                                Pane::Remote => FocusPane::Remote,
+                            };
+                            let prev = match pane {
+                                Pane::Local => app.selected_local,
+                                Pane::Remote => app.selected_remote,
+                            };
                             reduce(
                                 app,
                                 Action::SelectIndex {
-                                    pane: match pane {
-                                        Pane::Local => FocusPane::Local,
-                                        Pane::Remote => FocusPane::Remote,
-                                    },
+                                    pane: focus_pane,
                                     index: idx,
                                 },
                             );
+                            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                                reduce(
+                                    app,
+                                    Action::MarkRange {
+                                        pane: focus_pane,
+                                        from: prev,
+                                        to: idx,
+                                    },
+                                );
+                            }
                             if is_double {
                                 *last_click = None;
                                 let is_dir = match pane {

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-09-16
+
+### Added
+- Delete and move use the marked set (or the focused row); pane titles show a mark count
+- Shift+j/k and Shift+click extend a mark range; Esc clears marks when no modal/compare is open
+- Overwrite prompt can apply skip / overwrite / auto-rename to remaining **newer** destinations (`N` / `A` / `t`)
+
 ## [1.3.0] - 2026-09-15
 
 ### Added

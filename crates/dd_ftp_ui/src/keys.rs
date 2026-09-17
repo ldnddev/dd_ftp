@@ -39,7 +39,7 @@ pub const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Esc",
-        action: "Close current modal; when compare is on and no modal is open, close compare",
+        action: "Close current modal; when compare is on and no modal is open, close compare; otherwise clear marks",
         group: KeyGroup::Global,
     },
     KeyBinding {
@@ -193,8 +193,8 @@ pub const KEYMAP: &[KeyBinding] = &[
         group: KeyGroup::Transfers,
     },
     KeyBinding {
-        keys: "Enter/s skip  o overwrite  a overwrite-all  n skip-all  r rename  Esc abort",
-        action: "Overwrite prompt (default skip)",
+        keys: "s skip  o overwrite  r rename  a overwrite-all  n skip-all  A overwrite-newer  N skip-newer  t rename-newer  Esc abort",
+        action: "Overwrite prompt. Newer dest: A/N/t apply to remaining dest-newer files in the queue",
         group: KeyGroup::Transfers,
     },
     KeyBinding {
@@ -234,7 +234,7 @@ pub const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Delete",
-        action: "Delete selected item with confirm",
+        action: "Delete marked set or focused row with confirm",
         group: KeyGroup::FileOps,
     },
     KeyBinding {
@@ -245,6 +245,16 @@ pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "Space",
         action: "Toggle multi-select mark on the visible focused row (not . / ..)",
+        group: KeyGroup::FileOps,
+    },
+    KeyBinding {
+        keys: "Shift+j/k",
+        action: "Extend mark range from the anchor while moving",
+        group: KeyGroup::FileOps,
+    },
+    KeyBinding {
+        keys: "M",
+        action: "Move marked set or focused row to the other pane (transfer, then delete source on success)",
         group: KeyGroup::FileOps,
     },
     KeyBinding {
@@ -275,6 +285,11 @@ pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "Mouse: click row",
         action: "Focus pane, select visible row",
+        group: KeyGroup::Mouse,
+    },
+    KeyBinding {
+        keys: "Shift+click",
+        action: "Extend mark range from the previous row to the clicked row",
         group: KeyGroup::Mouse,
     },
     KeyBinding {

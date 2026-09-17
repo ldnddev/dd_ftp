@@ -70,7 +70,7 @@ export DD_FTP_PATH=/
 
 ### Global
 - `F1` toggle help (opening closes theme debug)
-- `Esc` close current modal; when compare is on and no modal is open, close compare
+- `Esc` close current modal; when compare is on and no modal is open, close compare; otherwise clear marks
 - `F2` toggle theme debug (opening closes help)
 - `Ctrl+q` quit (confirms if transfers are active)
 - `Ctrl+C` cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)
@@ -107,21 +107,23 @@ export DD_FTP_PATH=/
 - `X` clear pending queue
 - `Ctrl+C` cancel in-flight transfers
 - `Enter` on a file, queue upload/download of the marked set (or focused row)
-- Overwrite prompt (default skip): `Enter/s skip  o overwrite  a overwrite-all  n skip-all  r rename  Esc abort`
+- Overwrite prompt: `s skip  o overwrite  r rename  a overwrite-all  n skip-all  A overwrite-newer  N skip-newer  t rename-newer  Esc abort`
 
 ### Filters / compare
 - `/` toggle filter (`Esc` closes and clears the pattern)
 - `C` toggle directory compare
-- `Esc` close compare when no modal is open
+- `Esc` close compare when no modal is open (otherwise clear marks)
 
 ### File operations
 - `n` create (alias of `Ctrl+n`)
 - `Ctrl+n` create file/folder prompt (`Tab` toggles file/folder)
 - `e` rename selected item
 - `Ctrl+Alt+e` rename (alias)
-- `Delete` delete selected item with confirm
+- `Delete` delete marked set or focused row with confirm
 - `Ctrl+Delete` delete with confirm (alias)
 - `Space` toggle multi-select mark on the visible focused row (not `.` / `..`)
+- `Shift+j/k` extend mark range from the anchor while moving
+- `M` move marked set or focused row to the other pane (transfer, then delete source on success)
 - `p` SFTP chmod prompt (remote pane)
 - `s` cycle sort key: name → size → date → name
 - `S` toggle sort direction
@@ -130,6 +132,7 @@ export DD_FTP_PATH=/
 ### Mouse
 - `Mouse: wheel` scroll list / queue / help (also over the scrollbar rail)
 - `Mouse: click row` focus pane, select visible row
+- `Shift+click` extend mark range from the previous row to the clicked row
 - `Mouse: double-click dir` enter directory
 - `Mouse: double-click file` queue transfer (same as Enter)
 - `Mouse: drag scrollbar` scroll

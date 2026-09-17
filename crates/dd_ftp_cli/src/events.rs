@@ -99,10 +99,25 @@ pub(crate) async fn handle_key(
     }
 
     if key.code == KeyCode::F(2) && (!app.any_modal_open() || app.show_theme_debug) {
-        if !app.show_theme_debug {
+        if app.show_theme_debug {
+            if let Some(mut editor) = app.theme_editor.take() {
+                editor.revert();
+            }
+            reduce(app, Action::ToggleThemeDebug);
+        } else {
+            let loaded = dd_ftp_ui::cached_theme();
+            app.theme_editor = Some(ldnddev_theme::ThemeEditor::new(
+                dd_ftp_ui::palette_from_theme(&loaded.theme, loaded.header_quotes.clone()),
+                dd_ftp_ui::extra_theme_fields(),
+            ));
             let _ = dd_ftp_ui::reload_theme();
+            reduce(app, Action::ToggleThemeDebug);
         }
-        reduce(app, Action::ToggleThemeDebug);
+        return Ok(LoopControl::Continue);
+    }
+
+    if app.show_theme_debug && app.theme_editor.is_some() && key.code != KeyCode::F(1) {
+        handle_ftp_theme_editor(app, key);
         return Ok(LoopControl::Continue);
     }
 
@@ -1028,6 +1043,72 @@ pub(crate) fn key_picker_go_parent(app: &mut AppState) {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned());
     key_picker_load(app, parent, SelectPolicy::Reset, came_from);
+}
+
+fn handle_ftp_theme_editor(app: &mut AppState, key: KeyEvent) {
+    let Some(ek) = map_editor_key(key) else {
+        return;
+    };
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let outcome = {
+        let Some(editor) = app.theme_editor.as_mut() else {
+            return;
+        };
+        editor.handle(ek, shift)
+    };
+    match outcome {
+        ldnddev_theme::EditorOutcome::PaletteChanged => {
+            if let Some(editor) = &app.theme_editor {
+                dd_ftp_ui::apply_live_theme(&editor.palette);
+            }
+        }
+        ldnddev_theme::EditorOutcome::RequestSave => {
+            if let Some(editor) = &app.theme_editor {
+                let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                match ldnddev_theme::save_theme(
+                    &editor.palette,
+                    &root,
+                    "dd_ftp_theme.yml",
+                    editor.save_target,
+                    ldnddev_theme::default_config_home().as_deref(),
+                    &editor.fields,
+                ) {
+                    Ok(path) => {
+                        dd_ftp_ui::apply_live_theme(&editor.palette);
+                        app.theme_editor = None;
+                        reduce(app, Action::ToggleThemeDebug);
+                        let _ = path;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        ldnddev_theme::EditorOutcome::Closed { .. } => {
+            if let Some(mut editor) = app.theme_editor.take() {
+                editor.revert();
+                dd_ftp_ui::apply_live_theme(&editor.palette);
+            }
+            if app.show_theme_debug {
+                reduce(app, Action::ToggleThemeDebug);
+            }
+        }
+        ldnddev_theme::EditorOutcome::HexError(_) | ldnddev_theme::EditorOutcome::None => {}
+    }
+}
+
+fn map_editor_key(key: KeyEvent) -> Option<ldnddev_theme::EditorKey> {
+    Some(match key.code {
+        KeyCode::Up => ldnddev_theme::EditorKey::Up,
+        KeyCode::Down => ldnddev_theme::EditorKey::Down,
+        KeyCode::Left => ldnddev_theme::EditorKey::Left,
+        KeyCode::Right => ldnddev_theme::EditorKey::Right,
+        KeyCode::Tab => ldnddev_theme::EditorKey::Tab,
+        KeyCode::Enter => ldnddev_theme::EditorKey::Enter,
+        KeyCode::Esc => ldnddev_theme::EditorKey::Esc,
+        KeyCode::Backspace => ldnddev_theme::EditorKey::Backspace,
+        KeyCode::Char(c) => ldnddev_theme::EditorKey::Char(c),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

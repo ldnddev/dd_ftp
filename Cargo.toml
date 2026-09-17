@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 authors = ["ldnddev"]
 license = "MIT"
@@ -25,6 +25,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+ldnddev_theme = { path = "../ldnddev_theme" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 tracing = "0.1"
 thiserror = "2"

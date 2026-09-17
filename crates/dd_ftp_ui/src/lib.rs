@@ -11,4 +11,7 @@ pub use layout::{
     Region, ScrollRegion,
 };
 pub use render::render;
-pub use theme::{cached_theme, load_theme, load_theme_with_source, reload_theme, ThemeSource};
+pub use theme::{
+    apply_live_theme, apply_palette, cached_theme, extra_theme_fields, load_theme,
+    load_theme_with_source, palette_from_theme, reload_theme, ThemeSource,
+};

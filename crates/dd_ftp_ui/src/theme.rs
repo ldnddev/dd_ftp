@@ -405,6 +405,154 @@ fn parse_hex(input: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
+pub fn extra_theme_fields() -> &'static [ldnddev_theme::ColorField] {
+    &[ldnddev_theme::EXTRA_SELECTION]
+}
+
+fn color_to_rgb(color: Color) -> Option<ldnddev_theme::Rgb> {
+    match color {
+        Color::Rgb(r, g, b) => Some(ldnddev_theme::Rgb { r, g, b }),
+        _ => None,
+    }
+}
+
+fn rgb_to_color(rgb: ldnddev_theme::Rgb) -> Color {
+    Color::Rgb(rgb.r, rgb.g, rgb.b)
+}
+
+pub fn palette_from_theme(theme: &Theme, quotes: Vec<String>) -> ldnddev_theme::Palette {
+    let mut palette = ldnddev_theme::Palette::builtin();
+    palette.header_quotes = quotes;
+    let pairs = [
+        ("base_background", theme.base_background),
+        ("body_background", theme.body_background),
+        ("modal_background", theme.modal_background),
+        ("text_primary", theme.text_primary),
+        ("text_secondary", theme.text_secondary),
+        ("text_labels", theme.text_labels),
+        ("text_active_focus", theme.text_active_focus),
+        ("modal_labels", theme.modal_labels),
+        ("modal_text", theme.modal_text),
+        ("selected_background", theme.selected_background),
+        ("border_default", theme.border_default),
+        ("border_active", theme.border_active),
+        ("scrollbar", theme.scrollbar),
+        ("scrollbar_hover", theme.scrollbar_hover),
+        ("input_border_default", theme.input_border_default),
+        ("input_border_focus", theme.input_border_focus),
+        ("input_text_default", theme.input_text_default),
+        ("input_text_focus", theme.input_text_focus),
+        ("cursor", theme.cursor),
+        ("success", theme.success),
+        ("warning", theme.warning),
+        ("error", theme.error),
+        ("info", theme.info),
+        ("folders", theme.folder),
+        ("files", theme.file),
+        ("links", theme.link),
+        ("selection", theme.selection),
+    ];
+    for (key, color) in pairs {
+        if let Some(rgb) = color_to_rgb(color) {
+            palette.set(key, rgb);
+        }
+    }
+    palette
+}
+
+pub fn apply_palette(theme: &mut Theme, palette: &ldnddev_theme::Palette) {
+    let get = |k: &str| palette.get(k).map(rgb_to_color);
+    if let Some(c) = get("base_background") {
+        theme.base_background = c;
+    }
+    if let Some(c) = get("body_background") {
+        theme.body_background = c;
+    }
+    if let Some(c) = get("modal_background") {
+        theme.modal_background = c;
+    }
+    if let Some(c) = get("text_primary") {
+        theme.text_primary = c;
+    }
+    if let Some(c) = get("text_secondary") {
+        theme.text_secondary = c;
+    }
+    if let Some(c) = get("text_labels") {
+        theme.text_labels = c;
+    }
+    if let Some(c) = get("text_active_focus") {
+        theme.text_active_focus = c;
+        theme.text_labels_active = c;
+    }
+    if let Some(c) = get("modal_labels") {
+        theme.modal_labels = c;
+    }
+    if let Some(c) = get("modal_text") {
+        theme.modal_text = c;
+    }
+    if let Some(c) = get("selected_background") {
+        theme.selected_background = c;
+    }
+    if let Some(c) = get("border_default") {
+        theme.border_default = c;
+    }
+    if let Some(c) = get("border_active") {
+        theme.border_active = c;
+    }
+    if let Some(c) = get("scrollbar") {
+        theme.scrollbar = c;
+    }
+    if let Some(c) = get("scrollbar_hover") {
+        theme.scrollbar_hover = c;
+    }
+    if let Some(c) = get("input_border_default") {
+        theme.input_border_default = c;
+    }
+    if let Some(c) = get("input_border_focus") {
+        theme.input_border_focus = c;
+    }
+    if let Some(c) = get("input_text_default") {
+        theme.input_text_default = c;
+    }
+    if let Some(c) = get("input_text_focus") {
+        theme.input_text_focus = c;
+    }
+    if let Some(c) = get("cursor") {
+        theme.cursor = c;
+    }
+    if let Some(c) = get("success") {
+        theme.success = c;
+    }
+    if let Some(c) = get("warning") {
+        theme.warning = c;
+    }
+    if let Some(c) = get("error") {
+        theme.error = c;
+    }
+    if let Some(c) = get("info") {
+        theme.info = c;
+    }
+    if let Some(c) = get("folders") {
+        theme.folder = c;
+    }
+    if let Some(c) = get("files") {
+        theme.file = c;
+    }
+    if let Some(c) = get("links") {
+        theme.link = c;
+    }
+    if let Some(c) = get("selection") {
+        theme.selection = c;
+    }
+}
+
+pub fn apply_live_theme(palette: &ldnddev_theme::Palette) {
+    let mut loaded = cached_theme();
+    apply_palette(&mut loaded.theme, palette);
+    loaded.header_quotes = palette.header_quotes.clone();
+    *THEME.write().unwrap() = Some(loaded);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

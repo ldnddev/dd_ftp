@@ -50,7 +50,7 @@ Current implementation includes:
 - Dual-pane browser (local/remote) + queue panel
 - Parallel transfer workers + cancellation/retry/clear
 - Quick Connect + Bookmarks + keyring-backed credential storage
-- Theme system (`dd_ftp_theme.yml`) + F2 theme debug
+- Theme system (`dd_ftp_theme.yml`) + F2 live theme editor
 - File-type coloring and directory prefixing
 - Directory compare badges (`[L]`/`[R]`/`[=]`/`[≠]`)
 - File operations (local and remote): create file/folder, rename, delete
@@ -71,7 +71,7 @@ export DD_FTP_PATH=/
 ### Global
 - `F1` toggle help (opening closes theme debug)
 - `Esc` close current modal; when compare is on and no modal is open, close compare; otherwise clear marks
-- `F2` toggle theme debug (opening closes help)
+- `F2` toggle live theme editor (opening closes help)
 - `F3` toggle settings (editor command; saved to `~/.config/ldnddev/dd_ftp.toml`)
 - `Ctrl+q` quit (confirms if transfers are active)
 - `Ctrl+C` cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)

@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - 2026-09-17
+
+### Added
+- F2 live theme editor (shared `ldnddev_theme`): preview tokens, save to local or global `dd_ftp_theme.yml`
+
 ## [1.5.0] - 2026-09-17
 
 ### Added

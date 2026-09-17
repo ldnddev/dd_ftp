@@ -18,3 +18,4 @@ dd_ftp_ui = { path = "../dd_ftp_ui" }
 ratatui.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+ldnddev_theme.workspace = true

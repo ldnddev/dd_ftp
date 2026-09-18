@@ -1182,85 +1182,85 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         if let Some(editor) = &app.theme_editor {
             render_theme_editor(frame, &t, editor);
         } else {
-        let area = centered_rect(60, 70, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Block::default().style(Style::default().bg(t.modal_background)),
-            area,
-        );
-
-        let p = loaded
-            .path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(built-in defaults)".to_string());
-
-        let version_str = loaded
-            .version
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "(none)".to_string());
-
-        let mut lines = vec![
-            Line::from(vec![Span::styled(
-                "Theme Debug",
-                Style::default()
-                    .fg(t.modal_labels)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(format!("source:  {}", loaded.source.label())),
-            Line::from(format!("path:    {}", p)),
-            Line::from(format!("version: {}", version_str)),
-        ];
-        if let Some(w) = loaded.warning.as_ref() {
-            lines.push(Line::from(vec![Span::styled(
-                format!("warning: {}", w),
-                Style::default().fg(t.warning),
-            )]));
-        }
-        lines.extend([
-            Line::from(""),
-            Line::from("color tokens:"),
-            Line::from("base_background / body_background / modal_background"),
-            Line::from("border_default / border_active / scrollbar / scrollbar_hover"),
-            Line::from("text_primary / text_secondary / text_labels"),
-            Line::from("text_active_focus / text_labels_active"),
-            Line::from("modal_labels / modal_text / selected_background"),
-            Line::from("input_border_default / input_border_focus"),
-            Line::from("input_text_default / input_text_focus / cursor"),
-            Line::from("success / warning / error / info"),
-            Line::from("folder / file / link"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Press F2 to close",
-                Style::default().fg(t.warning),
-            )]),
-        ]);
-
-        let modal = Paragraph::new(lines)
-            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .title(Line::from(vec![Span::styled(
-                        " Theme ",
-                        Style::default()
-                            .fg(t.modal_labels)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.border_active)),
+            let area = centered_rect(60, 70, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(t.modal_background)),
+                area,
             );
 
-        frame.render_widget(modal, area);
-        render_scrollbar(
-            frame,
-            area,
-            0,
-            12,
-            t.scrollbar,
-            t.scrollbar_hover,
-            app.mouse_pos,
-        );
+            let p = loaded
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(built-in defaults)".to_string());
+
+            let version_str = loaded
+                .version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "(none)".to_string());
+
+            let mut lines = vec![
+                Line::from(vec![Span::styled(
+                    "Theme Debug",
+                    Style::default()
+                        .fg(t.modal_labels)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(format!("source:  {}", loaded.source.label())),
+                Line::from(format!("path:    {}", p)),
+                Line::from(format!("version: {}", version_str)),
+            ];
+            if let Some(w) = loaded.warning.as_ref() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("warning: {}", w),
+                    Style::default().fg(t.warning),
+                )]));
+            }
+            lines.extend([
+                Line::from(""),
+                Line::from("color tokens:"),
+                Line::from("base_background / body_background / modal_background"),
+                Line::from("border_default / border_active / scrollbar / scrollbar_hover"),
+                Line::from("text_primary / text_secondary / text_labels"),
+                Line::from("text_active_focus / text_labels_active"),
+                Line::from("modal_labels / modal_text / selected_background"),
+                Line::from("input_border_default / input_border_focus"),
+                Line::from("input_text_default / input_text_focus / cursor"),
+                Line::from("success / warning / error / info"),
+                Line::from("folder / file / link"),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "Press F2 to close",
+                    Style::default().fg(t.warning),
+                )]),
+            ]);
+
+            let modal = Paragraph::new(lines)
+                .style(Style::default().bg(t.modal_background).fg(t.modal_text))
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .title(Line::from(vec![Span::styled(
+                            " Theme ",
+                            Style::default()
+                                .fg(t.modal_labels)
+                                .add_modifier(Modifier::BOLD),
+                        )]))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(t.border_active)),
+                );
+
+            frame.render_widget(modal, area);
+            render_scrollbar(
+                frame,
+                area,
+                0,
+                12,
+                t.scrollbar,
+                t.scrollbar_hover,
+                app.mouse_pos,
+            );
         }
     }
 
@@ -1861,11 +1861,7 @@ fn render_scrollbar(
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
-fn render_theme_editor(
-    frame: &mut Frame,
-    t: &Theme,
-    editor: &ldnddev_theme::ThemeEditor,
-) {
+fn render_theme_editor(frame: &mut Frame, t: &Theme, editor: &ldnddev_theme::ThemeEditor) {
     use ldnddev_theme::{theme_editor_rows, ThemeEditorRow};
     let area = centered_rect(80, 80, frame.area());
     frame.render_widget(Clear, area);

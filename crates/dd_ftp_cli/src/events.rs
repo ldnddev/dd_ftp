@@ -1064,7 +1064,8 @@ fn handle_ftp_theme_editor(app: &mut AppState, key: KeyEvent) {
         }
         ldnddev_theme::EditorOutcome::RequestSave => {
             if let Some(editor) = &app.theme_editor {
-                let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let root =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 match ldnddev_theme::save_theme(
                     &editor.palette,
                     &root,
@@ -1077,9 +1078,17 @@ fn handle_ftp_theme_editor(app: &mut AppState, key: KeyEvent) {
                         dd_ftp_ui::apply_live_theme(&editor.palette);
                         app.theme_editor = None;
                         reduce(app, Action::ToggleThemeDebug);
-                        let _ = path;
+                        reduce(
+                            app,
+                            Action::SetStatus(format!("Theme saved to {}", path.display())),
+                        );
                     }
-                    Err(_) => {}
+                    Err(err) => {
+                        reduce(
+                            app,
+                            Action::ShowError(format!("Could not save theme: {err}")),
+                        );
+                    }
                 }
             }
         }

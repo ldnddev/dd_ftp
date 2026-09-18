@@ -1,0 +1,15 @@
+[package]
+name = "ldnddev_theme"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared YAML theme load/save and live color editor for ldnddev TUI apps"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

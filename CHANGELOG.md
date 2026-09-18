@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.1] - 2026-09-17
+
+### Fixed
+- Vendored `ldnddev_theme` in `crates/ldnddev_theme` so GitHub releases and `install.sh` no longer need a sibling repo
+
 ## [1.6.0] - 2026-09-17
 
 ### Added

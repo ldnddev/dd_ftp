@@ -38,9 +38,10 @@ Pre-populate connection at launch via env: `DD_FTP_HOST`, `DD_FTP_PORT`, `DD_FTP
 Workspace crates form a one-way dependency graph; respect it when adding code:
 
 ```
-dd_ftp_cli  →  dd_ftp_app, dd_ftp_ui, dd_ftp_protocols, dd_ftp_ftp, dd_ftp_storage, dd_ftp_core
-dd_ftp_app  →  dd_ftp_core, dd_ftp_transfer
-dd_ftp_ui   →  dd_ftp_app, dd_ftp_core, dd_ftp_transfer
+dd_ftp_cli  →  dd_ftp_app, dd_ftp_ui, dd_ftp_protocols, dd_ftp_ftp, dd_ftp_storage, dd_ftp_core, ldnddev_theme
+dd_ftp_app  →  dd_ftp_core, dd_ftp_transfer, ldnddev_theme
+dd_ftp_ui   →  dd_ftp_app, dd_ftp_core, dd_ftp_transfer, ldnddev_theme
+ldnddev_theme →  (no internal deps; YAML theme load/save + live editor)
 dd_ftp_protocols / dd_ftp_ftp / dd_ftp_transfer / dd_ftp_storage  →  dd_ftp_core
 dd_ftp_core →  (no internal deps; defines traits + types)
 ```
@@ -53,6 +54,7 @@ dd_ftp_core →  (no internal deps; defines traits + types)
 - `dd_ftp_storage` — `SiteManager` (bookmark TOML config) and `SecretStore` (OS keyring; passwords never persisted in site config).
 - `dd_ftp_app` — Redux-style core: `AppState` + `Action` enum + pure `reduce(state, action)`. No IO. Sub-state owns the queue. Live sockets live in CLI `Runtime`, not `AppState`.
 - `dd_ftp_ui` — ratatui render layer + theme loader. Read-only over `AppState`.
+- `ldnddev_theme` — vendored in-tree crate: YAML theme load/save and the F2 live color editor. Do not depend on a sibling `../ldnddev_theme` path.
 - `dd_ftp_cli` — terminal lifecycle, crossterm event loop, async glue, spawns transfer workers. `Runtime` owns `enum SessionHandle { Sftp(SftpSession), Ftp(UnifiedFtpSession) }` (no `dyn RemoteSession`), generation, cancel flags, worker handles, `in_flight`, and `pending_scan`. IO requests (`request_list` / `request_fs` / `connect_off_thread`) never `.await` in the key handler.
 
 ### Event / IO flow

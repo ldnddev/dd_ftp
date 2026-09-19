@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dd_ftp tutorial — setup, install, and use</title>
+  <meta name="description" content="Illustrated guide to installing, launching, and using dd_ftp, the terminal FTP/SFTP/FTPS client.">
+  <link rel="canonical" href="https://ldnddev.github.io/dd_ftp/">
+  <meta name="theme-color" content="#0F1114">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ldnddev.github.io/dd_ftp/">
+  <meta property="og:title" content="dd_ftp tutorial">
+  <meta property="og:description" content="Illustrated guide to installing, launching, and using dd_ftp.">
+  <meta property="og:image" content="https://ldnddev.github.io/dd_ftp/images/01-main.png">
+  <style>
+    :root {
+      --bg: #0f1114;
+      --bg-raised: #1c1e21;
+      --bg-body: #2a2d31;
+      --text: #f5f6f7;
+      --muted: #9ea3aa;
+      --label: #ffaf46;
+      --focus: #64b4f5;
+      --link: #ffa087;
+      --ok: #82e0aa;
+      --warn: #f5c469;
+      --err: #e57373;
+      --info: #5dade2;
+      --border: #3a3e44;
+      --max: 72rem;
+      --sidebar: 16rem;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font: 17px/1.55 "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    a { color: var(--focus); }
+    a:hover { color: var(--link); }
+    a:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+    .skip {
+      position: absolute;
+      left: -999px;
+      top: 0;
+      background: var(--focus);
+      color: var(--bg);
+      padding: 0.5rem 1rem;
+      z-index: 10;
+    }
+    .skip:focus { left: 0.5rem; top: 0.5rem; }
+    .layout {
+      display: grid;
+      grid-template-columns: var(--sidebar) minmax(0, 1fr);
+      max-width: calc(var(--max) + var(--sidebar));
+      margin: 0 auto;
+    }
+    nav.toc {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      padding: 1.5rem 1rem 2rem 1.25rem;
+      border-right: 1px solid var(--border);
+      background: var(--bg);
+    }
+    nav.toc .brand {
+      font-size: 0.95rem;
+      letter-spacing: 0.02em;
+      color: var(--label);
+      margin: 0 0 1rem;
+      font-weight: 700;
+    }
+    nav.toc ol {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    nav.toc a {
+      display: block;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 0.28rem 0.4rem;
+      border-radius: 6px;
+      font-size: 0.92rem;
+    }
+    nav.toc a:hover,
+    nav.toc a:focus-visible { color: var(--text); background: var(--bg-raised); }
+    main { padding: 2rem 1.5rem 4rem; min-width: 0; }
+    header.hero h1 {
+      font-size: clamp(1.8rem, 3vw, 2.4rem);
+      margin: 0 0 0.4rem;
+    }
+    header.hero p.lede {
+      color: var(--muted);
+      font-size: 1.1rem;
+      max-width: 46rem;
+    }
+    h2 {
+      margin-top: 2.75rem;
+      padding-top: 0.4rem;
+      border-top: 1px solid var(--border);
+      color: var(--focus);
+      font-size: 1.45rem;
+    }
+    h2:first-of-type { border-top: 0; }
+    h3 { margin-top: 1.6rem; color: var(--label); font-size: 1.12rem; }
+    p, li { max-width: 46rem; }
+    kbd {
+      font: 0.85em/1 ui-monospace, "JetBrains Mono", monospace;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 0.05em 0.4em;
+      color: var(--text);
+    }
+    pre, code {
+      font-family: ui-monospace, "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+    }
+    code {
+      font-size: 0.9em;
+      background: var(--bg-raised);
+      padding: 0.1em 0.35em;
+      border-radius: 4px;
+    }
+    pre {
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+      overflow: auto;
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+    pre code { background: none; padding: 0; }
+    figure {
+      margin: 1.25rem 0 1.75rem;
+      max-width: 100%;
+    }
+    figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: #0b0d10;
+    }
+    figcaption {
+      color: var(--muted);
+      font-size: 0.92rem;
+      margin-top: 0.55rem;
+    }
+    .callout {
+      border-left: 3px solid var(--focus);
+      background: var(--bg-raised);
+      padding: 0.8rem 1rem;
+      border-radius: 0 8px 8px 0;
+      max-width: 46rem;
+    }
+    .callout.warn { border-left-color: var(--warn); }
+    .callout.ok { border-left-color: var(--ok); }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      max-width: 50rem;
+      font-size: 0.95rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.45rem 0.6rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th { color: var(--label); font-weight: 600; }
+    .status { font-family: ui-monospace, monospace; }
+    footer.page {
+      margin-top: 3rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      nav.toc {
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 1rem;
+      }
+      nav.toc ol { display: flex; flex-wrap: wrap; gap: 0.2rem 0.6rem; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="layout">
+    <nav class="toc" aria-label="Tutorial sections">
+      <p class="brand">dd_ftp</p>
+      <ol>
+        <li><a href="#what">What it is</a></li>
+        <li><a href="#install">Install</a></li>
+        <li><a href="#first-run">First run</a></li>
+        <li><a href="#ui">The window</a></li>
+        <li><a href="#connect">Connect</a></li>
+        <li><a href="#transfers">Transfers</a></li>
+        <li><a href="#files">File operations</a></li>
+        <li><a href="#filter">Filter and compare</a></li>
+        <li><a href="#theme">Theme and settings</a></li>
+        <li><a href="#keys">Keys and mouse</a></li>
+        <li><a href="#uninstall">Uninstall</a></li>
+        <li><a href="#screenshots">Updating screenshots</a></li>
+      </ol>
+    </nav>
+    <main id="content">
+      <header class="hero">
+        <h1>dd_ftp tutorial</h1>
+        <p class="lede">A terminal FTP / SFTP / FTPS client. This page walks through install, first launch, connecting to a host, and the everyday loop: browse, mark, transfer, and manage files from a dual-pane TUI.</p>
+      </header>
+
+      <section id="what">
+        <h2>What it is</h2>
+        <p><strong>dd_ftp</strong> is a keyboard-and-mouse dual-pane browser for remote files. Local is on the left, remote on the right, transfers in the queue along the bottom. Protocols: SFTP, FTP, and FTPS.</p>
+        <figure>
+          <img src="images/01-main.png" alt="dd_ftp main window. Local files on the left, empty remote pane on the right while disconnected, transfer queue along the bottom.">
+          <figcaption>Main window, disconnected. The remote pane stays empty until you connect. Press <kbd>o</kbd> for Quick Connect or <kbd>m</kbd> for bookmarks.</figcaption>
+        </figure>
+        <p>What you get:</p>
+        <ul>
+          <li>SFTP, FTP, and FTPS connect / list / upload / download</li>
+          <li>Parallel transfer workers, cancel, retry, overwrite prompts</li>
+          <li>Bookmarks with OS-keyring passwords (never stored in site config)</li>
+          <li>Directory compare badges, filters, multi-select, chmod, remote edit</li>
+          <li>YAML theme plus an in-app <kbd>F2</kbd> color editor</li>
+        </ul>
+      </section>
+
+      <section id="install">
+        <h2>Install</h2>
+        <h3>Quick install (recommended)</h3>
+        <p>Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) and installs <code>dd_ftp</code> to <code>~/.local/bin</code>. If no package exists for your machine, the script builds from source. Pipe to <code>bash</code>, not <code>sh</code>.</p>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash</code></pre>
+        <p>Pin a release:</p>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --version v1.6.1</code></pre>
+        <div class="callout">
+          <p>The installer warns if the target directory is not on <code>PATH</code>. Add <code>~/.local/bin</code> if <code>dd_ftp</code> is not found after install.</p>
+        </div>
+
+        <h3>From a local checkout</h3>
+        <pre><code>./install.sh                  # release cargo build → ~/.local/bin
+./install.sh --from-release   # GitHub package even from a checkout
+INSTALL_DIR=/usr/local/bin ./install.sh
+BIN_NAME=dd_ftp_cli ./install.sh</code></pre>
+
+        <h3>Development run (no install)</h3>
+        <pre><code>cargo run -p dd_ftp_cli</code></pre>
+      </section>
+
+      <section id="first-run">
+        <h2>First run</h2>
+        <p>Launch from a terminal:</p>
+        <pre><code>dd_ftp</code></pre>
+        <p>The local pane opens on the current directory. <kbd>Ctrl+q</kbd> quits (confirms if transfers are active). <kbd>Esc</kbd> never quits — it closes a modal, then compare, then clears marks.</p>
+        <figure>
+          <img src="images/02-help.png" alt="Help overlay listing keyboard and mouse bindings, grouped by Global, Navigation, Connection, Transfers, and more.">
+          <figcaption>Press <kbd>F1</kbd> any time for in-app help. Opening help closes the theme editor; opening the theme editor closes help.</figcaption>
+        </figure>
+        <p>Optional environment variables pre-fill Quick Connect at launch:</p>
+        <pre><code>export DD_FTP_HOST=your.server.com
+export DD_FTP_PORT=22
+export DD_FTP_USER=your_username
+export DD_FTP_PASS='your_password'   # or DD_FTP_KEY
+export DD_FTP_KEY="$HOME/.ssh/id_rsa"
+export DD_FTP_PATH=/</code></pre>
+      </section>
+
+      <section id="ui">
+        <h2>The window</h2>
+        <ul>
+          <li><strong>Header</strong> — app name, a rotating tagline, and connection state on the right.</li>
+          <li><strong>Local Path / Remote Path</strong> — current working directories above each list.</li>
+          <li><strong>[1] Local</strong> — files on this machine. Folders are prefixed with <span class="status">&gt;</span>.</li>
+          <li><strong>[2] Remote</strong> — files on the server once connected; empty while disconnected.</li>
+          <li><strong>[3] Queue</strong> — pending / active / completed / failed / cancelled jobs, with speed and ETA.</li>
+          <li><strong>Status line</strong> — toasts and the latest status message.</li>
+        </ul>
+        <p>Focus a pane with <kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> or <kbd>Tab</kbd>. Move with <kbd>j</kbd>/<kbd>k</kbd>. <kbd>l</kbd> enters a directory, <kbd>h</kbd> goes to the parent, <kbd>r</kbd> refreshes. <kbd>Enter</kbd> on a directory enters it; on a file it queues an upload (local) or download (remote).</p>
+      </section>
+
+      <section id="connect">
+        <h2>Connect</h2>
+        <h3>Quick Connect</h3>
+        <p>Press <kbd>o</kbd>. Fill Name, Host, Port, User, Pass and/or SSH Key, Protocol (SFTP / FTP / FTPS), and Path. <kbd>c</kbd> connects; if you are already connected it disconnects first.</p>
+        <figure>
+          <img src="images/03-quick-connect.png" alt="Quick Connect modal with fields for name, host, port, user, password, SSH key, protocol, and path.">
+          <figcaption>Click the Protocol field (or use Left/Right while it is focused) to cycle SFTP → FTP → FTPS. Click Browse next to SSH Key, or press <kbd>Ctrl+P (SSH Key)</kbd>, for a file picker.</figcaption>
+        </figure>
+        <p>Passwords are stored in the OS keyring, keyed by <code>(name, username, host, port)</code>. They are never written to the bookmark TOML. <kbd>Ctrl+K</kbd> runs a keyring health check.</p>
+        <p>Save the current form as a bookmark with <kbd>B</kbd>.</p>
+
+        <h3>Bookmarks</h3>
+        <p>Press <kbd>m</kbd>. <kbd>j</kbd>/<kbd>k</kbd> move, Enter loads into Quick Connect, <kbd>c (bookmarks)</kbd> connects the highlighted site, <kbd>e (bookmarks)</kbd> edits, <kbd>d (bookmarks)</kbd> deletes with confirm, <kbd>D</kbd> sets the default. <kbd>b</kbd> cycles bookmarks from the main window.</p>
+        <figure>
+          <img src="images/04-bookmarks.png" alt="Bookmarks modal listing Production SFTP, Staging FTP, and Backup FTPS sites.">
+          <figcaption>The default bookmark is marked with <span class="status">*</span>. Single-click selects; double-click loads into Quick Connect.</figcaption>
+        </figure>
+
+        <h3>Once you are connected</h3>
+        <figure>
+          <img src="images/05-connected.png" alt="Connected session with local project files on the left and a remote /var/www/html listing on the right.">
+          <figcaption>Header shows the site name when connected. Remote listings include size, date, and permissions when the pane is wide enough.</figcaption>
+        </figure>
+      </section>
+
+      <section id="transfers">
+        <h2>Transfers</h2>
+        <p>Highlight a file (or mark a set) and press <kbd>u</kbd> to upload or <kbd>d</kbd> to download. Directories recurse. <kbd>Enter</kbd> on a file does the same in the focused pane.</p>
+        <figure>
+          <img src="images/06-queue.png" alt="Queue pane showing an active upload with a progress bar plus pending upload and download jobs.">
+          <figcaption>Focus the queue with <kbd>3</kbd> to give it more rows. <kbd>R</kbd> retries the last failed job, <kbd>X</kbd> clears pending, <kbd>Ctrl+C</kbd> cancels in-flight transfers.</figcaption>
+        </figure>
+        <p>If the destination already exists you get an overwrite prompt:</p>
+        <figure>
+          <img src="images/12-overwrite.png" alt="Overwrite prompt showing local and remote paths, with skip, overwrite, rename, and apply-to-remaining options.">
+          <figcaption>Keys: <kbd>s skip  o overwrite  r rename  a overwrite-all  n skip-all  A overwrite-newer  N skip-newer  t rename-newer  Esc abort</kbd>. Newer-destination variants apply to the rest of the scanned set.</figcaption>
+        </figure>
+        <p><kbd>M</kbd> moves: transfer to the other pane, then delete the source on success.</p>
+      </section>
+
+      <section id="files">
+        <h2>File operations</h2>
+        <p><kbd>n</kbd> or <kbd>Ctrl+n</kbd> creates. <kbd>Tab</kbd> toggles file vs folder. <kbd>e</kbd> (or <kbd>Ctrl+Alt+e</kbd>) renames. <kbd>Delete</kbd> (or <kbd>Ctrl+Delete</kbd>) deletes the marked set or the focused row, with confirm.</p>
+        <figure>
+          <img src="images/11-create.png" alt="Create File prompt with notes.txt typed in, and a hint that Tab switches to Folder.">
+          <figcaption>Create works on both panes. Remote create/rename/delete refresh the listing on success.</figcaption>
+        </figure>
+        <ul>
+          <li><kbd>Space</kbd> toggles a mark on the focused row (not <code>.</code> / <code>..</code>). Pane titles show a mark count.</li>
+          <li><kbd>Shift+j/k</kbd> extend the mark range while moving. Shift+click does the same with the mouse.</li>
+          <li><kbd>E</kbd> edits a remote file in <code>$VISUAL</code> / <code>$EDITOR</code> (or the Settings editor) and uploads on change.</li>
+          <li><kbd>p</kbd> is SFTP chmod on the remote pane.</li>
+          <li><kbd>s</kbd> cycles sort: name → size → date → name. <kbd>S</kbd> flips direction. <kbd>.</kbd> hides dotfiles.</li>
+        </ul>
+      </section>
+
+      <section id="filter">
+        <h2>Filter and compare</h2>
+        <p><kbd>/</kbd> opens a filter on the focused file pane. Type a substring; Esc closes and clears.</p>
+        <figure>
+          <img src="images/07-filter.png" alt="Filter bar showing the pattern index with a visible/total count, lists narrowed to matching names.">
+          <figcaption>Selection indexes the visible (filtered) list, so actions apply to what you see.</figcaption>
+        </figure>
+        <p><kbd>C</kbd> toggles directory compare. Badges appear on matching names in both lists:</p>
+        <table>
+          <thead><tr><th>Badge</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td class="status">[L]</td><td>Name exists only on the local side</td></tr>
+            <tr><td class="status">[R]</td><td>Name exists only on the remote side</td></tr>
+            <tr><td class="status">[=]</td><td>Same size and mtime (second resolution)</td></tr>
+            <tr><td class="status">[≠]</td><td>Same name, different size or mtime</td></tr>
+          </tbody>
+        </table>
+        <figure>
+          <img src="images/08-compare.png" alt="Local and remote lists with compare badges: local-only, remote-only, equal, and different.">
+          <figcaption>Esc closes compare when no modal is open; otherwise Esc clears marks.</figcaption>
+        </figure>
+      </section>
+
+      <section id="theme">
+        <h2>Theme and settings</h2>
+        <p>Theme lookup order:</p>
+        <ol>
+          <li><code>./dd_ftp_theme.yml</code></li>
+          <li><code>~/.config/ldnddev/dd_ftp_theme.yml</code></li>
+          <li>Built-in defaults</li>
+        </ol>
+        <p><kbd>F2</kbd> opens the live color editor. Preview tokens, then save to the local or global YAML file.</p>
+        <figure>
+          <img src="images/09-theme.png" alt="Live theme editor listing color tokens with RGB sliders and a hex field.">
+          <figcaption>Canonical tokens live in <code>THEME_STRUCTURE_STANDARD.md</code>. Do not hardcode colors past the theme load.</figcaption>
+        </figure>
+        <p><kbd>F3</kbd> is Settings. Today it has one field: <strong>Editor</strong>, saved to <code>~/.config/ldnddev/dd_ftp.toml</code> (not the theme file).</p>
+        <figure>
+          <img src="images/10-settings.png" alt="Settings panel with an Editor field set to hx and a note that environment variables override the saved editor.">
+          <figcaption>When you press <kbd>E</kbd>, the editor is <code>$VISUAL</code>, then <code>$EDITOR</code>, then this saved value, then <code>vi</code>. Leave the field empty to use the environment / vi. Enter saves, Esc cancels.</figcaption>
+        </figure>
+      </section>
+
+      <section id="keys">
+        <h2>Keys and mouse</h2>
+        <p>The in-app help (<kbd>F1</kbd>) is generated from the same table. Mouse works on lists, the queue, help, scrollbars, and text fields.</p>
+
+        <h3>Global</h3>
+        <table>
+          <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>F1</kbd></td><td>Toggle help (opening closes theme debug)</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Close current modal; when compare is on and no modal is open, close compare; otherwise clear marks</td></tr>
+            <tr><td><kbd>F2</kbd></td><td>Toggle live theme editor (opening closes help)</td></tr>
+            <tr><td><kbd>F3</kbd></td><td>Toggle settings (editor command; saved to ~/.config/ldnddev/dd_ftp.toml)</td></tr>
+            <tr><td><kbd>Ctrl+q</kbd></td><td>Quit (confirms if transfers are active)</td></tr>
+            <tr><td><kbd>Ctrl+C</kbd></td><td>Cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)</td></tr>
+            <tr><td><kbd>C</kbd></td><td>Toggle directory compare</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Navigation</h3>
+        <table>
+          <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>1</kbd></td><td>Local pane</td></tr>
+            <tr><td><kbd>2</kbd></td><td>Remote pane</td></tr>
+            <tr><td><kbd>3</kbd></td><td>Queue pane</td></tr>
+            <tr><td><kbd>Tab</kbd></td><td>Cycle focus</td></tr>
+            <tr><td><kbd>j/k</kbd></td><td>Move selection</td></tr>
+            <tr><td><kbd>l</kbd></td><td>Enter directory</td></tr>
+            <tr><td><kbd>h</kbd></td><td>Parent directory</td></tr>
+            <tr><td><kbd>r</kbd></td><td>Refresh</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>Enter directory, or queue upload (local file) / download (remote file). Queue pane: no-op.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Connection / bookmarks</h3>
+        <table>
+          <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>o</kbd></td><td>Quick connect</td></tr>
+            <tr><td><kbd>m</kbd></td><td>Bookmarks modal</td></tr>
+            <tr><td><kbd>b</kbd></td><td>Cycle bookmarks</td></tr>
+            <tr><td><kbd>c</kbd></td><td>Connect using the quick-connect form / disconnect if already connected</td></tr>
+            <tr><td><kbd>c (bookmarks)</kbd></td><td>Connect the highlighted bookmark (disconnects first if already connected)</td></tr>
+            <tr><td><kbd>d (bookmarks)</kbd></td><td>Delete bookmark with confirm</td></tr>
+            <tr><td><kbd>e (bookmarks)</kbd></td><td>Edit bookmark</td></tr>
+            <tr><td><kbd>D</kbd></td><td>Set default bookmark</td></tr>
+            <tr><td><kbd>B</kbd></td><td>Save current quick-connect as bookmark</td></tr>
+            <tr><td><kbd>Ctrl+K</kbd></td><td>Keyring health check</td></tr>
+            <tr><td><kbd>Ctrl+P (SSH Key)</kbd></td><td>Open SSH key file picker from the SSH Key field</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Transfers</h3>
+        <table>
+          <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>u</kbd></td><td>Queue upload (directories recurse; marked set or focused row)</td></tr>
+            <tr><td><kbd>d</kbd></td><td>Queue download (directories recurse; marked set or focused row)</td></tr>
+            <tr><td><kbd>R</kbd></td><td>Retry last failed</td></tr>
+            <tr><td><kbd>X</kbd></td><td>Clear pending queue</td></tr>
+            <tr><td><kbd>Ctrl+C</kbd></td><td>Cancel in-flight transfers</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>On a file, queue upload/download of the marked set (or focused row)</td></tr>
+            <tr><td><kbd>s skip  o overwrite  r rename  a overwrite-all  n skip-all  A overwrite-newer  N skip-newer  t rename-newer  Esc abort</kbd></td><td>Overwrite prompt. Newer dest: A/N/t apply to remaining dest-newer files in the queue</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Filters / compare</h3>
+        <table>
+          <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>/</kbd></td><td>Toggle filter (Esc closes and clears the pattern)</td></tr>
+            <tr><td><kbd>C</kbd></td><td>Toggle directory compare</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Close compare when no modal is open</td></tr>
+          </tbody>
+        </table>
+
+        <h3>File operations</h3>
+        <table>
+          <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>n</kbd></td><td>Create (alias of Ctrl+n)</td></tr>
+            <tr><td><kbd>Ctrl+n</kbd></td><td>Create file/folder prompt (Tab toggles file/folder)</td></tr>
+            <tr><td><kbd>e</kbd></td><td>Rename selected item</td></tr>
+            <tr><td><kbd>E</kbd></td><td>Edit remote file in $VISUAL/$EDITOR, then upload on change</td></tr>
+            <tr><td><kbd>Ctrl+Alt+e</kbd></td><td>Rename (alias)</td></tr>
+            <tr><td><kbd>Delete</kbd></td><td>Delete marked set or focused row with confirm</td></tr>
+            <tr><td><kbd>Ctrl+Delete</kbd></td><td>Delete with confirm (alias)</td></tr>
+            <tr><td><kbd>Space</kbd></td><td>Toggle multi-select mark on the visible focused row (not . / ..)</td></tr>
+            <tr><td><kbd>Shift+j/k</kbd></td><td>Extend mark range from the anchor while moving</td></tr>
+            <tr><td><kbd>M</kbd></td><td>Move marked set or focused row to the other pane (transfer, then delete source on success)</td></tr>
+            <tr><td><kbd>p</kbd></td><td>SFTP chmod prompt (remote pane)</td></tr>
+            <tr><td><kbd>s</kbd></td><td>Cycle sort key: name → size → date → name</td></tr>
+            <tr><td><kbd>S</kbd></td><td>Toggle sort direction</td></tr>
+            <tr><td><kbd>.</kbd></td><td>Toggle hide-dotfiles</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Mouse</h3>
+        <table>
+          <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>Mouse: wheel</kbd></td><td>Scroll list / queue / help (also over the scrollbar rail)</td></tr>
+            <tr><td><kbd>Mouse: click row</kbd></td><td>Focus pane, select visible row</td></tr>
+            <tr><td><kbd>Shift+click</kbd></td><td>Extend mark range from the previous row to the clicked row</td></tr>
+            <tr><td><kbd>Mouse: double-click dir</kbd></td><td>Enter directory</td></tr>
+            <tr><td><kbd>Mouse: double-click file</kbd></td><td>Queue transfer (same as Enter)</td></tr>
+            <tr><td><kbd>Mouse: drag scrollbar</kbd></td><td>Scroll</td></tr>
+            <tr><td><kbd>Mouse: QC / prompt field click-drag</kbd></td><td>Cursor / selection</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Keyboard field editing</h3>
+        <p>Quick-connect fields and text prompts:</p>
+        <ul>
+          <li><kbd>Left</kbd> / <kbd>Right</kbd> move the cursor one character</li>
+          <li><kbd>Shift+Left</kbd> / <kbd>Shift+Right</kbd> extend the selection</li>
+          <li><kbd>Home</kbd> / <kbd>End</kbd> jump to start / end (<kbd>Shift</kbd> to extend)</li>
+          <li><kbd>Delete</kbd> removes the character at the cursor (or the active selection)</li>
+          <li><kbd>Ctrl+W</kbd> deletes the previous word</li>
+        </ul>
+      </section>
+
+      <section id="uninstall">
+        <h2>Uninstall</h2>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --uninstall
+# or from a checkout
+./install.sh --uninstall</code></pre>
+        <p>Removes the installed binary and the default theme copy. Bookmarks in <code>~/.config/ldnddev/</code> and keyring secrets are left in place so a reinstall can pick them up.</p>
+      </section>
+
+      <section id="screenshots">
+        <h2>Updating screenshots</h2>
+        <p>Every figure on this page is a PNG under <code>docs/images/</code>, generated from the live TUI. Do not edit the PNGs in an image editor — change the capture scene and regenerate.</p>
+        <pre><code>./docs/capture.sh</code></pre>
+        <p>That script:</p>
+        <ol>
+          <li>Runs <code>cargo run -p dd_ftp_cli --example tutorial_shots --release</code>, which builds a fixture <code>AppState</code>, draws each scene with ratatui’s <code>TestBackend</code>, and writes HTML frames to <code>docs/images/_frames/</code> (gitignored).</li>
+          <li>Runs <code>node docs/rasterize.mjs</code>, which opens each frame in Chromium via Playwright and screenshots the <code>.shot</code> card to <code>docs/images/&lt;id&gt;.png</code> at 2×.</li>
+          <li>Greps this page for <code>images/*.png</code> and exits non-zero if a referenced file is missing.</li>
+        </ol>
+        <p>Requirements: Rust toolchain, Node with the <code>playwright</code> package, and Chromium at <code>/usr/bin/chromium</code> (or set <code>TUTORIAL_CHROMIUM</code>). Full notes, the shot catalog, and how to add a frame: <a href="https://github.com/ldnddev/dd_ftp/blob/master/docs/README.md">docs/README.md</a>.</p>
+        <div class="callout warn">
+          <p>Do not point <code>$HOME</code> at a real user directory while capturing. The example isolates <code>HOME</code> under <code>/tmp/dd-ftp-home</code> so private paths never appear in the PNGs. Do not check in <code>docs/images/_frames/</code>.</p>
+        </div>
+      </section>
+
+      <footer class="page">
+        <p>dd_ftp is MIT-licensed. Source: <a href="https://github.com/ldnddev/dd_ftp">github.com/ldnddev/dd_ftp</a>. Visual contract: <a href="https://github.com/ldnddev/dd_ftp/blob/master/LDNDDEV_TUI_VISUAL_STANDARD.md">LDNDDEV_TUI_VISUAL_STANDARD.md</a>.</p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

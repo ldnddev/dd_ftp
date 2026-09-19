@@ -4,3 +4,6 @@ Cargo.lock
 .DS_Store
 .idea/
 .vscode/
+
+# Intermediate TUI frames; PNGs in docs/images/ are the committed artifacts.
+docs/images/_frames/

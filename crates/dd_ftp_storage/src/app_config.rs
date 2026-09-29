@@ -9,6 +9,20 @@ pub struct AppConfig {
     /// `$VISUAL` / `$EDITOR` still win when set. Empty / omitted = use env then `vi`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+    /// Parallel transfer workers. Omitted = 2. Clamped to 1..=8 when applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_max_concurrency: Option<u32>,
+    /// Restored as the local pane cwd at launch when the path is still a directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_local_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_dotfiles: bool,
+    /// `ask`, `skip_all`, or `overwrite_all`. Omitted = ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_policy: Option<String>,
+    /// Connect the default bookmark when the app starts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_connect_default: bool,
 }
 
 impl AppConfig {
@@ -55,7 +69,16 @@ impl AppConfig {
             } else {
                 Some(trimmed.to_string())
             },
+            ..Self::default()
         }
+    }
+
+    pub fn worker_max_or_default(&self) -> usize {
+        self.worker_max_concurrency.unwrap_or(2).clamp(1, 8) as usize
+    }
+
+    pub fn overwrite_policy_or_default(&self) -> &str {
+        self.overwrite_policy.as_deref().unwrap_or("ask")
     }
 }
 
@@ -88,5 +111,39 @@ mod tests {
         let p = AppConfig::default_path();
         let s = p.to_string_lossy();
         assert!(s.ends_with("ldnddev/dd_ftp.toml") || s.ends_with("ldnddev\\dd_ftp.toml"));
+    }
+
+    #[test]
+    fn missing_keys_default_and_round_trip_new_fields() {
+        let parsed = AppConfig::from_toml("editor = \"hx\"\n").unwrap();
+        assert_eq!(parsed.editor.as_deref(), Some("hx"));
+        assert_eq!(parsed.worker_max_or_default(), 2);
+        assert!(!parsed.hide_dotfiles);
+        assert_eq!(parsed.overwrite_policy_or_default(), "ask");
+        assert!(!parsed.auto_connect_default);
+        assert!(parsed.last_local_cwd.is_none());
+
+        let cfg = AppConfig {
+            editor: Some("nvim".into()),
+            worker_max_concurrency: Some(4),
+            last_local_cwd: Some("/tmp".into()),
+            hide_dotfiles: true,
+            overwrite_policy: Some("skip_all".into()),
+            auto_connect_default: true,
+        };
+        let parsed = AppConfig::from_toml(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(parsed, cfg);
+        assert_eq!(parsed.worker_max_or_default(), 4);
+    }
+
+    #[test]
+    fn worker_max_clamps_to_1_through_8() {
+        let mut cfg = AppConfig {
+            worker_max_concurrency: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.worker_max_or_default(), 1);
+        cfg.worker_max_concurrency = Some(99);
+        assert_eq!(cfg.worker_max_or_default(), 8);
     }
 }

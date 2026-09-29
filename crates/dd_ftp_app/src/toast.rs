@@ -41,4 +41,36 @@ impl Toast {
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed() >= TOAST_TTL
     }
+
+    #[cfg(test)]
+    pub fn expired_for_tests(message: String) -> Self {
+        Self {
+            message,
+            level: ToastLevel::Info,
+            created_at: Instant::now()
+                .checked_sub(TOAST_TTL + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AppState;
+
+    #[test]
+    fn expire_toast_reports_whether_it_cleared() {
+        let mut app = AppState {
+            toast: Some(Toast::info("live".into())),
+            ..Default::default()
+        };
+        assert!(!app.expire_toast());
+        assert!(app.toast.is_some());
+
+        app.toast = Some(Toast::expired_for_tests("gone".into()));
+        assert!(app.expire_toast());
+        assert!(app.toast.is_none());
+        assert!(!app.expire_toast());
+    }
 }

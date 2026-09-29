@@ -68,6 +68,38 @@ impl TransferQueue {
         Some(job)
     }
 
+    pub fn retry_failed(&mut self, id: Uuid) -> Option<TransferJob> {
+        let idx = self.failed.iter().position(|j| j.id == id)?;
+        let mut job = self.failed.remove(idx);
+        job.retries = job.retries.saturating_add(1);
+        job.status = TransferStatus::Pending;
+        job.last_error = None;
+        self.pending.push(job.clone());
+        Some(job)
+    }
+
+    pub fn retry_all_failed(&mut self) -> usize {
+        let jobs: Vec<TransferJob> = self.failed.drain(..).collect();
+        let n = jobs.len();
+        for mut job in jobs {
+            job.retries = job.retries.saturating_add(1);
+            job.status = TransferStatus::Pending;
+            job.last_error = None;
+            self.pending.push(job);
+        }
+        n
+    }
+
+    pub fn remove_pending(&mut self, id: Uuid) -> Option<TransferJob> {
+        let idx = self.pending.iter().position(|j| j.id == id)?;
+        Some(self.pending.remove(idx))
+    }
+
+    pub fn dismiss_failed(&mut self, id: Uuid) -> Option<TransferJob> {
+        let idx = self.failed.iter().position(|j| j.id == id)?;
+        Some(self.failed.remove(idx))
+    }
+
     pub fn update_active_progress(&mut self, job_id: Uuid, transferred: u64, size: Option<u64>) {
         self.update_active_progress_at(job_id, transferred, size, Instant::now());
     }
@@ -196,6 +228,43 @@ mod tests {
         assert_eq!(retried.status, TransferStatus::Pending);
         assert_eq!(q.pending.len(), 1);
         assert!(q.failed.is_empty());
+    }
+
+    #[test]
+    fn retry_failed_by_id_and_retry_all() {
+        let mut q = TransferQueue::default();
+        let a = job("a");
+        let b = job("b");
+        let a_id = a.id;
+        q.mark_failed(a);
+        q.mark_failed(b);
+        assert_eq!(q.failed.len(), 2);
+        let retried = q.retry_failed(a_id).expect("retry a");
+        assert_eq!(retried.id, a_id);
+        assert_eq!(retried.retries, 1);
+        assert_eq!(q.pending.len(), 1);
+        assert_eq!(q.failed.len(), 1);
+        assert_eq!(q.retry_all_failed(), 1);
+        assert_eq!(q.pending.len(), 2);
+        assert!(q.failed.is_empty());
+        assert_eq!(q.retry_all_failed(), 0);
+    }
+
+    #[test]
+    fn remove_pending_and_dismiss_failed() {
+        let mut q = TransferQueue::default();
+        q.enqueue(job("keep"));
+        q.enqueue(job("drop"));
+        let drop_id = q.pending[1].id;
+        assert!(q.remove_pending(drop_id).is_some());
+        assert_eq!(q.pending.len(), 1);
+        assert_eq!(q.pending[0].remote_path, "/pub/keep");
+        let fail = job("fail");
+        let fail_id = fail.id;
+        q.mark_failed(fail);
+        assert!(q.dismiss_failed(fail_id).is_some());
+        assert!(q.failed.is_empty());
+        assert!(q.remove_pending(Uuid::nil()).is_none());
     }
 
     #[test]

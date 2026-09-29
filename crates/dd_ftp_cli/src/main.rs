@@ -7,26 +7,29 @@ mod paths;
 mod session;
 mod workers;
 
-use std::{io, time::Duration};
+use std::{future::poll_fn, io, path::Path, time::Duration};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, EventStream},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dd_ftp_app::{reduce, Action, AppState};
+use dd_ftp_app::{reduce, Action, AppState, OverwritePolicy};
 use dd_ftp_storage::{AppConfig, SiteManager};
+use futures_core::Stream;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
+use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
 use crate::bookmarks::{hydrate_password_from_keyring, run_keyring_health_check};
-use crate::events::{handle_key, LoopControl};
+use crate::events::{accept_key_event, handle_key, LoopControl};
 use crate::mouse::handle_mouse;
 use crate::paths::local_list;
 use crate::session::{connection_info_from_env, handle_io_message, Runtime};
 use crate::workers::{
-    accept_worker_msg, handle_worker_result, spawn_pending_workers, WorkerMessage,
+    accept_worker_msg, handle_worker_result, return_pooled_session, spawn_pending_workers,
+    WorkerMessage,
 };
 
 #[tokio::main]
@@ -50,7 +53,22 @@ async fn main() -> Result<()> {
 
     match AppConfig::load_or_default() {
         Ok(cfg) => {
-            reduce(&mut app, Action::SetEditor(cfg.editor_or_empty()));
+            reduce(
+                &mut app,
+                Action::ApplySettings {
+                    editor: cfg.editor_or_empty(),
+                    worker_max_concurrency: cfg.worker_max_or_default(),
+                    hide_dotfiles: cfg.hide_dotfiles,
+                    overwrite: OverwritePolicy::from_config(cfg.overwrite_policy_or_default()),
+                    auto_connect: cfg.auto_connect_default,
+                },
+            );
+            if let Some(path) = cfg.last_local_cwd.as_deref() {
+                if Path::new(path).is_dir() {
+                    app.local_cwd = path.to_string();
+                    app.local_entries = local_list(path);
+                }
+            }
         }
         Err(err) => {
             app.toast = Some(dd_ftp_app::Toast::warning(format!(
@@ -107,84 +125,191 @@ async fn run(
     let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let (io_tx, mut io_rx) = mpsc::unbounded_channel();
     let mut runtime = Runtime::new(io_tx);
+    runtime.default_overwrite_policy = app.default_overwrite_policy;
+    runtime.overwrite_policy = app.default_overwrite_policy;
+    if app.auto_connect_default && !app.quick_connect.host.trim().is_empty() {
+        crate::session::connect_off_thread(app, &mut runtime, app.quick_connect.clone());
+    }
     let mut last_click: Option<(u16, u16, std::time::Instant)> = None;
     let mut drag: Option<dd_ftp_ui::ScrollRegion> = None;
     let mut drag_field: Option<dd_ftp_ui::FieldId> = None;
+    let mut events = EventStream::new();
+    let mut tick = interval_at(
+        TokioInstant::now() + Duration::from_millis(150),
+        Duration::from_millis(150),
+    );
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut app_layout = dd_ftp_ui::LayoutMap::default();
+    let mut needs_draw = true;
 
     loop {
-        app.expire_toast();
-        runtime.sync_worker_view(app);
-        runtime.sync_busy(app);
-        let mut app_layout = dd_ftp_ui::LayoutMap::default();
-        terminal.draw(|f| dd_ftp_ui::render(f, app, &mut app_layout))?;
-
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                WorkerMessage::Progress {
-                    generation,
-                    job_id,
-                    transferred_bytes,
-                    size_bytes,
-                } => {
-                    if !accept_worker_msg(runtime.generation, generation) {
-                        continue;
-                    }
-                    reduce(
-                        app,
-                        Action::UpdateTransferProgress {
-                            job_id,
-                            transferred_bytes,
-                            size_bytes,
-                        },
-                    );
-                }
-                WorkerMessage::Done { generation, result } => {
-                    if !accept_worker_msg(runtime.generation, generation) {
-                        continue;
-                    }
-                    runtime.worker_active_count = runtime.worker_active_count.saturating_sub(1);
-                    runtime
-                        .cancel_flags
-                        .retain(|f| !std::sync::Arc::ptr_eq(f, &result.cancel_flag));
-                    handle_worker_result(app, &mut runtime, result);
-                }
-            }
+        spawn_pending_workers(app, &mut runtime, &tx);
+        if app.expire_toast() {
+            needs_draw = true;
+        }
+        if runtime.sync_worker_view(app) {
+            needs_draw = true;
+        }
+        if runtime.sync_busy(app) {
+            needs_draw = true;
         }
 
-        while let Ok(msg) = io_rx.try_recv() {
-            handle_io_message(app, &mut runtime, msg);
+        if needs_draw {
+            terminal.draw(|f| dd_ftp_ui::render(f, app, &mut app_layout))?;
+            needs_draw = false;
         }
 
         if runtime.editor_ready {
             runtime.editor_ready = false;
+            drop(events);
             run_blocking_editor(terminal, app, &mut runtime).await?;
+            events = EventStream::new();
+            needs_draw = true;
+            continue;
         }
 
-        spawn_pending_workers(app, &mut runtime, &tx);
+        let need_tick = app.busy || app.toast.is_some();
 
-        if event::poll(Duration::from_millis(150))? {
-            match event::read()? {
-                Event::Key(key) => match handle_key(app, &mut runtime, key).await? {
-                    LoopControl::Quit => return Ok(()),
-                    LoopControl::Continue => {}
-                },
-                Event::Mouse(mouse) => {
-                    handle_mouse(
+        tokio::select! {
+            biased;
+            maybe_ev = poll_fn(|cx| std::pin::Pin::new(&mut events).poll_next(cx)) => {
+                match maybe_ev {
+                    Some(Ok(ev)) => {
+                        let (ctl, draw) = handle_terminal_event(
+                            app,
+                            &mut runtime,
+                            &app_layout,
+                            ev,
+                            &mut last_click,
+                            &mut drag,
+                            &mut drag_field,
+                        )?;
+                        if ctl == LoopControl::Quit {
+                            return Ok(());
+                        }
+                        needs_draw |= draw;
+                    }
+                    Some(Err(err)) => return Err(err.into()),
+                    None => {}
+                }
+                while event::poll(Duration::from_millis(0))? {
+                    let (ctl, draw) = handle_terminal_event(
                         app,
                         &mut runtime,
                         &app_layout,
-                        mouse,
+                        event::read()?,
                         &mut last_click,
                         &mut drag,
                         &mut drag_field,
-                    );
+                    )?;
+                    if ctl == LoopControl::Quit {
+                        return Ok(());
+                    }
+                    needs_draw |= draw;
                 }
-                _ => {}
+            }
+            Some(msg) = rx.recv() => {
+                let mut changed = apply_worker_message(app, &mut runtime, msg);
+                while let Ok(more) = rx.try_recv() {
+                    changed |= apply_worker_message(app, &mut runtime, more);
+                }
+                if changed {
+                    spawn_pending_workers(app, &mut runtime, &tx);
+                    needs_draw = true;
+                }
+            }
+            Some(msg) = io_rx.recv() => {
+                handle_io_message(app, &mut runtime, msg);
+                while let Ok(more) = io_rx.try_recv() {
+                    handle_io_message(app, &mut runtime, more);
+                }
+                needs_draw = true;
+            }
+            _ = tick.tick(), if need_tick => {
+                if app.expire_toast() {
+                    needs_draw = true;
+                }
+                if runtime.sync_busy(app) {
+                    needs_draw = true;
+                }
+                if app.busy {
+                    needs_draw = true;
+                }
             }
         }
+    }
+}
 
-        runtime.sync_worker_view(app);
-        runtime.sync_busy(app);
+fn apply_worker_message(app: &mut AppState, runtime: &mut Runtime, msg: WorkerMessage) -> bool {
+    match msg {
+        WorkerMessage::Progress {
+            generation,
+            job_id,
+            transferred_bytes,
+            size_bytes,
+        } => {
+            if !accept_worker_msg(runtime.generation, generation) {
+                return false;
+            }
+            reduce(
+                app,
+                Action::UpdateTransferProgress {
+                    job_id,
+                    transferred_bytes,
+                    size_bytes,
+                },
+            );
+            true
+        }
+        WorkerMessage::Done {
+            generation,
+            result,
+            session,
+        } => {
+            if !accept_worker_msg(runtime.generation, generation) {
+                return false;
+            }
+            runtime.worker_active_count = runtime.worker_active_count.saturating_sub(1);
+            runtime
+                .cancel_flags
+                .retain(|f| !std::sync::Arc::ptr_eq(f, &result.cancel_flag));
+            runtime.job_cancels.remove(&result.job.id);
+            if let Some(session) = session {
+                if let Some(info) = app.active_connection.as_ref() {
+                    return_pooled_session(runtime, *session, info, app.worker_max_concurrency);
+                }
+            }
+            handle_worker_result(app, runtime, result);
+            true
+        }
+    }
+}
+
+fn handle_terminal_event(
+    app: &mut AppState,
+    runtime: &mut Runtime,
+    app_layout: &dd_ftp_ui::LayoutMap,
+    ev: Event,
+    last_click: &mut Option<(u16, u16, std::time::Instant)>,
+    drag: &mut Option<dd_ftp_ui::ScrollRegion>,
+    drag_field: &mut Option<dd_ftp_ui::FieldId>,
+) -> Result<(LoopControl, bool)> {
+    match ev {
+        Event::Key(key) => {
+            if !accept_key_event(key, app) {
+                return Ok((LoopControl::Continue, false));
+            }
+            let control = handle_key(app, runtime, key, app_layout)?;
+            Ok((control, true))
+        }
+        Event::Mouse(mouse) => {
+            let draw = handle_mouse(
+                app, runtime, app_layout, mouse, last_click, drag, drag_field,
+            );
+            Ok((LoopControl::Continue, draw))
+        }
+        Event::Resize(_, _) => Ok((LoopControl::Continue, true)),
+        _ => Ok((LoopControl::Continue, false)),
     }
 }
 
@@ -262,4 +387,61 @@ async fn run_blocking_editor(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod redraw_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    #[test]
+    fn key_release_and_focus_skip_redraw_resize_does_not() {
+        let mut app = AppState::default();
+        let (mut runtime, _rx) = crate::session::test_runtime();
+        let layout = dd_ftp_ui::LayoutMap::default();
+        let mut last_click = None;
+        let mut drag = None;
+        let mut drag_field = None;
+
+        let mut release = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        let (ctl, draw) = handle_terminal_event(
+            &mut app,
+            &mut runtime,
+            &layout,
+            Event::Key(release),
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        )
+        .unwrap();
+        assert_eq!(ctl, LoopControl::Continue);
+        assert!(!draw);
+
+        let (ctl, draw) = handle_terminal_event(
+            &mut app,
+            &mut runtime,
+            &layout,
+            Event::FocusGained,
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        )
+        .unwrap();
+        assert_eq!(ctl, LoopControl::Continue);
+        assert!(!draw);
+
+        let (ctl, draw) = handle_terminal_event(
+            &mut app,
+            &mut runtime,
+            &layout,
+            Event::Resize(120, 40),
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        )
+        .unwrap();
+        assert_eq!(ctl, LoopControl::Continue);
+        assert!(draw);
+    }
 }

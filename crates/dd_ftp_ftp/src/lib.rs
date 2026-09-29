@@ -59,6 +59,10 @@ impl UnifiedFtpSession {
         }
     }
 
+    pub fn connection_info(&self) -> Option<&ConnectionInfo> {
+        self.info.as_ref()
+    }
+
     fn variant_from_info(info: &ConnectionInfo) -> Result<FtpVariant> {
         match info.protocol {
             Protocol::Ftp => Ok(FtpVariant::Ftp),

@@ -55,7 +55,7 @@ dd_ftp_core →  (no internal deps; defines traits + types)
 - `dd_ftp_app` — Redux-style core: `AppState` + `Action` enum + pure `reduce(state, action)`. No IO. Sub-state owns the queue. Live sockets live in CLI `Runtime`, not `AppState`.
 - `dd_ftp_ui` — ratatui render layer + theme loader. Read-only over `AppState`.
 - `ldnddev_theme` — vendored in-tree crate: YAML theme load/save and the F2 live color editor. Do not depend on a sibling `../ldnddev_theme` path.
-- `dd_ftp_cli` — terminal lifecycle, crossterm event loop, async glue, spawns transfer workers. `Runtime` owns `enum SessionHandle { Sftp(SftpSession), Ftp(UnifiedFtpSession) }` (no `dyn RemoteSession`), generation, cancel flags, worker handles, `in_flight`, and `pending_scan`. IO requests (`request_list` / `request_fs` / `connect_off_thread`) never `.await` in the key handler.
+- `dd_ftp_cli` — terminal lifecycle, crossterm event loop, async glue, spawns transfer workers. `Runtime` owns `enum SessionHandle { Sftp(SftpSession), Ftp(UnifiedFtpSession) }` (no `dyn RemoteSession`), generation, cancel flags, worker handles, `in_flight`, `scan_generation`, and `pending_scan`. IO requests (`request_list` / `request_local_list` / `request_fs` / `connect_off_thread`) never `.await` in the key handler. Disconnect and quit drop workers in the background.
 
 ### Event / IO flow
 1. CLI captures crossterm events → translates to `Action`s → calls `reduce(&mut state, action)` (pure state mutation).

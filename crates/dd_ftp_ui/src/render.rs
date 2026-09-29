@@ -2,12 +2,12 @@ use std::time::Duration;
 
 use dd_ftp_app::{
     is_dot_or_dotdot, is_public_key_name, AppState, ChoicePromptKind, FocusPane, PromptKind,
-    QuickConnectField, TextPromptKind, ToastLevel,
+    QuickConnectField, SettingsField, TextPromptKind, ToastLevel,
 };
-use dd_ftp_core::{Protocol, TransferJob};
+use dd_ftp_core::{Protocol, TransferJob, TransferStatus};
 use dd_ftp_transfer::TransferQueue;
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -17,9 +17,12 @@ use ratatui::{
     Frame,
 };
 
-use crate::compare::{classify_compare, CompareBadge};
+use crate::compare::{classify_compare_indexed, index_by_name, CompareBadge};
 use crate::keys::{KeyGroup, KEYMAP};
-use crate::layout::{ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap};
+use crate::layout::{
+    split_fs_path, split_remote_path, ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap,
+    PathSeg,
+};
 use crate::theme::{cached_theme, Theme};
 
 /// Pulse bars for the working loader: ▃ d_d ▃ → ▅ d_d ▅ → █ d_d █ → ▅ d_d ▅
@@ -229,13 +232,22 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     let local_visible_len = local_visible.len();
     let local_row_width = panes[0].width.saturating_sub(4) as usize;
     let local_cols = meta_columns(local_row_width.saturating_sub(6));
+    let compare_local = if app.show_compare {
+        Some(index_by_name(&app.local_entries))
+    } else {
+        None
+    };
+    let compare_remote = if app.show_compare {
+        Some(index_by_name(&app.remote_entries))
+    } else {
+        None
+    };
     let local_items: Vec<ListItem> = local_visible
         .into_iter()
         .map(|e| {
-            let badge = if app.show_compare {
-                classify_compare(&e.name, &app.local_entries, &app.remote_entries)
-            } else {
-                None
+            let badge = match (&compare_local, &compare_remote) {
+                (Some(local), Some(remote)) => classify_compare_indexed(&e.name, local, remote),
+                _ => None,
             };
             file_list_item(
                 e,
@@ -258,10 +270,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     let remote_items: Vec<ListItem> = remote_visible
         .into_iter()
         .map(|e| {
-            let badge = if app.show_compare {
-                classify_compare(&e.name, &app.local_entries, &app.remote_entries)
-            } else {
-                None
+            let badge = match (&compare_local, &compare_remote) {
+                (Some(local), Some(remote)) => classify_compare_indexed(&e.name, local, remote),
+                _ => None,
             };
             file_list_item(
                 e,
@@ -294,32 +305,28 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         Style::default().fg(t.text_labels)
     };
 
-    let local_path = Paragraph::new(shorten_middle(&app.local_cwd, 70))
-        .style(Style::default().bg(t.body_background).fg(t.text_primary))
-        .block(
-            Block::default()
-                .title(Line::from(vec![Span::styled(
-                    " Local Path ",
-                    Style::default().fg(t.text_labels),
-                )]))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(t.border_default)),
-        );
-
-    let remote_path = Paragraph::new(shorten_middle(&app.remote_cwd, 70))
-        .style(Style::default().bg(t.body_background).fg(t.text_primary))
-        .block(
-            Block::default()
-                .title(Line::from(vec![Span::styled(
-                    " Remote Path ",
-                    Style::default().fg(t.text_labels),
-                )]))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(t.border_default)),
-        );
-
-    frame.render_widget(local_path, path_panes[0]);
-    frame.render_widget(remote_path, path_panes[1]);
+    let mut path_controls = Vec::new();
+    let local_targets = render_path_bar(
+        frame,
+        path_panes[0],
+        " Local Path ",
+        &split_fs_path(&app.local_cwd),
+        &t,
+        &mut path_controls,
+        ControlId::LocalPathSeg,
+    );
+    let remote_targets = render_path_bar(
+        frame,
+        path_panes[1],
+        " Remote Path ",
+        &split_remote_path(&app.remote_cwd),
+        &t,
+        &mut path_controls,
+        ControlId::RemotePathSeg,
+    );
+    map.local_path_targets = local_targets;
+    map.remote_path_targets = remote_targets;
+    map.controls.extend(path_controls);
 
     let local_marked = app.marked_live_count(FocusPane::Local);
     let local_title = if local_marked > 0 {
@@ -480,43 +487,8 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         app.queue.failed.len(),
         app.queue.cancelled.len()
     )));
-    let mut queue_text = vec![Line::from(worker_spans)];
-
-    if app.queue.active.is_empty() && app.queue.pending.is_empty() && app.queue.failed.is_empty() {
-        queue_text.push(Line::from("No jobs in queue"));
-    } else {
-        let row_cap = if app.focus == FocusPane::Queue { 5 } else { 2 };
-
-        for job in app.queue.active.iter().take(row_cap) {
-            queue_text.push(Line::from(vec![
-                Span::styled(
-                    "A ",
-                    Style::default().fg(t.info).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format_job_summary(job, &app.queue)),
-            ]));
-        }
-        for job in app.queue.pending.iter().take(row_cap) {
-            queue_text.push(Line::from(vec![
-                Span::styled(
-                    "P ",
-                    Style::default()
-                        .fg(t.text_secondary)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format_job_summary(job, &app.queue)),
-            ]));
-        }
-        for job in app.queue.failed.iter().rev().take(row_cap) {
-            queue_text.push(Line::from(vec![
-                Span::styled(
-                    "F ",
-                    Style::default().fg(t.error).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format_job_summary(job, &app.queue)),
-            ]));
-        }
-    }
+    let queue_jobs = app.visible_queue();
+    map.queue_line_count = queue_jobs.len();
 
     let queue_title_style = if app.focus == FocusPane::Queue {
         Style::default()
@@ -526,25 +498,75 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         Style::default().fg(t.text_labels)
     };
 
-    let queue = Paragraph::new(queue_text.clone())
-        .style(Style::default().bg(t.body_background).fg(t.text_primary))
-        .scroll((app.queue_scroll as u16, 0))
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .title(Line::from(vec![Span::styled(
-                    " [3] Queue ",
-                    queue_title_style,
-                )]))
-                .borders(Borders::ALL)
-                .border_style(queue_style),
+    frame.render_widget(
+        Block::default()
+            .title(Line::from(vec![Span::styled(
+                " [3] Queue ",
+                queue_title_style,
+            )]))
+            .borders(Borders::ALL)
+            .border_style(queue_style)
+            .style(Style::default().bg(t.body_background)),
+        queue_area,
+    );
+
+    let inner = queue_area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let queue_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(worker_spans))
+            .style(Style::default().bg(t.body_background).fg(t.text_primary)),
+        queue_chunks[0],
+    );
+    map.queue_list = queue_chunks[1];
+
+    if queue_jobs.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No jobs in queue")
+                .style(Style::default().fg(t.text_secondary).bg(t.body_background)),
+            queue_chunks[1],
         );
-    frame.render_widget(queue, queue_area);
+        map.queue_list_offset = 0;
+    } else {
+        let items: Vec<ListItem> = queue_jobs
+            .iter()
+            .map(|job| {
+                let (tag, color) = match job.status {
+                    TransferStatus::Active => ("A ", t.info),
+                    TransferStatus::Failed => ("F ", t.error),
+                    _ => ("P ", t.text_secondary),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(tag, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::raw(format_job_summary(job, &app.queue)),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .style(Style::default().bg(t.body_background).fg(t.text_primary))
+            .highlight_symbol("▶ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(
+                Style::default()
+                    .bg(t.selected_background)
+                    .fg(t.text_active_focus)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let mut list_state = ListState::default();
+        list_state.select(Some(app.selected_queue));
+        frame.render_stateful_widget(list, queue_chunks[1], &mut list_state);
+        map.queue_list_offset = list_state.offset();
+    }
     render_scrollbar(
         frame,
         queue_area,
-        app.queue_scroll,
-        queue_text.len(),
+        app.selected_queue,
+        map.queue_line_count.saturating_add(1),
         t.scrollbar,
         t.scrollbar_hover,
         app.mouse_pos,
@@ -558,7 +580,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     } else if status_area.width < 110 {
         "F1: Help   F3: Settings   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u/d: Up/Down   m: Bookmarks   o: Connect   Ctrl+q: Quit"
     } else {
-        "F1: Help   F3: Settings   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   r: Refresh   Ctrl+q: Quit   (mouse: click/scroll/drag)"
+        "F1: Help   F3: Settings   Tab: Pane   j/k: Nav   PgUp/PgDn: Page   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   Ctrl+q: Quit"
     };
     let footer_keys =
         Paragraph::new(keys).style(Style::default().fg(t.text_secondary).bg(t.base_background));
@@ -638,6 +660,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             "Press F1 or Esc to close",
             Style::default().fg(t.warning),
         )]));
+        map.help_line_count = lines.len();
 
         let help = Paragraph::new(lines.clone())
             .style(Style::default().bg(t.modal_background).fg(t.modal_text))
@@ -1099,7 +1122,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     }
 
     if app.show_settings {
-        let area = centered_rect(70, 40, frame.area());
+        let area = centered_rect(74, 80, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
             Block::default().style(Style::default().bg(t.modal_background)),
@@ -1118,40 +1141,109 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             }
         });
 
-        let mut lines = vec![
+        let row = |field: SettingsField| -> Style {
+            if app.settings_field == field {
+                Style::default()
+                    .fg(t.input_text_focus)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.modal_text)
+            }
+        };
+        let cycle_line = |field: SettingsField, label: &str, value: &str| -> Line<'static> {
+            let mark = if app.settings_field == field {
+                ">"
+            } else {
+                " "
+            };
+            Line::from(vec![Span::styled(
+                format!("{mark} {label:<16} {value}"),
+                row(field),
+            )])
+        };
+
+        let mut editor_spans = vec![Span::styled(
+            if app.settings_field == SettingsField::Editor {
+                "> "
+            } else {
+                "  "
+            },
+            row(SettingsField::Editor),
+        )];
+        editor_spans.extend(render_field_line(&app.settings_editor, false, &t));
+
+        let mut last_spans = vec![Span::styled(
+            if app.settings_field == SettingsField::LastLocalCwd {
+                "> "
+            } else {
+                "  "
+            },
+            row(SettingsField::LastLocalCwd),
+        )];
+        last_spans.extend(render_field_line(&app.settings_last_local, false, &t));
+
+        let hide = if app.settings_hide_dotfiles {
+            "on"
+        } else {
+            "off"
+        };
+        let auto = if app.settings_auto_connect {
+            "on"
+        } else {
+            "off"
+        };
+
+        let lines = vec![
             Line::from(vec![Span::styled(
                 "Editor  (empty = $VISUAL, then $EDITOR, then vi)",
                 Style::default().fg(t.modal_labels),
             )]),
+            Line::from(editor_spans),
+            Line::from(vec![Span::styled(
+                format!("Active now: {active}"),
+                Style::default().fg(t.text_secondary),
+            )]),
+            if env_override.is_some() {
+                Line::from(vec![Span::styled(
+                    "Environment variable overrides the saved editor",
+                    Style::default().fg(t.warning),
+                )])
+            } else {
+                Line::from("")
+            },
             Line::from(""),
-        ];
-        let mut editor_spans = vec![Span::styled("> ", Style::default().fg(t.input_text_focus))];
-        editor_spans.extend(render_field_line(&app.settings_editor, false, &t));
-        lines.push(Line::from(editor_spans));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            format!("Active now: {active}"),
-            Style::default().fg(t.text_secondary),
-        )]));
-        if env_override.is_some() {
-            lines.push(Line::from(vec![Span::styled(
-                "Environment variable overrides the saved editor",
+            cycle_line(
+                SettingsField::Workers,
+                "Workers",
+                &app.settings_workers.to_string(),
+            ),
+            cycle_line(SettingsField::HideDotfiles, "Hide dotfiles", hide),
+            cycle_line(
+                SettingsField::Overwrite,
+                "Overwrite",
+                app.settings_overwrite.settings_label(),
+            ),
+            cycle_line(SettingsField::AutoConnect, "Auto-connect", auto),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Last local path (restored at launch)",
+                Style::default().fg(t.modal_labels),
+            )]),
+            Line::from(last_spans),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Saved to ~/.config/ldnddev/dd_ftp.toml (not the theme file)",
+                Style::default().fg(t.text_secondary),
+            )]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Tab cycle | Left/Right/Space change | Enter save | Esc cancel",
                 Style::default().fg(t.warning),
-            )]));
-        }
-        lines.push(Line::from(vec![Span::styled(
-            "Saved to ~/.config/ldnddev/dd_ftp.toml (not the theme file)",
-            Style::default().fg(t.text_secondary),
-        )]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            "Enter save | Esc cancel",
-            Style::default().fg(t.warning),
-        )]));
+            )]),
+        ];
 
         let modal = Paragraph::new(lines)
             .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .wrap(Wrap { trim: true })
             .block(
                 Block::default()
                     .title(Line::from(vec![Span::styled(
@@ -1165,16 +1257,41 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
             );
         frame.render_widget(modal, area);
 
-        let editor_input_area = Rect {
-            x: area.x + 1,
-            y: area.y + 3,
-            width: area.width.saturating_sub(2),
+        let content_y = area.y.saturating_add(1);
+        let inner_x = area.x.saturating_add(1);
+        let inner_w = area.width.saturating_sub(2);
+        let row_area = |line: u16| Rect {
+            x: inner_x,
+            y: content_y.saturating_add(line),
+            width: inner_w,
             height: 1,
         };
+
         map.fields.push(FieldRegion {
             id: FieldId::SettingsEditor,
-            area: editor_input_area,
-            text_x: area.x + 3,
+            area: row_area(1),
+            text_x: inner_x.saturating_add(2),
+        });
+        map.fields.push(FieldRegion {
+            id: FieldId::SettingsLastLocal,
+            area: row_area(11),
+            text_x: inner_x.saturating_add(2),
+        });
+        map.controls.push(ControlRegion {
+            id: ControlId::SettingsWorkers,
+            area: row_area(5),
+        });
+        map.controls.push(ControlRegion {
+            id: ControlId::SettingsHideDotfiles,
+            area: row_area(6),
+        });
+        map.controls.push(ControlRegion {
+            id: ControlId::SettingsOverwrite,
+            area: row_area(7),
+        });
+        map.controls.push(ControlRegion {
+            id: ControlId::SettingsAutoConnect,
+            area: row_area(8),
         });
     }
 
@@ -1800,6 +1917,66 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{scaled:.1}{label}")
     }
+}
+
+fn render_path_bar(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    segs: &[PathSeg],
+    t: &Theme,
+    controls: &mut Vec<ControlRegion>,
+    make_id: fn(usize) -> ControlId,
+) -> Vec<String> {
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let mut spans = Vec::new();
+    let mut targets = Vec::new();
+    let mut x = inner.x;
+    let max_x = inner.x.saturating_add(inner.width);
+    for (i, seg) in segs.iter().enumerate() {
+        let show_slash = i > 0 && segs[i - 1].label != "/" && !seg.label.starts_with('/');
+        if show_slash {
+            spans.push(Span::styled("/", Style::default().fg(t.text_secondary)));
+            x = x.saturating_add(1);
+        }
+        let w = seg.label.chars().count() as u16;
+        if w > 0 && x < max_x {
+            let vis_w = w.min(max_x.saturating_sub(x));
+            controls.push(ControlRegion {
+                id: make_id(targets.len()),
+                area: Rect {
+                    x,
+                    y: inner.y,
+                    width: vis_w,
+                    height: 1,
+                },
+            });
+            targets.push(seg.target.clone());
+        }
+        spans.push(Span::styled(
+            seg.label.clone(),
+            Style::default()
+                .fg(t.text_primary)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+        x = x.saturating_add(w);
+    }
+    let bar = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(t.body_background).fg(t.text_primary))
+        .block(
+            Block::default()
+                .title(Line::from(vec![Span::styled(
+                    title.to_string(),
+                    Style::default().fg(t.text_labels),
+                )]))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.border_default)),
+        );
+    frame.render_widget(bar, area);
+    targets
 }
 
 fn shorten_middle(input: &str, max_chars: usize) -> String {

@@ -49,7 +49,17 @@ pub const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "F3",
-        action: "Toggle settings (editor command; saved to ~/.config/ldnddev/dd_ftp.toml)",
+        action: "Toggle settings (editor, workers, hide-dotfiles, overwrite, auto-connect, last path; saved to ~/.config/ldnddev/dd_ftp.toml)",
+        group: KeyGroup::Global,
+    },
+    KeyBinding {
+        keys: "Tab (settings)",
+        action: "Cycle settings fields",
+        group: KeyGroup::Global,
+    },
+    KeyBinding {
+        keys: "Left/Right/Space (settings)",
+        action: "Change the highlighted non-text setting",
         group: KeyGroup::Global,
     },
     KeyBinding {
@@ -90,6 +100,16 @@ pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "j/k",
         action: "Move selection",
+        group: KeyGroup::Navigation,
+    },
+    KeyBinding {
+        keys: "PgUp/PgDn",
+        action: "Move selection by a page (lists, help, queue, bookmarks, key picker)",
+        group: KeyGroup::Navigation,
+    },
+    KeyBinding {
+        keys: "Home/End",
+        action: "Jump to first or last row (lists, help, queue, bookmarks, key picker)",
         group: KeyGroup::Navigation,
     },
     KeyBinding {
@@ -179,7 +199,17 @@ pub const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "R",
-        action: "Retry last failed",
+        action: "Retry last failed (queue pane: retry the highlighted failed job)",
+        group: KeyGroup::Transfers,
+    },
+    KeyBinding {
+        keys: "A (queue)",
+        action: "Retry all failed jobs",
+        group: KeyGroup::Transfers,
+    },
+    KeyBinding {
+        keys: "x (queue)",
+        action: "Cancel or remove the highlighted job (pending, active, or failed)",
         group: KeyGroup::Transfers,
     },
     KeyBinding {
@@ -204,8 +234,18 @@ pub const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "/",
-        action: "Toggle filter (Esc closes and clears the pattern)",
+        action: "Toggle filter (Esc closes and clears the pattern; Enter closes and keeps it)",
         group: KeyGroup::Filter,
+    },
+    KeyBinding {
+        keys: "Enter (filter)",
+        action: "Close the filter bar and keep the pattern",
+        group: KeyGroup::Filter,
+    },
+    KeyBinding {
+        keys: "Ctrl+a",
+        action: "Mark every visible row in the focused file pane (skips . and ..)",
+        group: KeyGroup::FileOps,
     },
     KeyBinding {
         keys: "C",
@@ -295,6 +335,11 @@ pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "Mouse: click row",
         action: "Focus pane, select visible row",
+        group: KeyGroup::Mouse,
+    },
+    KeyBinding {
+        keys: "Mouse: click path segment",
+        action: "cd to that path prefix; double-click the current segment for the parent",
         group: KeyGroup::Mouse,
     },
     KeyBinding {

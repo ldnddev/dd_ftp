@@ -1,7 +1,7 @@
 use dd_ftp_core::{ConnectionInfo, FileEntry, TransferJob};
 use uuid::Uuid;
 
-use crate::{ChoicePromptKind, FocusPane, OverwritePolicy, SelectPolicy};
+use crate::{ChoicePromptKind, FocusPane, OverwritePolicy, SelectPolicy, SettingsField};
 
 #[derive(Debug)]
 pub enum Action {
@@ -57,6 +57,9 @@ pub enum Action {
     MarkTransferFailed(TransferJob),
     MarkTransferCancelled(TransferJob),
     RetryLastFailed,
+    RetryFailed(Uuid),
+    RetryAllFailed,
+    RemoveQueueJob(Uuid),
     UpdateTransferProgress {
         job_id: Uuid,
         transferred_bytes: u64,
@@ -83,6 +86,10 @@ pub enum Action {
     ToggleHelp,
     ToggleThemeDebug,
     ToggleSettings,
+    SettingsNextField,
+    SettingsPrevField,
+    SettingsSelectField(SettingsField),
+    SettingsCycleValue(i32),
     SettingsInput(char),
     SettingsBackspace,
     SettingsMoveCursor {
@@ -91,6 +98,13 @@ pub enum Action {
     },
     SettingsBeginSelect(usize),
     SettingsExtendSelect(usize),
+    ApplySettings {
+        editor: String,
+        worker_max_concurrency: usize,
+        hide_dotfiles: bool,
+        overwrite: OverwritePolicy,
+        auto_connect: bool,
+    },
     SetEditor(String),
     SelectUp,
     SelectDown,
@@ -98,6 +112,8 @@ pub enum Action {
     FilterInput(char),
     FilterBackspace,
     ClearFilter,
+    CloseFilterKeep,
+    MarkAllVisible,
     ToggleCompare,
     CreateFile(String),
     CreateFolder(String),

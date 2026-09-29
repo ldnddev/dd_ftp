@@ -1,8 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-use dd_ftp_app::{reduce, Action, AppState, FocusPane, QuickConnectField};
-use dd_ftp_ui::{hit_test, ControlId, FieldId, Pane, Region, ScrollRegion};
+use dd_ftp_app::{reduce, Action, AppState, FocusPane, QuickConnectField, SettingsField};
+use dd_ftp_ui::{
+    hit_test, path_seg_action, ControlId, FieldId, Pane, PathSegAction, Region, ScrollRegion,
+};
 
 use crate::session::Runtime;
 
@@ -16,11 +18,17 @@ pub(crate) fn handle_mouse(
     last_click: &mut Option<(u16, u16, Instant)>,
     drag: &mut Option<ScrollRegion>,
     drag_field: &mut Option<FieldId>,
-) {
+) -> bool {
     let (mx, my) = (mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Moved => {
-            app.mouse_pos = Some((mx, my));
+            let old = app.mouse_pos;
+            let new = Some((mx, my));
+            if old == new {
+                return false;
+            }
+            app.mouse_pos = new;
+            app_layout.hovered_scrollbar(old) != app_layout.hovered_scrollbar(new)
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
@@ -40,6 +48,7 @@ pub(crate) fn handle_mouse(
                             },
                         );
                     }
+                    true
                 }
                 Some(Region::List(Pane::Remote))
                 | Some(Region::Scrollbar(ScrollRegion::ListRemote))
@@ -56,16 +65,23 @@ pub(crate) fn handle_mouse(
                             },
                         );
                     }
+                    true
                 }
-                Some(Region::Scrollbar(ScrollRegion::Queue)) => {
-                    reduce(
-                        app,
-                        Action::QueueScroll(if up {
-                            -(SCROLL_STEP as i32)
-                        } else {
-                            SCROLL_STEP as i32
-                        }),
-                    );
+                Some(Region::QueueList) | Some(Region::Scrollbar(ScrollRegion::Queue))
+                    if !app.any_modal_open() =>
+                {
+                    reduce(app, Action::SetFocus(FocusPane::Queue));
+                    for _ in 0..SCROLL_STEP {
+                        reduce(
+                            app,
+                            if up {
+                                Action::SelectUp
+                            } else {
+                                Action::SelectDown
+                            },
+                        );
+                    }
+                    true
                 }
                 Some(Region::Scrollbar(ScrollRegion::Help)) => {
                     reduce(
@@ -76,6 +92,7 @@ pub(crate) fn handle_mouse(
                             SCROLL_STEP as i32
                         }),
                     );
+                    true
                 }
                 Some(Region::KeyPickerList) | Some(Region::Scrollbar(ScrollRegion::KeyPicker))
                     if app.show_key_picker =>
@@ -90,8 +107,9 @@ pub(crate) fn handle_mouse(
                             },
                         );
                     }
+                    true
                 }
-                _ => {}
+                _ => false,
             }
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -103,6 +121,23 @@ pub(crate) fn handle_mouse(
                 .unwrap_or(false);
             *last_click = Some((mx, my, now));
             match hit_test(app_layout, mx, my) {
+                Some(Region::QueueList) if !app.any_modal_open() => {
+                    reduce(app, Action::SetFocus(FocusPane::Queue));
+                    let list_rect = app_layout.queue_list;
+                    if my >= list_rect.y {
+                        let row = (my - list_rect.y) as usize;
+                        let idx = app_layout.queue_list_offset + row;
+                        if idx < app.visible_queue().len() {
+                            reduce(
+                                app,
+                                Action::SelectIndex {
+                                    pane: FocusPane::Queue,
+                                    index: idx,
+                                },
+                            );
+                        }
+                    }
+                }
                 Some(Region::List(pane)) if !app.any_modal_open() => {
                     reduce(
                         app,
@@ -179,7 +214,45 @@ pub(crate) fn handle_mouse(
                         }
                     }
                 }
+                Some(Region::Control(ControlId::LocalPathSeg(i))) if !app.any_modal_open() => {
+                    reduce(app, Action::SetFocus(FocusPane::Local));
+                    match path_seg_action(&app_layout.local_path_targets, i, is_double).map(|a| {
+                        match a {
+                            PathSegAction::Parent => None,
+                            PathSegAction::Goto(p) => Some(p.to_string()),
+                        }
+                    }) {
+                        Some(None) => crate::events::navigate_parent_directory(app, runtime),
+                        Some(Some(path)) => crate::events::navigate_local_path(app, runtime, path),
+                        None => {}
+                    }
+                }
+                Some(Region::Control(ControlId::RemotePathSeg(i))) if !app.any_modal_open() => {
+                    reduce(app, Action::SetFocus(FocusPane::Remote));
+                    match path_seg_action(&app_layout.remote_path_targets, i, is_double).map(|a| {
+                        match a {
+                            PathSegAction::Parent => None,
+                            PathSegAction::Goto(p) => Some(p.to_string()),
+                        }
+                    }) {
+                        Some(None) => crate::events::navigate_parent_directory(app, runtime),
+                        Some(Some(path)) => crate::events::navigate_remote_path(app, runtime, path),
+                        None => {}
+                    }
+                }
                 Some(Region::Control(_)) if app.show_prompt => {}
+                Some(Region::Control(cid)) if app.show_settings => {
+                    if let Some(field) = match cid {
+                        ControlId::SettingsWorkers => Some(SettingsField::Workers),
+                        ControlId::SettingsHideDotfiles => Some(SettingsField::HideDotfiles),
+                        ControlId::SettingsOverwrite => Some(SettingsField::Overwrite),
+                        ControlId::SettingsAutoConnect => Some(SettingsField::AutoConnect),
+                        _ => None,
+                    } {
+                        reduce(app, Action::SettingsSelectField(field));
+                        reduce(app, Action::SettingsCycleValue(1));
+                    }
+                }
                 Some(Region::Control(ControlId::QcBrowseKey)) if app.show_quick_connect => {
                     crate::events::open_key_picker(app);
                 }
@@ -238,8 +311,15 @@ pub(crate) fn handle_mouse(
                                 *drag_field = Some(fid);
                             }
                             FieldId::Prompt => {}
-                            FieldId::SettingsEditor if app.show_settings => {
-                                let len = app.settings_editor.len();
+                            FieldId::SettingsEditor | FieldId::SettingsLastLocal
+                                if app.show_settings =>
+                            {
+                                let field = match fid {
+                                    FieldId::SettingsLastLocal => SettingsField::LastLocalCwd,
+                                    _ => SettingsField::Editor,
+                                };
+                                reduce(app, Action::SettingsSelectField(field));
+                                let len = app.settings_text_mut().map(|tf| tf.len()).unwrap_or(0);
                                 let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
                                 reduce(app, Action::SettingsBeginSelect(idx));
                                 *drag_field = Some(fid);
@@ -259,8 +339,10 @@ pub(crate) fn handle_mouse(
                 }
                 _ => {}
             }
+            true
         }
         MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            let dragging = drag.is_some() || drag_field.is_some();
             if let Some(sr) = *drag {
                 apply_scrollbar_drag(app, app_layout, sr, my);
             }
@@ -273,8 +355,10 @@ pub(crate) fn handle_mouse(
                             app.prompt_value.extend_drag(idx);
                         }
                         FieldId::Prompt => {}
-                        FieldId::SettingsEditor if app.show_settings => {
-                            let len = app.settings_editor.len();
+                        FieldId::SettingsEditor | FieldId::SettingsLastLocal
+                            if app.show_settings =>
+                        {
+                            let len = app.settings_text_mut().map(|tf| tf.len()).unwrap_or(0);
                             let idx = dd_ftp_ui::char_index_at(&fr, mx, len);
                             reduce(app, Action::SettingsExtendSelect(idx));
                         }
@@ -287,12 +371,14 @@ pub(crate) fn handle_mouse(
                     }
                 }
             }
+            dragging
         }
         MouseEventKind::Up(_) => {
             *drag = None;
             *drag_field = None;
+            false
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -306,7 +392,7 @@ pub(crate) fn qc_field_for(fid: dd_ftp_ui::FieldId) -> Option<QuickConnectField>
         QcPassword => QuickConnectField::Password,
         QcPrivateKey => QuickConnectField::PrivateKey,
         QcPath => QuickConnectField::Path,
-        Prompt | SettingsEditor => return None,
+        Prompt | SettingsEditor | SettingsLastLocal => return None,
     })
 }
 
@@ -353,15 +439,13 @@ pub(crate) fn apply_scrollbar_drag(
             );
         }
         ScrollRegion::Queue => {
-            let n = app.queue.pending.len()
-                + app.queue.active.len()
-                + app.queue.completed.len()
-                + app.queue.failed.len()
-                + app.queue.cancelled.len();
-            let target = (frac * n as f32).round() as usize;
+            let n = app.visible_queue().len().saturating_sub(1);
             reduce(
                 app,
-                Action::QueueScroll(target as i32 - app.queue_scroll as i32),
+                Action::SelectIndex {
+                    pane: FocusPane::Queue,
+                    index: (frac * n as f32).round() as usize,
+                },
             );
         }
         ScrollRegion::Help => {
@@ -378,5 +462,95 @@ pub(crate) fn apply_scrollbar_drag(
                 Action::KeyPickerSelectIndex((frac * n as f32).round() as usize),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::MouseEvent;
+    use dd_ftp_ui::LayoutMap;
+    use ratatui::layout::Rect;
+
+    use crate::session::test_runtime;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn layout_with_local_bar() -> LayoutMap {
+        LayoutMap {
+            local_list: Rect::new(0, 3, 40, 20),
+            local_scrollbar: Rect::new(39, 3, 1, 20),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mouse_move_redraws_only_when_scrollbar_hover_changes() {
+        let mut app = AppState::default();
+        let (mut runtime, _rx) = test_runtime();
+        let layout = layout_with_local_bar();
+        let mut last_click = None;
+        let mut drag = None;
+        let mut drag_field = None;
+
+        assert!(!handle_mouse(
+            &mut app,
+            &mut runtime,
+            &layout,
+            mouse(MouseEventKind::Moved, 10, 10),
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        ));
+        assert_eq!(app.mouse_pos, Some((10, 10)));
+
+        assert!(!handle_mouse(
+            &mut app,
+            &mut runtime,
+            &layout,
+            mouse(MouseEventKind::Moved, 12, 11),
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        ));
+
+        assert!(handle_mouse(
+            &mut app,
+            &mut runtime,
+            &layout,
+            mouse(MouseEventKind::Moved, 39, 10),
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        ));
+        assert!(!handle_mouse(
+            &mut app,
+            &mut runtime,
+            &layout,
+            mouse(MouseEventKind::Moved, 39, 12),
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        ));
+        assert!(!handle_mouse(
+            &mut app,
+            &mut runtime,
+            &layout,
+            mouse(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                39,
+                12
+            ),
+            &mut last_click,
+            &mut drag,
+            &mut drag_field,
+        ));
     }
 }

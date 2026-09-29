@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -27,6 +27,15 @@ use crate::paths::{local_list, parent_remote_path, safe_local_child, safe_remote
 pub(crate) enum SessionHandle {
     Sftp(SftpSession),
     Ftp(UnifiedFtpSession),
+}
+
+impl std::fmt::Debug for SessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sftp(_) => f.write_str("Sftp"),
+            Self::Ftp(_) => f.write_str("Ftp"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +71,6 @@ pub(crate) enum InFlight {
     List {
         generation: u64,
         path: String,
-    },
-    Scan {
-        generation: u64,
     },
     HostKey {
         generation: u64,
@@ -125,6 +131,13 @@ pub(crate) enum IoMessage {
         generation: u64,
         error: String,
     },
+    LocalListDone {
+        generation: u64,
+        path: String,
+        entries: Vec<FileEntry>,
+        select: SelectPolicy,
+        ok_status: Option<String>,
+    },
 }
 
 /// CLI-owned sockets and in-flight IO. No `dyn RemoteSession`.
@@ -132,8 +145,17 @@ pub(crate) struct Runtime {
     pub generation: u64,
     pub handle: Option<SessionHandle>,
     pub cancel_flags: Vec<Arc<AtomicBool>>,
+    pub job_cancels: HashMap<uuid::Uuid, Arc<AtomicBool>>,
     pub worker_handles: Vec<JoinHandle<()>>,
+    /// Connected transfer sessions reused across jobs. Separate from `handle`
+    /// (the UI listing session).
+    pub worker_sessions: Vec<SessionHandle>,
     pub in_flight: Option<InFlight>,
+    /// Folder walk generation. Independent of `in_flight` so the UI session
+    /// can list while a scan fills `pending_scan`.
+    pub scan_generation: Option<u64>,
+    pub local_list_gen: u64,
+    pub local_list_pending: bool,
     pub pending_scan: VecDeque<PendingFile>,
     pub io_tx: mpsc::UnboundedSender<IoMessage>,
     pub park: Arc<Mutex<Option<SessionHandle>>>,
@@ -143,6 +165,8 @@ pub(crate) struct Runtime {
     pub fs_remote: bool,
     pub fs_ok_status: String,
     pub overwrite_policy: OverwritePolicy,
+    /// Fresh-drain default from F3 settings. In-flight drain policy is not overwritten.
+    pub default_overwrite_policy: OverwritePolicy,
     pub drain_list: bool,
     pub drain_mkdir: bool,
     pub mkdir_queue: VecDeque<String>,
@@ -161,8 +185,13 @@ impl Runtime {
             generation: 0,
             handle: None,
             cancel_flags: Vec::new(),
+            job_cancels: HashMap::new(),
             worker_handles: Vec::new(),
+            worker_sessions: Vec::new(),
             in_flight: None,
+            scan_generation: None,
+            local_list_gen: 0,
+            local_list_pending: false,
             pending_scan: VecDeque::new(),
             io_tx,
             park: Arc::new(Mutex::new(None)),
@@ -172,6 +201,7 @@ impl Runtime {
             fs_remote: false,
             fs_ok_status: String::new(),
             overwrite_policy: OverwritePolicy::Ask,
+            default_overwrite_policy: OverwritePolicy::Ask,
             drain_list: false,
             drain_mkdir: false,
             mkdir_queue: VecDeque::new(),
@@ -185,15 +215,21 @@ impl Runtime {
         }
     }
 
-    pub fn sync_worker_view(&self, app: &mut AppState) {
+    pub fn sync_worker_view(&self, app: &mut AppState) -> bool {
+        let active_count = self.worker_active_count;
+        let running = active_count > 0;
+        if app.worker_active_count == active_count && app.worker_running == running {
+            return false;
+        }
         reduce(
             app,
             Action::SetWorkerView {
-                active_count: self.worker_active_count,
-                running: self.worker_active_count > 0,
+                active_count,
+                running,
                 cancel_requested: app.worker_cancel_requested,
             },
         );
+        true
     }
 
     /// Connect/list/fs/scan (not host-key prompts) or an active transfer worker.
@@ -201,22 +237,21 @@ impl Runtime {
         self.worker_active_count > 0
             || !self.pending_delete.is_empty()
             || self.edit_session.is_some()
+            || self.scan_generation.is_some()
+            || self.local_list_pending
             || matches!(
                 self.in_flight,
-                Some(
-                    InFlight::Connect { .. }
-                        | InFlight::List { .. }
-                        | InFlight::Fs { .. }
-                        | InFlight::Scan { .. }
-                )
+                Some(InFlight::Connect { .. } | InFlight::List { .. } | InFlight::Fs { .. })
             )
     }
 
-    pub fn sync_busy(&self, app: &mut AppState) {
+    pub fn sync_busy(&self, app: &mut AppState) -> bool {
         let busy = self.is_working();
-        if app.busy != busy {
-            reduce(app, Action::SetBusy(busy));
+        if app.busy == busy {
+            return false;
         }
+        reduce(app, Action::SetBusy(busy));
+        true
     }
 
     pub fn request_list(
@@ -341,21 +376,50 @@ impl Runtime {
     }
 }
 
+/// UI session is parked or connecting (list/fs/connect/host-key). Folder scan
+/// and local listings use their own slots and do not set this.
 pub(crate) fn io_busy(runtime: &Runtime) -> bool {
     runtime.in_flight.is_some()
 }
 
 pub(crate) fn drain_busy(runtime: &Runtime) -> bool {
     !runtime.pending_scan.is_empty()
-        || matches!(
-            runtime.in_flight,
-            Some(InFlight::Scan { .. } | InFlight::List { .. })
-        )
+        || runtime.scan_generation.is_some()
+        || runtime.drain_list
+        || runtime.drain_mkdir
+}
+
+pub(crate) fn busy_status(runtime: &Runtime) -> String {
+    match &runtime.in_flight {
+        Some(InFlight::Connect { .. }) => "busy: connecting".to_string(),
+        Some(InFlight::List { .. }) => "busy: listing remote".to_string(),
+        Some(InFlight::HostKey { .. }) => "busy: waiting for host key".to_string(),
+        Some(InFlight::Fs { kind, .. }) => match kind {
+            FsKind::CreateFile | FsKind::CreateFolder => "busy: creating".to_string(),
+            FsKind::Rename => "busy: renaming".to_string(),
+            FsKind::Delete => "busy: deleting".to_string(),
+            FsKind::Chmod => "busy: setting permissions".to_string(),
+        },
+        None => {
+            if runtime.scan_generation.is_some() {
+                "busy: scanning folder".to_string()
+            } else if drain_busy(runtime) {
+                "busy: preparing transfers".to_string()
+            } else {
+                "busy".to_string()
+            }
+        }
+    }
+}
+
+fn reset_overwrite_policy(runtime: &mut Runtime) {
+    runtime.overwrite_policy = runtime.default_overwrite_policy;
 }
 
 pub(crate) fn clear_scan_state(runtime: &mut Runtime) {
     runtime.pending_scan.clear();
-    runtime.overwrite_policy = OverwritePolicy::Ask;
+    runtime.scan_generation = None;
+    reset_overwrite_policy(runtime);
     runtime.mkdir_queue.clear();
     runtime.drain_list = false;
     runtime.drain_mkdir = false;
@@ -364,19 +428,56 @@ pub(crate) fn clear_scan_state(runtime: &mut Runtime) {
 fn bump_generation(runtime: &mut Runtime) {
     runtime.generation = runtime.generation.wrapping_add(1);
     clear_scan_state(runtime);
+    drop_sessions(std::mem::take(&mut runtime.worker_sessions));
 }
 
-async fn wait_worker_handles(handles: &mut Vec<JoinHandle<()>>) {
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        for handle in handles.drain(..) {
-            let _ = handle.await;
+fn drop_worker_handles(handles: &mut Vec<JoinHandle<()>>) {
+    let taken = std::mem::take(handles);
+    if taken.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            for handle in taken {
+                let _ = handle.await;
+            }
+        })
+        .await;
+    });
+}
+
+fn drop_sessions(sessions: Vec<SessionHandle>) {
+    if sessions.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for session in sessions {
+            disconnect_handle(session).await;
         }
-    })
-    .await;
-    handles.clear();
+    });
 }
 
-pub(crate) async fn bump_generation_drop_workers(app: &mut AppState, runtime: &mut Runtime) {
+fn spawn_disconnect(handle: Option<SessionHandle>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    tokio::spawn(async move {
+        disconnect_handle(handle).await;
+    });
+}
+
+async fn disconnect_handle(handle: SessionHandle) {
+    match handle {
+        SessionHandle::Ftp(mut ftp) => {
+            let _ = ftp.disconnect().await;
+        }
+        SessionHandle::Sftp(mut sftp) => {
+            let _ = sftp.disconnect().await;
+        }
+    }
+}
+
+pub(crate) fn bump_generation_drop_workers(app: &mut AppState, runtime: &mut Runtime) {
     bump_generation(runtime);
     for flag in runtime.cancel_flags.iter() {
         flag.store(true, Ordering::Relaxed);
@@ -395,8 +496,31 @@ pub(crate) async fn bump_generation_drop_workers(app: &mut AppState, runtime: &m
         reduce(app, Action::MarkTransferCancelled(job));
     }
     reduce(app, Action::ClearPendingTransfers);
-    wait_worker_handles(&mut runtime.worker_handles).await;
+    drop_worker_handles(&mut runtime.worker_handles);
     runtime.cancel_flags.clear();
+    runtime.job_cancels.clear();
+}
+
+pub(crate) fn request_local_list(
+    runtime: &mut Runtime,
+    path: String,
+    select: SelectPolicy,
+    ok_status: Option<String>,
+) {
+    runtime.local_list_gen = runtime.local_list_gen.wrapping_add(1);
+    let gen = runtime.local_list_gen;
+    runtime.local_list_pending = true;
+    let io_tx = runtime.io_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let entries = local_list(&path);
+        let _ = io_tx.send(IoMessage::LocalListDone {
+            generation: gen,
+            path,
+            entries,
+            select,
+            ok_status,
+        });
+    });
 }
 
 fn take_parked(park: &Arc<Mutex<Option<SessionHandle>>>) -> Option<SessionHandle> {
@@ -575,9 +699,6 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                         }
                     }
                 }
-                return;
-            }
-            if !runtime.pending_scan.is_empty() {
                 maybe_resume_drain(app, runtime);
                 return;
             }
@@ -596,6 +717,7 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                     );
                 }
             }
+            maybe_resume_drain(app, runtime);
         }
         IoMessage::FsDone {
             generation,
@@ -629,22 +751,20 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                     if kind == FsKind::Delete && !runtime.pending_delete.is_empty() {
                         runtime.pending_delete.pop_front();
                     }
+                    if !runtime.fs_remote {
+                        request_local_list(
+                            runtime,
+                            app.local_cwd.clone(),
+                            SelectPolicy::PreserveName,
+                            None,
+                        );
+                    }
                     if !runtime.pending_scan.is_empty() {
                         maybe_resume_drain(app, runtime);
                     } else if !runtime.pending_delete.is_empty() {
                         crate::fs_ops::start_next_delete(app, runtime);
-                    } else if runtime.fs_remote {
-                        if app.connected {
-                            relist_remote(app, runtime);
-                        }
-                    } else {
-                        reduce(
-                            app,
-                            Action::SetLocalEntries {
-                                entries: local_list(&app.local_cwd),
-                                select: SelectPolicy::PreserveName,
-                            },
-                        );
+                    } else if runtime.fs_remote && app.connected {
+                        relist_remote(app, runtime);
                     }
                 }
                 Err(err) => {
@@ -684,14 +804,7 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
             reduce(app, Action::ShowChoicePrompt(ChoicePromptKind::HostKey));
         }
         IoMessage::ScanItem { generation, file } => {
-            if generation != runtime.generation {
-                return;
-            }
-            let matches_inflight = matches!(
-                runtime.in_flight,
-                Some(InFlight::Scan { generation: g }) if g == generation
-            );
-            if !matches_inflight {
+            if generation != runtime.generation || runtime.scan_generation != Some(generation) {
                 return;
             }
             if app.worker_cancel_requested {
@@ -701,17 +814,10 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
             apply_scan_item(&mut runtime.pending_scan, file, runtime.scan_delete_source);
         }
         IoMessage::ScanDone { generation } => {
-            if generation != runtime.generation {
+            if generation != runtime.generation || runtime.scan_generation != Some(generation) {
                 return;
             }
-            let matches_inflight = matches!(
-                runtime.in_flight,
-                Some(InFlight::Scan { generation: g }) if g == generation
-            );
-            if !matches_inflight {
-                return;
-            }
-            runtime.in_flight = None;
+            runtime.scan_generation = None;
             if app.worker_cancel_requested {
                 park_pending_scan(app, runtime);
                 return;
@@ -719,24 +825,36 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
             drain_scan_next(app, runtime);
         }
         IoMessage::ScanError { generation, error } => {
-            if generation != runtime.generation {
+            if generation != runtime.generation || runtime.scan_generation != Some(generation) {
                 return;
             }
-            let matches_inflight = matches!(
-                runtime.in_flight,
-                Some(InFlight::Scan { generation: g }) if g == generation
-            );
-            if !matches_inflight {
-                return;
-            }
-            runtime.in_flight = None;
+            runtime.scan_generation = None;
             clear_scan_state(runtime);
             reduce(app, Action::ShowError(format!("Scan failed: {error}")));
+        }
+        IoMessage::LocalListDone {
+            generation,
+            path,
+            entries,
+            select,
+            ok_status,
+        } => {
+            if generation != runtime.local_list_gen {
+                return;
+            }
+            runtime.local_list_pending = false;
+            if path != app.local_cwd {
+                return;
+            }
+            reduce(app, Action::SetLocalEntries { entries, select });
+            if let Some(status) = ok_status {
+                reduce(app, Action::SetStatus(status));
+            }
         }
     }
 }
 
-pub(crate) async fn disconnect_session(app: &mut AppState, runtime: &mut Runtime) {
+pub(crate) fn disconnect_session(app: &mut AppState, runtime: &mut Runtime) {
     if runtime.edit_session.is_some() {
         cancel_edit(app, runtime, true);
     }
@@ -744,42 +862,25 @@ pub(crate) async fn disconnect_session(app: &mut AppState, runtime: &mut Runtime
         let _ = reply.send(false);
     }
     runtime.in_flight = None;
-    bump_generation_drop_workers(app, runtime).await;
+    bump_generation_drop_workers(app, runtime);
     reduce(app, Action::CancelPrompt);
-    let _ = take_parked(&runtime.park);
+    let parked = take_parked(&runtime.park);
     let handle = runtime.handle.take();
-    let disconnect_ok = match handle {
-        Some(SessionHandle::Ftp(mut ftp)) => {
-            let _ = ftp.disconnect().await;
-            Ok(())
-        }
-        Some(SessionHandle::Sftp(mut sftp)) => sftp.disconnect().await,
-        None => Ok(()),
-    };
-    match disconnect_ok {
-        Ok(_) => {
-            reduce(app, Action::Disconnect);
-            reduce(
-                app,
-                Action::SetRemoteEntries {
-                    entries: vec![],
-                    select: SelectPolicy::Reset,
-                },
-            );
-            app.active_connection = None;
-            reduce(app, Action::SetStatus("Disconnected".to_string()));
-        }
-        Err(err) => {
-            reduce(app, Action::SetStatus(format!("Disconnect failed: {err}")));
-        }
-    }
+    spawn_disconnect(handle);
+    spawn_disconnect(parked);
+    reduce(app, Action::Disconnect);
+    reduce(
+        app,
+        Action::SetRemoteEntries {
+            entries: vec![],
+            select: SelectPolicy::Reset,
+        },
+    );
+    app.active_connection = None;
+    reduce(app, Action::SetStatus("Disconnected".to_string()));
 }
 
-pub(crate) async fn connect_off_thread(
-    app: &mut AppState,
-    runtime: &mut Runtime,
-    info: ConnectionInfo,
-) {
+pub(crate) fn connect_off_thread(app: &mut AppState, runtime: &mut Runtime, info: ConnectionInfo) {
     if io_busy(runtime) {
         return;
     }
@@ -813,13 +914,13 @@ pub(crate) async fn connect_off_thread(
     }
 
     if app.connected || runtime.handle.is_some() {
-        disconnect_session(app, runtime).await;
+        disconnect_session(app, runtime);
     }
     let leftover_workers = runtime.worker_active_count > 0
         || !app.queue.active.is_empty()
         || !runtime.worker_handles.is_empty();
     if leftover_workers {
-        bump_generation_drop_workers(app, runtime).await;
+        bump_generation_drop_workers(app, runtime);
     } else {
         bump_generation(runtime);
     }
@@ -982,7 +1083,7 @@ pub(crate) fn start_remote_edit(app: &mut AppState, runtime: &mut Runtime) {
         return;
     }
     if io_busy(runtime) || drain_busy(runtime) {
-        reduce(app, Action::SetStatus("busy".to_string()));
+        reduce(app, Action::SetStatus(busy_status(runtime)));
         return;
     }
     let marked = app.marked_live_count(FocusPane::Remote);
@@ -1243,11 +1344,8 @@ pub(crate) fn enqueue_entries(
     direction: TransferDirection,
     delete_source: bool,
 ) {
-    if drain_busy(runtime) {
-        return;
-    }
-    if io_busy(runtime) {
-        reduce(app, Action::SetStatus("busy".to_string()));
+    if drain_busy(runtime) || io_busy(runtime) {
+        reduce(app, Action::SetStatus(busy_status(runtime)));
         return;
     }
     let entries: Vec<FileEntry> = entries
@@ -1486,11 +1584,14 @@ pub(crate) fn park_pending_scan(app: &mut AppState, runtime: &mut Runtime) {
         enqueue_pending_file(app, file);
     }
     runtime.mkdir_queue.clear();
-    runtime.overwrite_policy = OverwritePolicy::Ask;
+    reset_overwrite_policy(runtime);
 }
 
 pub(crate) fn maybe_resume_drain(app: &mut AppState, runtime: &mut Runtime) {
     if app.worker_cancel_requested {
+        return;
+    }
+    if runtime.scan_generation.is_some() {
         return;
     }
     if !runtime.pending_scan.is_empty() {
@@ -1520,7 +1621,7 @@ pub(crate) fn drain_scan_next(app: &mut AppState, runtime: &mut Runtime) {
 
     loop {
         let Some(file) = runtime.pending_scan.front().cloned() else {
-            runtime.overwrite_policy = OverwritePolicy::Ask;
+            reset_overwrite_policy(runtime);
             runtime.mkdir_queue.clear();
             return;
         };
@@ -1952,7 +2053,7 @@ pub(crate) fn start_scan_entries(
     direction: TransferDirection,
     delete_source: bool,
 ) {
-    if io_busy(runtime) {
+    if io_busy(runtime) || runtime.scan_generation.is_some() {
         return;
     }
     let entries: Vec<FileEntry> = entries
@@ -1964,7 +2065,7 @@ pub(crate) fn start_scan_entries(
     }
     let gen = runtime.generation;
     runtime.scan_delete_source = delete_source;
-    runtime.in_flight = Some(InFlight::Scan { generation: gen });
+    runtime.scan_generation = Some(gen);
     let label = if entries.len() == 1 {
         entries[0].name.clone()
     } else {
@@ -1982,7 +2083,7 @@ pub(crate) fn start_scan_entries(
                 match safe_remote_child(&app.remote_cwd, &entry.name) {
                     Ok(remote_root) => roots.push((PathBuf::from(&entry.path), remote_root)),
                     Err(_) => {
-                        runtime.in_flight = None;
+                        runtime.scan_generation = None;
                         reduce(app, Action::ShowError("path escapes directory".to_string()));
                         drain_scan_next(app, runtime);
                         return;
@@ -2014,7 +2115,7 @@ pub(crate) fn start_scan_entries(
         }
         TransferDirection::Download => {
             let Some(info) = app.active_connection.clone() else {
-                runtime.in_flight = None;
+                runtime.scan_generation = None;
                 reduce(app, Action::SetStatus("Not connected".to_string()));
                 drain_scan_next(app, runtime);
                 return;
@@ -2024,7 +2125,7 @@ pub(crate) fn start_scan_entries(
                 let remote_root = match safe_remote_child(&app.remote_cwd, &entry.name) {
                     Ok(p) => p,
                     Err(_) => {
-                        runtime.in_flight = None;
+                        runtime.scan_generation = None;
                         reduce(app, Action::ShowError("path escapes directory".to_string()));
                         drain_scan_next(app, runtime);
                         return;
@@ -2033,7 +2134,7 @@ pub(crate) fn start_scan_entries(
                 let local_root = match safe_local_child(Path::new(&app.local_cwd), &entry.name) {
                     Ok(p) => p,
                     Err(_) => {
-                        runtime.in_flight = None;
+                        runtime.scan_generation = None;
                         reduce(app, Action::ShowError("path escapes directory".to_string()));
                         drain_scan_next(app, runtime);
                         return;
@@ -2216,7 +2317,8 @@ mod scan_tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use dd_ftp_app::{
-        reduce, Action, AppState, OverwritePolicy, PendingFile, PromptKind, TextPromptKind,
+        reduce, Action, AppState, OverwritePolicy, PendingFile, PromptKind, SelectPolicy,
+        TextPromptKind,
     };
     use dd_ftp_core::TransferDirection;
 
@@ -2297,6 +2399,19 @@ mod scan_tests {
             "ScanItem must not enqueue; queue.pending={}",
             app.queue.pending.len()
         );
+    }
+
+    #[test]
+    fn clear_scan_state_restores_default_overwrite_policy() {
+        let (mut runtime, _rx) = test_runtime();
+        runtime.default_overwrite_policy = OverwritePolicy::SkipAll;
+        runtime.overwrite_policy = OverwritePolicy::OverwriteAll;
+        runtime
+            .pending_scan
+            .push_back(pending_upload("/tmp/a", "/pub/a"));
+        clear_scan_state(&mut runtime);
+        assert!(runtime.pending_scan.is_empty());
+        assert_eq!(runtime.overwrite_policy, OverwritePolicy::SkipAll);
     }
 
     #[test]
@@ -2461,12 +2576,13 @@ mod scan_tests {
             }
             _ => panic!("expected ScanItem"),
         }
-        let inflight = InFlight::Scan { generation: 7 };
-        assert!(matches!(inflight, InFlight::Scan { generation: 7 }));
         let (mut runtime, _rx) = test_runtime();
+        runtime.scan_generation = Some(7);
         runtime.pending_scan.push_back(file);
         assert!(!runtime.pending_scan.is_empty());
         assert!(drain_busy(&runtime));
+        assert!(!io_busy(&runtime));
+        assert!(runtime.is_working());
     }
 
     #[test]
@@ -2684,7 +2800,7 @@ mod scan_tests {
             runtime.pending_scan.is_empty(),
             "must not push files when dirs cannot scan"
         );
-        assert_eq!(app.status, "busy");
+        assert_eq!(app.status, "busy: setting permissions");
         assert!(matches!(
             runtime.in_flight,
             Some(InFlight::Fs {
@@ -2692,5 +2808,188 @@ mod scan_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sync_worker_view_and_busy_are_nops_when_unchanged() {
+        let mut app = AppState::default();
+        let (mut runtime, _rx) = test_runtime();
+        assert!(!runtime.sync_worker_view(&mut app));
+        assert!(!runtime.sync_busy(&mut app));
+        runtime.worker_active_count = 1;
+        assert!(runtime.sync_worker_view(&mut app));
+        assert!(app.worker_running);
+        assert!(runtime.sync_busy(&mut app));
+        assert!(app.busy);
+        assert!(!runtime.sync_worker_view(&mut app));
+        assert!(!runtime.sync_busy(&mut app));
+    }
+
+    #[test]
+    fn io_busy_excludes_folder_scan() {
+        let (mut runtime, _rx) = test_runtime();
+        runtime.scan_generation = Some(1);
+        assert!(!io_busy(&runtime));
+        assert!(drain_busy(&runtime));
+        assert!(runtime.is_working());
+        runtime.scan_generation = None;
+        runtime.in_flight = Some(InFlight::List {
+            generation: 1,
+            path: "/pub".into(),
+        });
+        assert!(io_busy(&runtime));
+        assert!(!drain_busy(&runtime));
+    }
+
+    #[test]
+    fn list_done_applies_while_scan_pending() {
+        use dd_ftp_core::{EntryKind, FileEntry};
+        let mut app = AppState {
+            connected: true,
+            remote_cwd: "/pub".into(),
+            ..Default::default()
+        };
+        let (mut runtime, _rx) = test_runtime();
+        runtime.in_flight = Some(InFlight::List {
+            generation: 1,
+            path: "/pub".into(),
+        });
+        runtime.scan_generation = Some(1);
+        runtime
+            .pending_scan
+            .push_back(pending_upload("/tmp/a.txt", "/pub/a.txt"));
+        handle_io_message(
+            &mut app,
+            &mut runtime,
+            IoMessage::ListDone {
+                generation: 1,
+                path: "/pub".into(),
+                result: Ok(vec![FileEntry {
+                    name: "shown.txt".into(),
+                    path: "/pub/shown.txt".into(),
+                    kind: EntryKind::File,
+                    size: 1,
+                    modified: None,
+                    permissions: None,
+                }]),
+            },
+        );
+        assert_eq!(app.remote_entries.len(), 1);
+        assert_eq!(app.remote_entries[0].name, "shown.txt");
+        assert!(runtime.scan_generation.is_some());
+        assert_eq!(runtime.pending_scan.len(), 1);
+        assert!(runtime.in_flight.is_none());
+    }
+
+    #[test]
+    fn local_list_done_ignores_stale_generation() {
+        use dd_ftp_core::{EntryKind, FileEntry};
+        let mut app = AppState {
+            local_cwd: "/tmp".into(),
+            ..Default::default()
+        };
+        let (mut runtime, _rx) = test_runtime();
+        runtime.local_list_gen = 3;
+        runtime.local_list_pending = true;
+        handle_io_message(
+            &mut app,
+            &mut runtime,
+            IoMessage::LocalListDone {
+                generation: 2,
+                path: "/tmp".into(),
+                entries: vec![FileEntry {
+                    name: "stale.txt".into(),
+                    path: "/tmp/stale.txt".into(),
+                    kind: EntryKind::File,
+                    size: 1,
+                    modified: None,
+                    permissions: None,
+                }],
+                select: SelectPolicy::Reset,
+                ok_status: Some("stale".into()),
+            },
+        );
+        assert!(app.local_entries.is_empty());
+        assert!(runtime.local_list_pending);
+        assert_ne!(app.status, "stale");
+
+        handle_io_message(
+            &mut app,
+            &mut runtime,
+            IoMessage::LocalListDone {
+                generation: 3,
+                path: "/tmp".into(),
+                entries: vec![FileEntry {
+                    name: "fresh.txt".into(),
+                    path: "/tmp/fresh.txt".into(),
+                    kind: EntryKind::File,
+                    size: 1,
+                    modified: None,
+                    permissions: None,
+                }],
+                select: SelectPolicy::Reset,
+                ok_status: Some("Local cwd: /tmp".into()),
+            },
+        );
+        assert!(!runtime.local_list_pending);
+        assert_eq!(app.local_entries.len(), 1);
+        assert_eq!(app.local_entries[0].name, "fresh.txt");
+        assert_eq!(app.status, "Local cwd: /tmp");
+    }
+
+    #[test]
+    fn enqueue_refuses_when_scanning() {
+        use dd_ftp_core::{EntryKind, FileEntry};
+        let mut app = AppState {
+            connected: true,
+            local_cwd: "/tmp".into(),
+            remote_cwd: "/pub".into(),
+            ..Default::default()
+        };
+        let (mut runtime, _rx) = test_runtime();
+        runtime.scan_generation = Some(1);
+        let file = FileEntry {
+            name: "a.txt".into(),
+            path: "/tmp/a.txt".into(),
+            kind: EntryKind::File,
+            size: 1,
+            modified: None,
+            permissions: None,
+        };
+        enqueue_entries(
+            &mut app,
+            &mut runtime,
+            vec![file],
+            TransferDirection::Upload,
+            false,
+        );
+        assert!(runtime.pending_scan.is_empty());
+        assert_eq!(app.status, "busy: scanning folder");
+    }
+
+    #[test]
+    fn bump_generation_drop_workers_with_no_handles_is_sync() {
+        let mut app = AppState::default();
+        let (mut runtime, _rx) = test_runtime();
+        bump_generation_drop_workers(&mut app, &mut runtime);
+        assert_eq!(runtime.generation, 2);
+        assert!(runtime.worker_handles.is_empty());
+        assert!(runtime.scan_generation.is_none());
+    }
+
+    #[test]
+    fn maybe_resume_drain_waits_while_scanning() {
+        let mut app = AppState {
+            connected: true,
+            ..Default::default()
+        };
+        let (mut runtime, _rx) = test_runtime();
+        runtime.scan_generation = Some(1);
+        runtime
+            .pending_scan
+            .push_back(pending_upload("/tmp/a.txt", "/pub/a.txt"));
+        maybe_resume_drain(&mut app, &mut runtime);
+        assert_eq!(runtime.pending_scan.len(), 1);
+        assert!(app.queue.pending.is_empty());
     }
 }

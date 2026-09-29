@@ -247,7 +247,7 @@
         <p>Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) and installs <code>dd_ftp</code> to <code>~/.local/bin</code>. If no package exists for your machine, the script builds from source. Pipe to <code>bash</code>, not <code>sh</code>.</p>
         <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash</code></pre>
         <p>Pin a release:</p>
-        <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --version v1.6.1</code></pre>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --version v1.7.0</code></pre>
         <div class="callout">
           <p>The installer warns if the target directory is not on <code>PATH</code>. Add <code>~/.local/bin</code> if <code>dd_ftp</code> is not found after install.</p>
         </div>
@@ -266,7 +266,7 @@ BIN_NAME=dd_ftp_cli ./install.sh</code></pre>
         <h2>First run</h2>
         <p>Launch from a terminal:</p>
         <pre><code>dd_ftp</code></pre>
-        <p>The local pane opens on the current directory. <kbd>Ctrl+q</kbd> quits (confirms if transfers are active). <kbd>Esc</kbd> never quits — it closes a modal, then compare, then clears marks.</p>
+        <p>The local pane opens on the current directory. Click a path-bar segment to jump to that prefix; double-click the current segment to go to the parent. <kbd>Ctrl+q</kbd> quits (confirms if transfers are active). <kbd>Esc</kbd> never quits — it closes a modal, then compare, then clears marks.</p>
         <figure>
           <img src="images/02-help.png" alt="Help overlay listing keyboard and mouse bindings, grouped by Global, Navigation, Connection, Transfers, and more.">
           <figcaption>Press <kbd>F1</kbd> any time for in-app help. Opening help closes the theme editor; opening the theme editor closes help.</figcaption>
@@ -341,7 +341,7 @@ export DD_FTP_PATH=/</code></pre>
           <figcaption>Create works on both panes. Remote create/rename/delete refresh the listing on success.</figcaption>
         </figure>
         <ul>
-          <li><kbd>Space</kbd> toggles a mark on the focused row (not <code>.</code> / <code>..</code>). Pane titles show a mark count.</li>
+          <li><kbd>Space</kbd> toggles a mark on the focused row (not <code>.</code> / <code>..</code>). <kbd>Ctrl+a</kbd> marks every visible row. Pane titles show a mark count.</li>
           <li><kbd>Shift+j/k</kbd> extend the mark range while moving. Shift+click does the same with the mouse.</li>
           <li><kbd>E</kbd> edits a remote file in <code>$VISUAL</code> / <code>$EDITOR</code> (or the Settings editor) and uploads on change.</li>
           <li><kbd>p</kbd> is SFTP chmod on the remote pane.</li>
@@ -351,7 +351,7 @@ export DD_FTP_PATH=/</code></pre>
 
       <section id="filter">
         <h2>Filter and compare</h2>
-        <p><kbd>/</kbd> opens a filter on the focused file pane. Type a substring; Esc closes and clears.</p>
+        <p><kbd>/</kbd> opens a filter on the focused file pane. Type a substring. Esc closes and clears the pattern; Enter closes and keeps it. <kbd>Ctrl+a</kbd> marks every visible match.</p>
         <figure>
           <img src="images/07-filter.png" alt="Filter bar showing the pattern index with a visible/total count, lists narrowed to matching names.">
           <figcaption>Selection indexes the visible (filtered) list, so actions apply to what you see.</figcaption>
@@ -385,10 +385,10 @@ export DD_FTP_PATH=/</code></pre>
           <img src="images/09-theme.png" alt="Live theme editor listing color tokens with RGB sliders and a hex field.">
           <figcaption>Canonical tokens live in <code>THEME_STRUCTURE_STANDARD.md</code>. Do not hardcode colors past the theme load.</figcaption>
         </figure>
-        <p><kbd>F3</kbd> is Settings. Today it has one field: <strong>Editor</strong>, saved to <code>~/.config/ldnddev/dd_ftp.toml</code> (not the theme file).</p>
+        <p><kbd>F3</kbd> is Settings. Fields: <strong>Editor</strong>, <strong>Workers</strong> (1–8), <strong>Hide dotfiles</strong>, <strong>Overwrite</strong> (ask / skip all / overwrite all), <strong>Auto-connect</strong> the default bookmark at launch, and <strong>Last local path</strong>. Saved to <code>~/.config/ldnddev/dd_ftp.toml</code> (not the theme file). <kbd>Tab</kbd> cycles fields; Left/Right/Space change a non-text value. Enter saves, Esc cancels.</p>
         <figure>
-          <img src="images/10-settings.png" alt="Settings panel with an Editor field set to hx and a note that environment variables override the saved editor.">
-          <figcaption>When you press <kbd>E</kbd>, the editor is <code>$VISUAL</code>, then <code>$EDITOR</code>, then this saved value, then <code>vi</code>. Leave the field empty to use the environment / vi. Enter saves, Esc cancels.</figcaption>
+          <img src="images/10-settings.png" alt="Settings panel with Editor, Workers, Hide dotfiles, Overwrite, Auto-connect, and Last local path fields.">
+          <figcaption>When you press <kbd>E</kbd>, the editor is <code>$VISUAL</code>, then <code>$EDITOR</code>, then this saved value, then <code>vi</code>. Leave the field empty to use the environment / vi. Last local path is restored at launch when it is still a directory.</figcaption>
         </figure>
       </section>
 
@@ -403,7 +403,9 @@ export DD_FTP_PATH=/</code></pre>
             <tr><td><kbd>F1</kbd></td><td>Toggle help (opening closes theme debug)</td></tr>
             <tr><td><kbd>Esc</kbd></td><td>Close current modal; when compare is on and no modal is open, close compare; otherwise clear marks</td></tr>
             <tr><td><kbd>F2</kbd></td><td>Toggle live theme editor (opening closes help)</td></tr>
-            <tr><td><kbd>F3</kbd></td><td>Toggle settings (editor command; saved to ~/.config/ldnddev/dd_ftp.toml)</td></tr>
+            <tr><td><kbd>F3</kbd></td><td>Toggle settings (editor, workers, hide-dotfiles, overwrite, auto-connect, last path; saved to ~/.config/ldnddev/dd_ftp.toml)</td></tr>
+            <tr><td><kbd>Tab (settings)</kbd></td><td>Cycle settings fields</td></tr>
+            <tr><td><kbd>Left/Right/Space (settings)</kbd></td><td>Change the highlighted non-text setting</td></tr>
             <tr><td><kbd>Ctrl+q</kbd></td><td>Quit (confirms if transfers are active)</td></tr>
             <tr><td><kbd>Ctrl+C</kbd></td><td>Cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)</td></tr>
             <tr><td><kbd>C</kbd></td><td>Toggle directory compare</td></tr>
@@ -419,6 +421,8 @@ export DD_FTP_PATH=/</code></pre>
             <tr><td><kbd>3</kbd></td><td>Queue pane</td></tr>
             <tr><td><kbd>Tab</kbd></td><td>Cycle focus</td></tr>
             <tr><td><kbd>j/k</kbd></td><td>Move selection</td></tr>
+            <tr><td><kbd>PgUp/PgDn</kbd></td><td>Move selection by a page (lists, help, queue, bookmarks, key picker)</td></tr>
+            <tr><td><kbd>Home/End</kbd></td><td>Jump to first or last row (lists, help, queue, bookmarks, key picker)</td></tr>
             <tr><td><kbd>l</kbd></td><td>Enter directory</td></tr>
             <tr><td><kbd>h</kbd></td><td>Parent directory</td></tr>
             <tr><td><kbd>r</kbd></td><td>Refresh</td></tr>
@@ -450,7 +454,9 @@ export DD_FTP_PATH=/</code></pre>
           <tbody>
             <tr><td><kbd>u</kbd></td><td>Queue upload (directories recurse; marked set or focused row)</td></tr>
             <tr><td><kbd>d</kbd></td><td>Queue download (directories recurse; marked set or focused row)</td></tr>
-            <tr><td><kbd>R</kbd></td><td>Retry last failed</td></tr>
+            <tr><td><kbd>R</kbd></td><td>Retry last failed (queue pane: retry the highlighted failed job)</td></tr>
+            <tr><td><kbd>A (queue)</kbd></td><td>Retry all failed jobs</td></tr>
+            <tr><td><kbd>x (queue)</kbd></td><td>Cancel or remove the highlighted job (pending, active, or failed)</td></tr>
             <tr><td><kbd>X</kbd></td><td>Clear pending queue</td></tr>
             <tr><td><kbd>Ctrl+C</kbd></td><td>Cancel in-flight transfers</td></tr>
             <tr><td><kbd>Enter</kbd></td><td>On a file, queue upload/download of the marked set (or focused row)</td></tr>
@@ -462,7 +468,8 @@ export DD_FTP_PATH=/</code></pre>
         <table>
           <thead><tr><th>Keys</th><th>Action</th></tr></thead>
           <tbody>
-            <tr><td><kbd>/</kbd></td><td>Toggle filter (Esc closes and clears the pattern)</td></tr>
+            <tr><td><kbd>/</kbd></td><td>Toggle filter (Esc closes and clears the pattern; Enter closes and keeps it)</td></tr>
+            <tr><td><kbd>Enter (filter)</kbd></td><td>Close the filter bar and keep the pattern</td></tr>
             <tr><td><kbd>C</kbd></td><td>Toggle directory compare</td></tr>
             <tr><td><kbd>Esc</kbd></td><td>Close compare when no modal is open</td></tr>
           </tbody>
@@ -480,6 +487,7 @@ export DD_FTP_PATH=/</code></pre>
             <tr><td><kbd>Delete</kbd></td><td>Delete marked set or focused row with confirm</td></tr>
             <tr><td><kbd>Ctrl+Delete</kbd></td><td>Delete with confirm (alias)</td></tr>
             <tr><td><kbd>Space</kbd></td><td>Toggle multi-select mark on the visible focused row (not . / ..)</td></tr>
+            <tr><td><kbd>Ctrl+a</kbd></td><td>Mark every visible row in the focused file pane (skips . and ..)</td></tr>
             <tr><td><kbd>Shift+j/k</kbd></td><td>Extend mark range from the anchor while moving</td></tr>
             <tr><td><kbd>M</kbd></td><td>Move marked set or focused row to the other pane (transfer, then delete source on success)</td></tr>
             <tr><td><kbd>p</kbd></td><td>SFTP chmod prompt (remote pane)</td></tr>
@@ -495,6 +503,7 @@ export DD_FTP_PATH=/</code></pre>
           <tbody>
             <tr><td><kbd>Mouse: wheel</kbd></td><td>Scroll list / queue / help (also over the scrollbar rail)</td></tr>
             <tr><td><kbd>Mouse: click row</kbd></td><td>Focus pane, select visible row</td></tr>
+            <tr><td><kbd>Mouse: click path segment</kbd></td><td>cd to that path prefix; double-click the current segment for the parent</td></tr>
             <tr><td><kbd>Shift+click</kbd></td><td>Extend mark range from the previous row to the clicked row</td></tr>
             <tr><td><kbd>Mouse: double-click dir</kbd></td><td>Enter directory</td></tr>
             <tr><td><kbd>Mouse: double-click file</kbd></td><td>Queue transfer (same as Enter)</td></tr>

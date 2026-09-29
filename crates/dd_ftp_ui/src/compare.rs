@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use dd_ftp_core::FileEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,10 +21,36 @@ impl CompareBadge {
     }
 }
 
-fn find_by_name<'a>(entries: &'a [FileEntry], name: &str) -> Option<&'a FileEntry> {
-    entries
-        .iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name) && e.name != "." && e.name != "..")
+/// Lowercased name → entry, skipping `.` / `..`. Later duplicates win.
+pub fn index_by_name(entries: &[FileEntry]) -> HashMap<String, &FileEntry> {
+    let mut map = HashMap::with_capacity(entries.len());
+    for e in entries {
+        if e.name != "." && e.name != ".." {
+            map.insert(e.name.to_ascii_lowercase(), e);
+        }
+    }
+    map
+}
+
+pub fn classify_compare_indexed(
+    name: &str,
+    local: &HashMap<String, &FileEntry>,
+    remote: &HashMap<String, &FileEntry>,
+) -> Option<CompareBadge> {
+    if name == "." || name == ".." {
+        return None;
+    }
+    let key = name.to_ascii_lowercase();
+    match (local.get(&key), remote.get(&key)) {
+        (Some(a), Some(b)) => Some(if same_meta(a, b) {
+            CompareBadge::Equal
+        } else {
+            CompareBadge::Differ
+        }),
+        (Some(_), None) => Some(CompareBadge::LocalOnly),
+        (None, Some(_)) => Some(CompareBadge::RemoteOnly),
+        (None, None) => None,
+    }
 }
 
 fn same_meta(a: &FileEntry, b: &FileEntry) -> bool {
@@ -46,18 +74,7 @@ pub fn classify_compare(
     if name == "." || name == ".." {
         return None;
     }
-    let l = find_by_name(local, name);
-    let r = find_by_name(remote, name);
-    match (l, r) {
-        (Some(a), Some(b)) => Some(if same_meta(a, b) {
-            CompareBadge::Equal
-        } else {
-            CompareBadge::Differ
-        }),
-        (Some(_), None) => Some(CompareBadge::LocalOnly),
-        (None, Some(_)) => Some(CompareBadge::RemoteOnly),
-        (None, None) => None,
-    }
+    classify_compare_indexed(name, &index_by_name(local), &index_by_name(remote))
 }
 
 #[cfg(test)]
@@ -158,5 +175,31 @@ mod tests {
         let remote = vec![fe(".", 0, None)];
         assert_eq!(classify_compare(".", &local, &remote), None);
         assert_eq!(classify_compare("..", &local, &remote), None);
+    }
+
+    #[test]
+    fn index_by_name_skips_dots_and_matches_classify() {
+        let local = vec![
+            fe(".", 0, None),
+            fe("a.txt", 10, Some(100)),
+            fe("OnlyL", 1, None),
+        ];
+        let remote = vec![
+            fe("..", 0, None),
+            fe("A.TXT", 10, Some(100)),
+            fe("only-r", 1, None),
+        ];
+        let lmap = index_by_name(&local);
+        let rmap = index_by_name(&remote);
+        assert!(!lmap.contains_key("."));
+        assert!(!rmap.contains_key(".."));
+        assert_eq!(
+            classify_compare_indexed("a.txt", &lmap, &rmap),
+            classify_compare("a.txt", &local, &remote)
+        );
+        assert_eq!(
+            classify_compare_indexed("OnlyL", &lmap, &rmap),
+            Some(CompareBadge::LocalOnly)
+        );
     }
 }

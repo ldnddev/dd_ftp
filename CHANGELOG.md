@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.0] - 2026-09-28
+
+### Added
+- PageUp / PageDown / Home / End jump by page or to the first/last row in file lists, help, the queue, bookmarks, and the SSH key picker
+- F3 settings persist worker count, last local path, hide-dotfiles, overwrite default, and auto-connect of the default bookmark to `~/.config/ldnddev/dd_ftp.toml`
+- Queue pane selection: click a row, `A` retries all failed jobs, `x` / Delete cancels or removes the highlighted job
+- Ctrl+a marks every visible row in the focused file pane; filter Enter keeps the pattern when closing the bar
+- Click a Local/Remote path-bar segment to cd there; double-click the current segment to go to the parent
+
+### Changed
+- Transfer workers reuse a connected SFTP/FTP session across jobs and reconnect only when a reused session fails
+- The UI waits on terminal events, transfer progress, and IO together, so bars and listings update without a 150ms poll
+- Disconnect and quit cancel workers in the background instead of waiting up to two seconds on the key path
+- Local directory listings run off the UI thread; browse and refresh stay available while a folder scan fills the queue
+- Transfer progress is sent at most every 100ms (the last chunk is always sent)
+- Status names the busy reason (`busy: scanning folder`, `busy: listing remote`, …) instead of a bare `busy`
+- File lists keep a cached filter/sort view and rebuild only when the listing, filter, or sort changes
+- The TUI redraws only after a state change, a resize, scrollbar hover, or the 150ms busy pulse; idle mouse motion, key-release, and toast wait ticks skip a frame
+
 ## [1.6.1] - 2026-09-17
 
 ### Fixed

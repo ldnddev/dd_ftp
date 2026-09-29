@@ -28,12 +28,28 @@ pub struct HostKeyOffer {
 }
 
 /// Authenticated SFTP handle. `ssh2::Session` is not Sync; ops serialize on the mutex
-/// and run in `spawn_blocking`. UI reuses `inner`; workers open their own session.
+/// and run in `spawn_blocking`. UI reuses `inner`; workers reuse a pooled session
+/// across jobs and reconnect only on error.
 #[derive(Clone, Default)]
 pub struct SftpSession {
     inner: Option<Arc<Mutex<Session>>>,
     info: Option<ConnectionInfo>,
     reconnect_count: Arc<AtomicUsize>,
+}
+
+impl SftpSession {
+    pub fn connection_info(&self) -> Option<&ConnectionInfo> {
+        self.info.as_ref()
+    }
+
+    /// Disconnected handle tagged with `info`, used by the worker session pool tests.
+    pub fn disconnected_for_tests(info: ConnectionInfo) -> Self {
+        Self {
+            inner: None,
+            info: Some(info),
+            reconnect_count: Default::default(),
+        }
+    }
 }
 
 fn lock_session(inner: &Arc<Mutex<Session>>) -> Result<std::sync::MutexGuard<'_, Session>> {

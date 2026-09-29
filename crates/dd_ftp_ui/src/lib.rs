@@ -7,8 +7,9 @@ pub mod theme;
 pub use compare::{classify_compare, CompareBadge};
 pub use keys::{KeyBinding, KeyGroup, KEYMAP};
 pub use layout::{
-    char_index_at, hit_test, ControlId, ControlRegion, FieldId, FieldRegion, LayoutMap, Pane,
-    Region, ScrollRegion,
+    char_index_at, hit_test, path_seg_action, split_fs_path, split_remote_path, ControlId,
+    ControlRegion, FieldId, FieldRegion, LayoutMap, Pane, PathSeg, PathSegAction, Region,
+    ScrollRegion,
 };
 pub use render::render;
 pub use theme::{

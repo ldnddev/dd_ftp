@@ -1,18 +1,18 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 
 use dd_ftp_app::{reduce, Action, AppState, SelectPolicy};
-use dd_ftp_core::{Protocol, RemoteSession, TransferDirection};
+use dd_ftp_core::{ConnectionInfo, Protocol, RemoteSession, TransferDirection};
 use dd_ftp_ftp::UnifiedFtpSession;
 use dd_ftp_protocols::SftpSession;
 use dd_ftp_storage::SecretStore;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::paths;
-use crate::session::{connection_info_from_env, list_remote, Runtime};
+use crate::session::{connection_info_from_env, list_remote, Runtime, SessionHandle};
 
 #[derive(Debug)]
 pub(crate) struct WorkerResult {
@@ -33,6 +33,7 @@ pub(crate) enum WorkerMessage {
     Done {
         generation: u64,
         result: WorkerResult,
+        session: Option<Box<SessionHandle>>,
     },
 }
 
@@ -48,6 +49,56 @@ pub(crate) fn should_spawn(
 
 pub(crate) fn accept_worker_msg(current: u64, msg_gen: u64) -> bool {
     current == msg_gen
+}
+
+fn protocol_tag(p: &Protocol) -> u8 {
+    match p {
+        Protocol::Sftp => 0,
+        Protocol::Ftp => 1,
+        Protocol::Ftps => 2,
+    }
+}
+
+pub(crate) fn session_identity_eq(a: &ConnectionInfo, b: &ConnectionInfo) -> bool {
+    protocol_tag(&a.protocol) == protocol_tag(&b.protocol)
+        && a.host == b.host
+        && a.port == b.port
+        && a.username == b.username
+        && a.private_key == b.private_key
+}
+
+fn handle_matches_info(handle: &SessionHandle, info: &ConnectionInfo) -> bool {
+    let current = match handle {
+        SessionHandle::Sftp(s) => s.connection_info(),
+        SessionHandle::Ftp(f) => f.connection_info(),
+    };
+    current.is_some_and(|c| session_identity_eq(c, info))
+}
+
+pub(crate) fn take_pooled_session(
+    runtime: &mut Runtime,
+    info: &ConnectionInfo,
+) -> Option<SessionHandle> {
+    let idx = runtime
+        .worker_sessions
+        .iter()
+        .position(|h| handle_matches_info(h, info))?;
+    Some(runtime.worker_sessions.swap_remove(idx))
+}
+
+pub(crate) fn return_pooled_session(
+    runtime: &mut Runtime,
+    session: SessionHandle,
+    info: &ConnectionInfo,
+    max: usize,
+) {
+    if runtime.worker_sessions.len() >= max.max(1) {
+        return;
+    }
+    if !handle_matches_info(&session, info) {
+        return;
+    }
+    runtime.worker_sessions.push(session);
 }
 
 pub(crate) fn spawn_pending_workers(
@@ -91,81 +142,20 @@ pub(crate) fn spawn_pending_workers(
         let tx_clone = tx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         runtime.cancel_flags.push(cancel.clone());
+        runtime.job_cancels.insert(job.id, cancel.clone());
         let generation = runtime.generation;
+        let pooled = take_pooled_session(runtime, &info);
 
         let handle = tokio::spawn(async move {
-            let mut worker_session = SftpSession::default();
-            let protocol = info.protocol.clone();
-
-            let outcome = match protocol {
-                Protocol::Sftp => {
-                    let connect_result = worker_session.connect(info.clone()).await;
-                    match connect_result {
-                        Ok(_) => {
-                            let progress_tx = {
-                                let tx_progress = tx_clone.clone();
-                                move |job_id: Uuid, transferred, size| {
-                                    let _ = tx_progress.send(WorkerMessage::Progress {
-                                        generation,
-                                        job_id,
-                                        transferred_bytes: transferred,
-                                        size_bytes: size,
-                                    });
-                                }
-                            };
-
-                            match job.direction {
-                                TransferDirection::Upload => {
-                                    worker_session
-                                        .upload_with_progress(&job, cancel.clone(), progress_tx)
-                                        .await
-                                }
-                                TransferDirection::Download => {
-                                    worker_session
-                                        .download_with_progress(&job, cancel.clone(), progress_tx)
-                                        .await
-                                }
-                            }
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-                Protocol::Ftp | Protocol::Ftps => {
-                    let mut unified = UnifiedFtpSession::new();
-
-                    match unified.connect(info.clone()).await {
-                        Ok(_) => {
-                            let progress_tx = {
-                                let tx_progress = tx_clone.clone();
-                                move |job_id: Uuid, transferred, size| {
-                                    let _ = tx_progress.send(WorkerMessage::Progress {
-                                        generation,
-                                        job_id,
-                                        transferred_bytes: transferred,
-                                        size_bytes: size,
-                                    });
-                                }
-                            };
-                            let result = match job.direction {
-                                TransferDirection::Upload => {
-                                    unified
-                                        .upload_with_progress(&job, cancel.clone(), progress_tx)
-                                        .await
-                                }
-                                TransferDirection::Download => {
-                                    unified
-                                        .download_with_progress(&job, cancel.clone(), progress_tx)
-                                        .await
-                                }
-                            };
-                            unified.disconnect().await.ok();
-                            result
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-            };
-
+            let (outcome, session) = run_pooled_job(
+                pooled,
+                info,
+                &job,
+                cancel.clone(),
+                tx_clone.clone(),
+                generation,
+            )
+            .await;
             let _ = tx_clone.send(WorkerMessage::Done {
                 generation,
                 result: WorkerResult {
@@ -174,9 +164,138 @@ pub(crate) fn spawn_pending_workers(
                     was_cancelled: cancel.load(Ordering::Relaxed),
                     cancel_flag: cancel,
                 },
+                session: session.map(Box::new),
             });
         });
         runtime.worker_handles.push(handle);
+    }
+}
+
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+fn should_emit_progress(last: Option<Instant>, now: Instant, complete: bool) -> bool {
+    if complete {
+        return true;
+    }
+    match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= PROGRESS_MIN_INTERVAL,
+    }
+}
+
+fn progress_cb(
+    tx: mpsc::UnboundedSender<WorkerMessage>,
+    generation: u64,
+) -> impl Fn(Uuid, u64, Option<u64>) + Send + Sync + 'static {
+    let last = Mutex::new(None::<Instant>);
+    move |job_id: Uuid, transferred, size| {
+        let complete = size.is_some_and(|s| transferred >= s);
+        let now = Instant::now();
+        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+        if !should_emit_progress(*last, now, complete) {
+            return;
+        }
+        *last = Some(now);
+        let _ = tx.send(WorkerMessage::Progress {
+            generation,
+            job_id,
+            transferred_bytes: transferred,
+            size_bytes: size,
+        });
+    }
+}
+
+async fn connect_worker_session(info: ConnectionInfo) -> anyhow::Result<SessionHandle> {
+    match info.protocol {
+        Protocol::Sftp => {
+            let mut session = SftpSession::default();
+            session.connect(info).await?;
+            Ok(SessionHandle::Sftp(session))
+        }
+        Protocol::Ftp | Protocol::Ftps => {
+            let mut session = UnifiedFtpSession::new();
+            session.connect(info).await?;
+            Ok(SessionHandle::Ftp(session))
+        }
+    }
+}
+
+async fn disconnect_worker_session(session: &mut SessionHandle) {
+    match session {
+        SessionHandle::Sftp(s) => {
+            let _ = s.disconnect().await;
+        }
+        SessionHandle::Ftp(f) => {
+            let _ = f.disconnect().await;
+        }
+    }
+}
+
+async fn transfer_with_handle(
+    session: &mut SessionHandle,
+    job: &dd_ftp_core::TransferJob,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::UnboundedSender<WorkerMessage>,
+    generation: u64,
+) -> anyhow::Result<()> {
+    let progress = progress_cb(tx, generation);
+    match session {
+        SessionHandle::Sftp(s) => match job.direction {
+            TransferDirection::Upload => {
+                SftpSession::upload_with_progress(s, job, cancel, progress).await
+            }
+            TransferDirection::Download => {
+                SftpSession::download_with_progress(s, job, cancel, progress).await
+            }
+        },
+        SessionHandle::Ftp(f) => match job.direction {
+            TransferDirection::Upload => {
+                UnifiedFtpSession::upload_with_progress(f, job, cancel, progress).await
+            }
+            TransferDirection::Download => {
+                UnifiedFtpSession::download_with_progress(f, job, cancel, progress).await
+            }
+        },
+    }
+}
+
+async fn run_pooled_job(
+    pooled: Option<SessionHandle>,
+    info: ConnectionInfo,
+    job: &dd_ftp_core::TransferJob,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::UnboundedSender<WorkerMessage>,
+    generation: u64,
+) -> (anyhow::Result<()>, Option<SessionHandle>) {
+    let reused = pooled.is_some();
+    let mut session = match pooled {
+        Some(s) => s,
+        None => match connect_worker_session(info.clone()).await {
+            Ok(s) => s,
+            Err(err) => return (Err(err), None),
+        },
+    };
+
+    let mut outcome =
+        transfer_with_handle(&mut session, job, cancel.clone(), tx.clone(), generation).await;
+
+    if outcome.is_err() && reused && !cancel.load(Ordering::Relaxed) {
+        disconnect_worker_session(&mut session).await;
+        match connect_worker_session(info).await {
+            Ok(mut fresh) => {
+                outcome =
+                    transfer_with_handle(&mut fresh, job, cancel.clone(), tx, generation).await;
+                session = fresh;
+            }
+            Err(err) => return (Err(err), None),
+        }
+    }
+
+    if outcome.is_ok() && !cancel.load(Ordering::Relaxed) {
+        (outcome, Some(session))
+    } else {
+        disconnect_worker_session(&mut session).await;
+        (outcome, None)
     }
 }
 
@@ -253,12 +372,11 @@ pub(crate) fn handle_worker_result(
                 }
             }
 
-            reduce(
-                app,
-                Action::SetLocalEntries {
-                    entries: paths::local_list(&app.local_cwd),
-                    select: SelectPolicy::PreserveName,
-                },
+            crate::session::request_local_list(
+                runtime,
+                app.local_cwd.clone(),
+                SelectPolicy::PreserveName,
+                None,
             );
             if !runtime.pending_delete.is_empty() && runtime.in_flight.is_none() {
                 crate::fs_ops::start_next_delete(app, runtime);
@@ -290,6 +408,27 @@ mod worker_gate_tests {
     use crate::session::test_runtime;
     use dd_ftp_app::{reduce, Action, PendingFile};
     use dd_ftp_core::TransferJob;
+
+    #[test]
+    fn progress_emits_first_complete_and_throttles() {
+        let t0 = Instant::now();
+        assert!(should_emit_progress(None, t0, false));
+        assert!(!should_emit_progress(
+            Some(t0),
+            t0 + Duration::from_millis(50),
+            false
+        ));
+        assert!(should_emit_progress(
+            Some(t0),
+            t0 + Duration::from_millis(100),
+            false
+        ));
+        assert!(should_emit_progress(
+            Some(t0),
+            t0 + Duration::from_millis(10),
+            true
+        ));
+    }
 
     #[test]
     fn should_spawn_false_when_cancel_requested() {
@@ -377,6 +516,64 @@ mod worker_gate_tests {
                 app.queue.pending.len(),
             ),
             "parked drain files must not auto-start"
+        );
+    }
+
+    #[test]
+    fn session_identity_ignores_password_and_label() {
+        let a = ConnectionInfo {
+            name: "prod".into(),
+            host: "box".into(),
+            port: 22,
+            protocol: Protocol::Sftp,
+            username: "u".into(),
+            password: Some("secret".into()),
+            private_key: None,
+            initial_path: "/".into(),
+        };
+        let mut b = a.clone();
+        b.name = "other".into();
+        b.password = Some("other".into());
+        b.initial_path = "/var".into();
+        assert!(session_identity_eq(&a, &b));
+        b.host = "other".into();
+        assert!(!session_identity_eq(&a, &b));
+    }
+
+    #[test]
+    fn pool_takes_matching_session_and_caps_returns() {
+        let (mut runtime, _rx) = test_runtime();
+        let info = ConnectionInfo {
+            name: "site".into(),
+            host: "box".into(),
+            port: 22,
+            protocol: Protocol::Sftp,
+            username: "u".into(),
+            password: None,
+            private_key: None,
+            initial_path: "/".into(),
+        };
+        let other = ConnectionInfo {
+            host: "other".into(),
+            ..info.clone()
+        };
+        runtime
+            .worker_sessions
+            .push(SessionHandle::Sftp(SftpSession::disconnected_for_tests(
+                info.clone(),
+            )));
+        assert!(take_pooled_session(&mut runtime, &other).is_none());
+        assert_eq!(runtime.worker_sessions.len(), 1);
+        let taken = take_pooled_session(&mut runtime, &info).expect("matching session");
+        assert!(runtime.worker_sessions.is_empty());
+        return_pooled_session(&mut runtime, taken, &info, 1);
+        assert_eq!(runtime.worker_sessions.len(), 1);
+        let extra = SessionHandle::Sftp(SftpSession::disconnected_for_tests(info.clone()));
+        return_pooled_session(&mut runtime, extra, &info, 1);
+        assert_eq!(
+            runtime.worker_sessions.len(),
+            1,
+            "cap rejects extra session"
         );
     }
 

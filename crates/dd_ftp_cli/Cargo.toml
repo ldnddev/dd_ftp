@@ -8,7 +8,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+futures-core = "0.3"
 dd_ftp_app = { path = "../dd_ftp_app" }
 dd_ftp_core = { path = "../dd_ftp_core" }
 dd_ftp_ftp = { path = "../dd_ftp_ftp" }

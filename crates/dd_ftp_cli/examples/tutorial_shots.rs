@@ -165,7 +165,7 @@ fn main() -> Result<()> {
         &frames_dir,
         &mut shots,
         "10-settings",
-        "F3 settings (editor command)",
+        "F3 settings (editor, workers, hide-dotfiles, overwrite, auto-connect, last path)",
     )?;
     reduce(&mut app, Action::ToggleSettings);
 

@@ -1,6 +1,7 @@
 use crate::{
-    is_dot_or_dotdot, is_public_key_name, Action, AppState, ChoicePromptKind, FocusPane,
-    PromptKind, QuickConnectField, SelectPolicy, TextField, TextPromptKind, Toast,
+    clamp_worker_concurrency, is_dot_or_dotdot, is_public_key_name, Action, AppState,
+    ChoicePromptKind, FocusPane, PromptKind, QuickConnectField, SelectPolicy, SettingsField,
+    TextField, TextPromptKind, Toast, WORKER_MAX_CONCURRENCY_LIMIT,
 };
 use dd_ftp_core::{FileEntry, Protocol};
 
@@ -18,6 +19,17 @@ fn resolve_select(
             .and_then(|name| visible.iter().position(|e| e.name == name))
             .unwrap_or(current.min(last)),
     }
+}
+
+fn preserve_queue_selection(state: &mut AppState, keep: Option<uuid::Uuid>) {
+    if let Some(id) = keep {
+        if let Some(i) = state.visible_queue().iter().position(|j| j.id == id) {
+            state.selected_queue = i;
+            return;
+        }
+    }
+    let last = state.visible_queue().len().saturating_sub(1);
+    state.selected_queue = state.selected_queue.min(last);
 }
 
 fn close_key_picker(state: &mut AppState) {
@@ -334,50 +346,96 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.status = "Loaded bookmark into quick connect".to_string();
         }
         Action::QueueTransfer(job) => {
+            let keep = state.selected_queue_job().map(|j| j.id);
             state.worker_cancel_requested = false;
             state.queue.enqueue(job);
             state.status = format!("Queue: {} pending", state.queue.pending.len());
+            preserve_queue_selection(state, keep);
         }
         Action::StartNextTransfer => {
+            let keep = state.selected_queue_job().map(|j| j.id);
             if let Some(job) = state.queue.start_next() {
                 state.status = format!("Transfer active: {}", job.id);
             } else {
                 state.status = "Queue is empty".to_string();
             }
+            preserve_queue_selection(state, keep);
         }
         Action::MarkTransferCompleted(job) => {
+            let keep = state.selected_queue_job().map(|j| j.id);
             state.queue.mark_completed(job);
             state.status = format!(
                 "Transfer complete. Pending: {} Active: {}",
                 state.queue.pending.len(),
                 state.queue.active.len()
             );
+            preserve_queue_selection(state, keep);
         }
         Action::MarkTransferFailed(job) => {
+            let keep = state.selected_queue_job().map(|j| j.id);
             state.queue.mark_failed(job);
             state.status = format!(
                 "Transfer failed. Pending: {} Active: {}",
                 state.queue.pending.len(),
                 state.queue.active.len()
             );
+            preserve_queue_selection(state, keep);
         }
         Action::MarkTransferCancelled(job) => {
+            let keep = state.selected_queue_job().map(|j| j.id);
             state.queue.mark_cancelled(job);
             state.status = format!(
                 "Transfer cancelled. Pending: {} Active: {}",
                 state.queue.pending.len(),
                 state.queue.active.len()
             );
+            preserve_queue_selection(state, keep);
         }
         Action::RetryLastFailed => {
             state.worker_cancel_requested = false;
-            if state.queue.retry_last_failed().is_some() {
+            if let Some(job) = state.queue.retry_last_failed() {
+                let id = job.id;
                 state.status = format!(
                     "Requeued last failed transfer. Pending: {}",
                     state.queue.pending.len()
                 );
+                preserve_queue_selection(state, Some(id));
             } else {
                 state.status = "No failed transfer to retry".to_string();
+            }
+        }
+        Action::RetryFailed(id) => {
+            state.worker_cancel_requested = false;
+            if state.queue.retry_failed(id).is_some() {
+                state.status = format!(
+                    "Requeued failed transfer. Pending: {}",
+                    state.queue.pending.len()
+                );
+                preserve_queue_selection(state, Some(id));
+            } else {
+                state.status = "No failed transfer to retry".to_string();
+            }
+        }
+        Action::RetryAllFailed => {
+            state.worker_cancel_requested = false;
+            let n = state.queue.retry_all_failed();
+            if n == 0 {
+                state.status = "No failed transfer to retry".to_string();
+            } else {
+                state.status = format!(
+                    "Requeued {n} failed transfer(s). Pending: {}",
+                    state.queue.pending.len()
+                );
+            }
+            preserve_queue_selection(state, None);
+        }
+        Action::RemoveQueueJob(id) => {
+            if state.queue.remove_pending(id).is_some() {
+                state.status = "Removed pending transfer".to_string();
+                preserve_queue_selection(state, None);
+            } else if state.queue.dismiss_failed(id).is_some() {
+                state.status = "Dismissed failed transfer".to_string();
+                preserve_queue_selection(state, None);
             }
         }
         Action::UpdateTransferProgress {
@@ -390,8 +448,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 .update_active_progress(job_id, transferred_bytes, size_bytes);
         }
         Action::ClearPendingTransfers => {
+            let keep = state.selected_queue_job().map(|j| j.id);
             let removed = state.queue.clear_pending();
             state.status = format!("Cleared {removed} pending transfer(s)");
+            preserve_queue_selection(state, keep);
         }
         Action::SetWorkerView {
             active_count,
@@ -427,7 +487,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 let last = state.visible_remote().len().saturating_sub(1);
                 state.selected_remote = index.min(last);
             }
-            FocusPane::Queue => {}
+            FocusPane::Queue => {
+                let last = state.visible_queue().len().saturating_sub(1);
+                state.selected_queue = index.min(last);
+            }
         },
         Action::HelpScroll(delta) => {
             if delta < 0 {
@@ -439,12 +502,16 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::QueueScroll(delta) => {
+            let last = state.visible_queue().len().saturating_sub(1);
             if delta < 0 {
-                state.queue_scroll = state
-                    .queue_scroll
+                state.selected_queue = state
+                    .selected_queue
                     .saturating_sub(delta.unsigned_abs() as usize);
             } else {
-                state.queue_scroll = state.queue_scroll.saturating_add(delta as usize);
+                state.selected_queue = state
+                    .selected_queue
+                    .saturating_add(delta as usize)
+                    .min(last);
             }
         }
         Action::FocusNextPane => {
@@ -474,23 +541,97 @@ pub fn reduce(state: &mut AppState, action: Action) {
             if state.show_settings {
                 state.show_help = false;
                 state.show_theme_debug = false;
+                state.settings_field = SettingsField::Editor;
                 state.settings_editor = TextField::from_str(&state.editor);
+                state.settings_workers = clamp_worker_concurrency(state.worker_max_concurrency);
+                state.settings_hide_dotfiles = state.hide_dotfiles;
+                state.settings_overwrite = state.default_overwrite_policy;
+                state.settings_auto_connect = state.auto_connect_default;
+                state.settings_last_local = TextField::from_str(&state.local_cwd);
             }
         }
+        Action::SettingsNextField => {
+            state.settings_field = state.settings_field.next();
+        }
+        Action::SettingsPrevField => {
+            state.settings_field = state.settings_field.prev();
+        }
+        Action::SettingsSelectField(field) => {
+            state.settings_field = field;
+        }
+        Action::SettingsCycleValue(dir) => match state.settings_field {
+            SettingsField::Workers => {
+                let n = state.settings_workers as i32;
+                let next = if dir < 0 {
+                    if n <= 1 {
+                        WORKER_MAX_CONCURRENCY_LIMIT as i32
+                    } else {
+                        n - 1
+                    }
+                } else if n >= WORKER_MAX_CONCURRENCY_LIMIT as i32 {
+                    1
+                } else {
+                    n + 1
+                };
+                state.settings_workers = clamp_worker_concurrency(next as usize);
+            }
+            SettingsField::HideDotfiles => {
+                state.settings_hide_dotfiles = !state.settings_hide_dotfiles;
+            }
+            SettingsField::Overwrite => {
+                state.settings_overwrite = if dir < 0 {
+                    state.settings_overwrite.settings_prev()
+                } else {
+                    state.settings_overwrite.settings_next()
+                };
+            }
+            SettingsField::AutoConnect => {
+                state.settings_auto_connect = !state.settings_auto_connect;
+            }
+            SettingsField::Editor | SettingsField::LastLocalCwd => {}
+        },
         Action::SettingsInput(ch) => {
-            state.settings_editor.insert_char(ch);
+            if let Some(tf) = state.settings_text_mut() {
+                tf.insert_char(ch);
+            }
         }
         Action::SettingsBackspace => {
-            state.settings_editor.backspace();
+            if let Some(tf) = state.settings_text_mut() {
+                tf.backspace();
+            }
         }
         Action::SettingsMoveCursor { dir, shift } => {
-            state.settings_editor.move_cursor(dir, shift);
+            if let Some(tf) = state.settings_text_mut() {
+                tf.move_cursor(dir, shift);
+            }
         }
         Action::SettingsBeginSelect(idx) => {
-            state.settings_editor.begin_drag(idx);
+            if let Some(tf) = state.settings_text_mut() {
+                tf.begin_drag(idx);
+            }
         }
         Action::SettingsExtendSelect(idx) => {
-            state.settings_editor.extend_drag(idx);
+            if let Some(tf) = state.settings_text_mut() {
+                tf.extend_drag(idx);
+            }
+        }
+        Action::ApplySettings {
+            editor,
+            worker_max_concurrency,
+            hide_dotfiles,
+            overwrite,
+            auto_connect,
+        } => {
+            state.editor = editor;
+            state.worker_max_concurrency = clamp_worker_concurrency(worker_max_concurrency);
+            state.default_overwrite_policy = overwrite;
+            state.auto_connect_default = auto_connect;
+            if state.hide_dotfiles != hide_dotfiles {
+                let local_name = state.selected_local_entry().map(|e| e.name.clone());
+                let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
+                state.hide_dotfiles = hide_dotfiles;
+                preserve_filter_selection(state, local_name, remote_name);
+            }
         }
         Action::SetEditor(value) => {
             state.editor = value;
@@ -506,7 +647,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                     state.selected_remote -= 1;
                 }
             }
-            FocusPane::Queue => {}
+            FocusPane::Queue => {
+                if state.selected_queue > 0 {
+                    state.selected_queue -= 1;
+                }
+            }
         },
         Action::SelectDown => match state.focus {
             FocusPane::Local => {
@@ -519,7 +664,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                     state.selected_remote += 1;
                 }
             }
-            FocusPane::Queue => {}
+            FocusPane::Queue => {
+                if state.selected_queue < state.visible_queue().len().saturating_sub(1) {
+                    state.selected_queue += 1;
+                }
+            }
         },
         Action::ToggleFilter => {
             let local_name = state.selected_local_entry().map(|e| e.name.clone());
@@ -547,6 +696,38 @@ pub fn reduce(state: &mut AppState, action: Action) {
             let remote_name = state.selected_remote_entry().map(|e| e.name.clone());
             state.filter_pattern.clear();
             preserve_filter_selection(state, local_name, remote_name);
+        }
+        Action::CloseFilterKeep => {
+            state.show_filter = false;
+        }
+        Action::MarkAllVisible => {
+            let pane = state.filter_count_pane();
+            let paths: Vec<String> = match pane {
+                FocusPane::Local => state
+                    .visible_local()
+                    .into_iter()
+                    .filter(|e| !is_dot_or_dotdot(&e.name))
+                    .map(|e| e.path.clone())
+                    .collect(),
+                FocusPane::Remote => state
+                    .visible_remote()
+                    .into_iter()
+                    .filter(|e| !is_dot_or_dotdot(&e.name))
+                    .map(|e| e.path.clone())
+                    .collect(),
+                FocusPane::Queue => Vec::new(),
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let marks = match pane {
+                FocusPane::Local => &mut state.marked_local,
+                FocusPane::Remote => &mut state.marked_remote,
+                FocusPane::Queue => return,
+            };
+            for path in paths {
+                marks.insert(path);
+            }
         }
         Action::ToggleCompare => {
             state.show_compare = !state.show_compare;
@@ -982,6 +1163,7 @@ mod overlay_tests {
         reduce(&mut s, Action::ToggleSettings);
         assert!(s.show_settings);
         assert!(!s.show_help);
+        assert_eq!(s.settings_field, SettingsField::Editor);
         assert_eq!(s.settings_editor.value, "hx");
         reduce(&mut s, Action::SettingsInput('x'));
         assert_eq!(s.settings_editor.value, "hxx");
@@ -989,6 +1171,89 @@ mod overlay_tests {
         assert_eq!(s.editor, "nvim");
         reduce(&mut s, Action::ToggleSettings);
         assert!(!s.show_settings);
+    }
+
+    #[test]
+    fn toggle_settings_hydrates_all_drafts() {
+        let mut s = AppState {
+            editor: "nvim".into(),
+            worker_max_concurrency: 4,
+            hide_dotfiles: true,
+            default_overwrite_policy: crate::OverwritePolicy::SkipAll,
+            auto_connect_default: true,
+            local_cwd: "/tmp/ftp".into(),
+            ..Default::default()
+        };
+        reduce(&mut s, Action::ToggleSettings);
+        assert_eq!(s.settings_field, SettingsField::Editor);
+        assert_eq!(s.settings_editor.value, "nvim");
+        assert_eq!(s.settings_workers, 4);
+        assert!(s.settings_hide_dotfiles);
+        assert_eq!(s.settings_overwrite, crate::OverwritePolicy::SkipAll);
+        assert!(s.settings_auto_connect);
+        assert_eq!(s.settings_last_local.value, "/tmp/ftp");
+    }
+
+    #[test]
+    fn settings_tab_cycles_and_wraps() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleSettings);
+        assert_eq!(s.settings_field, SettingsField::Editor);
+        reduce(&mut s, Action::SettingsNextField);
+        assert_eq!(s.settings_field, SettingsField::Workers);
+        reduce(&mut s, Action::SettingsPrevField);
+        assert_eq!(s.settings_field, SettingsField::Editor);
+        reduce(&mut s, Action::SettingsPrevField);
+        assert_eq!(s.settings_field, SettingsField::LastLocalCwd);
+        reduce(&mut s, Action::SettingsNextField);
+        assert_eq!(s.settings_field, SettingsField::Editor);
+    }
+
+    #[test]
+    fn settings_cycle_workers_wraps_and_input_targets_active_text() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::ToggleSettings);
+        reduce(&mut s, Action::SettingsSelectField(SettingsField::Workers));
+        assert_eq!(s.settings_workers, 2);
+        reduce(&mut s, Action::SettingsCycleValue(1));
+        assert_eq!(s.settings_workers, 3);
+        s.settings_workers = WORKER_MAX_CONCURRENCY_LIMIT;
+        reduce(&mut s, Action::SettingsCycleValue(1));
+        assert_eq!(s.settings_workers, 1);
+        reduce(&mut s, Action::SettingsCycleValue(-1));
+        assert_eq!(s.settings_workers, WORKER_MAX_CONCURRENCY_LIMIT);
+
+        reduce(
+            &mut s,
+            Action::SettingsSelectField(SettingsField::LastLocalCwd),
+        );
+        s.settings_last_local = crate::TextField::from_str("/tmp");
+        reduce(&mut s, Action::SettingsInput('x'));
+        assert_eq!(s.settings_last_local.value, "/tmpx");
+        assert_eq!(s.settings_editor.value, "");
+    }
+
+    #[test]
+    fn apply_settings_updates_live_fields() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            Action::ApplySettings {
+                editor: "hx".into(),
+                worker_max_concurrency: 99,
+                hide_dotfiles: true,
+                overwrite: crate::OverwritePolicy::OverwriteAll,
+                auto_connect: true,
+            },
+        );
+        assert_eq!(s.editor, "hx");
+        assert_eq!(s.worker_max_concurrency, WORKER_MAX_CONCURRENCY_LIMIT);
+        assert!(s.hide_dotfiles);
+        assert_eq!(
+            s.default_overwrite_policy,
+            crate::OverwritePolicy::OverwriteAll
+        );
+        assert!(s.auto_connect_default);
     }
 
     #[test]
@@ -1373,6 +1638,40 @@ mod reduce_table_tests {
     }
 
     #[test]
+    fn select_index_pages_and_clamps_to_last() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("b"), fe("c"), fe("d"), fe("e")],
+            selected_local: 0,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(
+            &mut s,
+            Action::SelectIndex {
+                pane: FocusPane::Local,
+                index: 3,
+            },
+        );
+        assert_eq!(s.selected_local, 3);
+        reduce(
+            &mut s,
+            Action::SelectIndex {
+                pane: FocusPane::Local,
+                index: usize::MAX,
+            },
+        );
+        assert_eq!(s.selected_local, 4);
+        reduce(
+            &mut s,
+            Action::SelectIndex {
+                pane: FocusPane::Local,
+                index: 0,
+            },
+        );
+        assert_eq!(s.selected_local, 0);
+    }
+
+    #[test]
     fn toggle_filter_clears_pattern() {
         let mut s = AppState {
             filter_pattern: "foo".into(),
@@ -1382,6 +1681,18 @@ mod reduce_table_tests {
         reduce(&mut s, Action::ToggleFilter);
         assert!(!s.show_filter);
         assert!(s.filter_pattern.is_empty());
+    }
+
+    #[test]
+    fn close_filter_keep_leaves_pattern() {
+        let mut s = AppState {
+            filter_pattern: "foo".into(),
+            show_filter: true,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::CloseFilterKeep);
+        assert!(!s.show_filter);
+        assert_eq!(s.filter_pattern, "foo");
     }
 
     #[test]
@@ -1444,6 +1755,65 @@ mod reduce_table_tests {
         reduce(&mut s, Action::QueueTransfer(job("/tmp/b", "/pub/b")));
         reduce(&mut s, Action::ClearPendingTransfers);
         assert!(s.queue.pending.is_empty());
+    }
+
+    #[test]
+    fn queue_select_up_down_and_retry_all() {
+        let mut s = AppState::default();
+        s.set_focus(FocusPane::Queue);
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/a", "/pub/a")));
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/b", "/pub/b")));
+        let fail = job("/tmp/c", "/pub/c");
+        let fail_id = fail.id;
+        s.queue.mark_failed(fail);
+        assert_eq!(s.visible_queue().len(), 3);
+        reduce(&mut s, Action::SelectDown);
+        reduce(&mut s, Action::SelectDown);
+        assert_eq!(s.selected_queue, 2);
+        assert_eq!(s.selected_queue_job().map(|j| j.id), Some(fail_id));
+        reduce(&mut s, Action::RetryAllFailed);
+        assert!(s.queue.failed.is_empty());
+        assert_eq!(s.queue.pending.len(), 3);
+        reduce(
+            &mut s,
+            Action::SelectIndex {
+                pane: FocusPane::Queue,
+                index: 1,
+            },
+        );
+        let drop_id = s.selected_queue_job().unwrap().id;
+        reduce(&mut s, Action::RemoveQueueJob(drop_id));
+        assert_eq!(s.queue.pending.len(), 2);
+        assert!(s.selected_queue < s.visible_queue().len() || s.visible_queue().is_empty());
+    }
+
+    #[test]
+    fn queue_scroll_moves_selection() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/a", "/pub/a")));
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/b", "/pub/b")));
+        reduce(&mut s, Action::QueueTransfer(job("/tmp/c", "/pub/c")));
+        reduce(&mut s, Action::QueueScroll(2));
+        assert_eq!(s.selected_queue, 2);
+        reduce(&mut s, Action::QueueScroll(-1));
+        assert_eq!(s.selected_queue, 1);
+        reduce(&mut s, Action::QueueScroll(99));
+        assert_eq!(s.selected_queue, 2);
+    }
+
+    #[test]
+    fn retry_failed_moves_that_job_to_pending() {
+        let mut s = AppState::default();
+        let a = job("/tmp/a", "/pub/a");
+        let b = job("/tmp/b", "/pub/b");
+        let a_id = a.id;
+        s.queue.mark_failed(a);
+        s.queue.mark_failed(b);
+        reduce(&mut s, Action::RetryFailed(a_id));
+        assert_eq!(s.queue.pending.len(), 1);
+        assert_eq!(s.queue.pending[0].id, a_id);
+        assert_eq!(s.queue.failed.len(), 1);
+        assert_eq!(s.selected_queue_job().map(|j| j.id), Some(a_id));
     }
 
     #[test]
@@ -1527,6 +1897,29 @@ mod mark_sort_chmod_tests {
             modified: None,
             permissions: None,
         }
+    }
+
+    #[test]
+    fn mark_all_visible_skips_dot_and_hidden() {
+        let mut s = AppState {
+            local_entries: vec![dir("."), dir(".."), fe("a"), fe("b"), fe(".secret")],
+            hide_dotfiles: true,
+            focus: FocusPane::Local,
+            ..Default::default()
+        };
+        reduce(&mut s, Action::MarkAllVisible);
+        assert!(s.marked_local.contains("/a"));
+        assert!(s.marked_local.contains("/b"));
+        assert!(!s.marked_local.contains("/."));
+        assert!(!s.marked_local.contains("/.."));
+        assert!(!s.marked_local.contains("/.secret"));
+        assert_eq!(s.marked_local.len(), 2);
+
+        s.filter_pattern = "a".into();
+        s.marked_local.clear();
+        reduce(&mut s, Action::MarkAllVisible);
+        assert!(s.marked_local.contains("/a"));
+        assert!(!s.marked_local.contains("/b"));
     }
 
     #[test]

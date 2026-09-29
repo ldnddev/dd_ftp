@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -148,6 +149,93 @@ pub enum OverwritePolicy {
     RenameNewer,
 }
 
+impl OverwritePolicy {
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "skip_all" | "skip" => Self::SkipAll,
+            "overwrite_all" | "overwrite" => Self::OverwriteAll,
+            _ => Self::Ask,
+        }
+    }
+
+    pub fn to_config(self) -> &'static str {
+        match self {
+            Self::SkipAll => "skip_all",
+            Self::OverwriteAll => "overwrite_all",
+            _ => "ask",
+        }
+    }
+
+    pub fn settings_label(self) -> &'static str {
+        match self {
+            Self::SkipAll => "skip all",
+            Self::OverwriteAll => "overwrite all",
+            _ => "ask",
+        }
+    }
+
+    pub fn settings_next(self) -> Self {
+        match self {
+            Self::Ask => Self::SkipAll,
+            Self::SkipAll => Self::OverwriteAll,
+            _ => Self::Ask,
+        }
+    }
+
+    pub fn settings_prev(self) -> Self {
+        match self {
+            Self::OverwriteAll => Self::SkipAll,
+            Self::SkipAll => Self::Ask,
+            _ => Self::OverwriteAll,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsField {
+    #[default]
+    Editor,
+    Workers,
+    HideDotfiles,
+    Overwrite,
+    AutoConnect,
+    LastLocalCwd,
+}
+
+impl SettingsField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Editor => Self::Workers,
+            Self::Workers => Self::HideDotfiles,
+            Self::HideDotfiles => Self::Overwrite,
+            Self::Overwrite => Self::AutoConnect,
+            Self::AutoConnect => Self::LastLocalCwd,
+            Self::LastLocalCwd => Self::Editor,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Editor => Self::LastLocalCwd,
+            Self::Workers => Self::Editor,
+            Self::HideDotfiles => Self::Workers,
+            Self::Overwrite => Self::HideDotfiles,
+            Self::AutoConnect => Self::Overwrite,
+            Self::LastLocalCwd => Self::AutoConnect,
+        }
+    }
+
+    pub fn is_text(self) -> bool {
+        matches!(self, Self::Editor | Self::LastLocalCwd)
+    }
+}
+
+pub const WORKER_MAX_CONCURRENCY_LIMIT: usize = 8;
+
+pub fn clamp_worker_concurrency(n: usize) -> usize {
+    n.clamp(1, WORKER_MAX_CONCURRENCY_LIMIT)
+}
+
 /// One file discovered by a folder scan. Enqueued only after drain + overwrite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingFile {
@@ -290,6 +378,14 @@ pub struct AppState {
     /// Configured editor from `~/.config/ldnddev/dd_ftp.toml` (env still wins at use).
     pub editor: String,
     pub settings_editor: TextField,
+    pub settings_field: SettingsField,
+    pub settings_workers: usize,
+    pub settings_hide_dotfiles: bool,
+    pub settings_overwrite: OverwritePolicy,
+    pub settings_auto_connect: bool,
+    pub settings_last_local: TextField,
+    pub auto_connect_default: bool,
+    pub default_overwrite_policy: OverwritePolicy,
     pub worker_running: bool,
     pub worker_active_count: usize,
     pub worker_max_concurrency: usize,
@@ -302,6 +398,7 @@ pub struct AppState {
     pub busy: bool,
     pub toast: Option<Toast>,
     pub queue_scroll: usize,
+    pub selected_queue: usize,
     pub queue: TransferQueue,
     /// Host-key ChoicePrompt fields. Oneshot is not stored here.
     pub host_key: Option<HostKeyView>,
@@ -314,12 +411,47 @@ pub struct AppState {
     pub marked_remote: HashSet<String>,
     pub mark_anchor_local: Option<usize>,
     pub mark_anchor_remote: Option<usize>,
+    pub visible_local_cache: RefCell<Option<VisibleCache>>,
+    pub visible_remote_cache: RefCell<Option<VisibleCache>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisibleCache {
+    entries_ptr: usize,
+    entries_len: usize,
+    filter: String,
+    hide_dotfiles: bool,
+    sort_key: SortKey,
+    sort_asc: bool,
+    idx: Vec<usize>,
+}
+
+impl VisibleCache {
+    fn matches(
+        &self,
+        entries: &[FileEntry],
+        filter: &str,
+        hide_dotfiles: bool,
+        sort_key: SortKey,
+        sort_asc: bool,
+    ) -> bool {
+        self.entries_ptr == entries.as_ptr() as usize
+            && self.entries_len == entries.len()
+            && self.filter == filter
+            && self.hide_dotfiles == hide_dotfiles
+            && self.sort_key == sort_key
+            && self.sort_asc == sort_asc
+    }
 }
 
 impl AppState {
-    pub fn expire_toast(&mut self) {
+    /// Clears an expired toast. Returns true when the toast was removed.
+    pub fn expire_toast(&mut self) -> bool {
         if self.toast.as_ref().is_some_and(Toast::is_expired) {
             self.toast = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -382,69 +514,99 @@ impl AppState {
         hide && name.starts_with('.') && !is_dot_or_dotdot(name)
     }
 
-    fn sort_entries(entries: &mut [&FileEntry], key: SortKey, asc: bool) {
-        entries.sort_by(|a, b| {
-            let rank = |name: &str| -> u8 {
-                if name == "." {
-                    0
-                } else if name == ".." {
-                    1
+    fn cmp_entries(a: &FileEntry, b: &FileEntry, key: SortKey, asc: bool) -> std::cmp::Ordering {
+        let rank = |name: &str| -> u8 {
+            if name == "." {
+                0
+            } else if name == ".." {
+                1
+            } else {
+                2
+            }
+        };
+        let special = rank(&a.name).cmp(&rank(&b.name));
+        if special != std::cmp::Ordering::Equal {
+            return special;
+        }
+        match key {
+            SortKey::Name => {
+                let dirs = b.is_dir().cmp(&a.is_dir());
+                let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                dirs.then(if asc { names } else { names.reverse() })
+            }
+            SortKey::Size => {
+                let sizes = a.size.cmp(&b.size);
+                let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                let ord = sizes.then(names);
+                if asc {
+                    ord
                 } else {
-                    2
-                }
-            };
-            let special = rank(&a.name).cmp(&rank(&b.name));
-            if special != std::cmp::Ordering::Equal {
-                return special;
-            }
-            match key {
-                SortKey::Name => {
-                    let dirs = b.is_dir().cmp(&a.is_dir());
-                    let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                    dirs.then(if asc { names } else { names.reverse() })
-                }
-                SortKey::Size => {
-                    let sizes = a.size.cmp(&b.size);
-                    let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                    let ord = sizes.then(names);
-                    if asc {
-                        ord
-                    } else {
-                        ord.reverse()
-                    }
-                }
-                SortKey::Date => {
-                    let dates = a.modified.cmp(&b.modified);
-                    let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                    let ord = dates.then(names);
-                    if asc {
-                        ord
-                    } else {
-                        ord.reverse()
-                    }
+                    ord.reverse()
                 }
             }
-        });
+            SortKey::Date => {
+                let dates = a.modified.cmp(&b.modified);
+                let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                let ord = dates.then(names);
+                if asc {
+                    ord
+                } else {
+                    ord.reverse()
+                }
+            }
+        }
     }
 
-    fn visible_entries<'a>(
+    fn visible_indices(
+        entries: &[FileEntry],
+        pattern: &str,
+        hide_dotfiles: bool,
+        sort_key: SortKey,
+        sort_asc: bool,
+    ) -> Vec<usize> {
+        let mut idx: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| Self::entry_visible(&e.name, pattern))
+            .filter(|(_, e)| !Self::hide_dotfile(&e.name, hide_dotfiles))
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by(|&ia, &ib| Self::cmp_entries(&entries[ia], &entries[ib], sort_key, sort_asc));
+        idx
+    }
+
+    fn cached_visible<'a>(
+        cache: &RefCell<Option<VisibleCache>>,
         entries: &'a [FileEntry],
         pattern: &str,
         hide_dotfiles: bool,
         sort_key: SortKey,
         sort_asc: bool,
     ) -> Vec<&'a FileEntry> {
-        let mut out: Vec<&FileEntry> = entries
-            .iter()
-            .filter(|e| Self::entry_visible(&e.name, pattern))
-            .filter(|e| !Self::hide_dotfile(&e.name, hide_dotfiles))
-            .collect();
-        Self::sort_entries(&mut out, sort_key, sort_asc);
-        out
+        let idx = {
+            let mut slot = cache.borrow_mut();
+            let hit = slot
+                .as_ref()
+                .is_some_and(|c| c.matches(entries, pattern, hide_dotfiles, sort_key, sort_asc));
+            if !hit {
+                *slot = Some(VisibleCache {
+                    entries_ptr: entries.as_ptr() as usize,
+                    entries_len: entries.len(),
+                    filter: pattern.to_string(),
+                    hide_dotfiles,
+                    sort_key,
+                    sort_asc,
+                    idx: Self::visible_indices(entries, pattern, hide_dotfiles, sort_key, sort_asc),
+                });
+            }
+            slot.as_ref().expect("cache filled").idx.clone()
+        };
+        idx.iter().map(|&i| &entries[i]).collect()
     }
 
     pub fn visible_local(&self) -> Vec<&FileEntry> {
-        Self::visible_entries(
+        Self::cached_visible(
+            &self.visible_local_cache,
             &self.local_entries,
             &self.filter_pattern,
             self.hide_dotfiles,
@@ -454,7 +616,8 @@ impl AppState {
     }
 
     pub fn visible_remote(&self) -> Vec<&FileEntry> {
-        Self::visible_entries(
+        Self::cached_visible(
+            &self.visible_remote_cache,
             &self.remote_entries,
             &self.filter_pattern,
             self.hide_dotfiles,
@@ -465,7 +628,8 @@ impl AppState {
 
     /// Picker always shows dotfiles and sorts by name (dirs first).
     pub fn visible_key_picker(&self) -> Vec<&FileEntry> {
-        Self::visible_entries(&self.key_picker_entries, "", false, SortKey::Name, true)
+        let idx = Self::visible_indices(&self.key_picker_entries, "", false, SortKey::Name, true);
+        idx.iter().map(|&i| &self.key_picker_entries[i]).collect()
     }
 
     pub fn sort_title_suffix(&self) -> String {
@@ -475,6 +639,27 @@ impl AppState {
             s.push_str("  hidden-dotfiles");
         }
         s
+    }
+
+    pub fn visible_queue(&self) -> Vec<&dd_ftp_core::TransferJob> {
+        self.queue
+            .active
+            .iter()
+            .chain(self.queue.pending.iter())
+            .chain(self.queue.failed.iter())
+            .collect()
+    }
+
+    pub fn selected_queue_job(&self) -> Option<&dd_ftp_core::TransferJob> {
+        self.visible_queue().get(self.selected_queue).copied()
+    }
+
+    pub fn settings_text_mut(&mut self) -> Option<&mut TextField> {
+        match self.settings_field {
+            SettingsField::Editor => Some(&mut self.settings_editor),
+            SettingsField::LastLocalCwd => Some(&mut self.settings_last_local),
+            _ => None,
+        }
     }
 
     pub fn selected_local_entry(&self) -> Option<&FileEntry> {
@@ -547,6 +732,19 @@ impl AppState {
             FocusPane::Queue => self.last_file_pane,
         }
     }
+
+    #[cfg(test)]
+    fn visible_local_cache_valid(&self) -> bool {
+        self.visible_local_cache.borrow().as_ref().is_some_and(|c| {
+            c.matches(
+                &self.local_entries,
+                &self.filter_pattern,
+                self.hide_dotfiles,
+                self.sort_key,
+                self.sort_asc,
+            )
+        })
+    }
 }
 
 impl Default for AppState {
@@ -586,6 +784,14 @@ impl Default for AppState {
             qc_field: TextField::default(),
             editor: String::new(),
             settings_editor: TextField::default(),
+            settings_field: SettingsField::Editor,
+            settings_workers: 2,
+            settings_hide_dotfiles: false,
+            settings_overwrite: OverwritePolicy::Ask,
+            settings_auto_connect: false,
+            settings_last_local: TextField::default(),
+            auto_connect_default: false,
+            default_overwrite_policy: OverwritePolicy::Ask,
             worker_running: false,
             worker_active_count: 0,
             worker_max_concurrency: 2,
@@ -597,6 +803,7 @@ impl Default for AppState {
             busy: false,
             toast: None,
             queue_scroll: 0,
+            selected_queue: 0,
             queue: TransferQueue::default(),
             host_key: None,
             overwrite: None,
@@ -607,6 +814,8 @@ impl Default for AppState {
             marked_remote: HashSet::new(),
             mark_anchor_local: None,
             mark_anchor_remote: None,
+            visible_local_cache: RefCell::new(None),
+            visible_remote_cache: RefCell::new(None),
         }
     }
 }
@@ -648,6 +857,31 @@ mod visible_tests {
             modified: None,
             permissions: None,
         }
+    }
+
+    #[test]
+    fn visible_local_cache_hits_until_filter_or_listing_changes() {
+        let mut s = AppState {
+            local_entries: vec![fe("a"), fe("Foo"), fe("bar")],
+            ..Default::default()
+        };
+        assert!(!s.visible_local_cache_valid());
+        let first: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
+        assert!(s.visible_local_cache_valid());
+        let second: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(first, second);
+        assert_eq!(first, vec!["a", "bar", "Foo"]);
+
+        s.filter_pattern = "foo".into();
+        assert!(!s.visible_local_cache_valid());
+        let filtered: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(filtered, vec!["Foo"]);
+        assert!(s.visible_local_cache_valid());
+
+        s.local_entries.push(fe("food"));
+        assert!(!s.visible_local_cache_valid());
+        let after_push: Vec<&str> = s.visible_local().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(after_push, vec!["Foo", "food"]);
     }
 
     #[test]
@@ -799,5 +1033,38 @@ mod visible_tests {
         assert_eq!(s.filter_count_pane(), FocusPane::Remote);
         s.set_focus(FocusPane::Local);
         assert_eq!(s.filter_count_pane(), FocusPane::Local);
+    }
+
+    #[test]
+    fn overwrite_policy_config_round_trip_and_settings_cycle() {
+        assert_eq!(OverwritePolicy::from_config("ask"), OverwritePolicy::Ask);
+        assert_eq!(
+            OverwritePolicy::from_config("skip_all"),
+            OverwritePolicy::SkipAll
+        );
+        assert_eq!(
+            OverwritePolicy::from_config("overwrite_all"),
+            OverwritePolicy::OverwriteAll
+        );
+        assert_eq!(OverwritePolicy::from_config("nope"), OverwritePolicy::Ask);
+        assert_eq!(OverwritePolicy::Ask.to_config(), "ask");
+        assert_eq!(OverwritePolicy::SkipAll.to_config(), "skip_all");
+        assert_eq!(OverwritePolicy::OverwriteAll.to_config(), "overwrite_all");
+        assert_eq!(
+            OverwritePolicy::Ask.settings_next(),
+            OverwritePolicy::SkipAll
+        );
+        assert_eq!(
+            OverwritePolicy::SkipAll.settings_next(),
+            OverwritePolicy::OverwriteAll
+        );
+        assert_eq!(
+            OverwritePolicy::OverwriteAll.settings_next(),
+            OverwritePolicy::Ask
+        );
+        assert_eq!(
+            OverwritePolicy::Ask.settings_prev(),
+            OverwritePolicy::OverwriteAll
+        );
     }
 }

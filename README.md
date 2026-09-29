@@ -14,7 +14,7 @@ Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) an
 curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
 ```
 
-Pin a release: `bash -s -- --version v1.6.1`. Uninstall: `bash -s -- --uninstall`. From a checkout: `./install.sh`. Full options, PATH notes, and env vars are in the [tutorial](https://ldnddev.github.io/dd_ftp/#install).
+Pin a release: `bash -s -- --version v1.7.0`. Uninstall: `bash -s -- --uninstall`. From a checkout: `./install.sh`. Full options, PATH notes, and env vars are in the [tutorial](https://ldnddev.github.io/dd_ftp/#install).
 
 ## Run
 

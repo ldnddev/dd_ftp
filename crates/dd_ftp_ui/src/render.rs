@@ -105,7 +105,13 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         frame.area(),
     );
 
-    let queue_height = if app.focus == FocusPane::Queue { 12 } else { 8 };
+    // Idle queue is a 3-row strip (title, worker summary, bottom border), even
+    // when focused. With jobs the panel grows by one row each, capped at 8,
+    // or 12 while the queue pane is focused.
+    let queue_height = queue_panel_height(
+        app.visible_queue().len(),
+        app.focus == FocusPane::Queue,
+    );
     let filter_height = if app.show_filter { 1 } else { 0 };
 
     let vertical = Layout::default()
@@ -514,25 +520,22 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         horizontal: 1,
         vertical: 1,
     });
-    let queue_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(worker_spans))
-            .style(Style::default().bg(t.body_background).fg(t.text_primary)),
-        queue_chunks[0],
-    );
-    map.queue_list = queue_chunks[1];
+    let worker_line = Paragraph::new(Line::from(worker_spans))
+        .style(Style::default().bg(t.body_background).fg(t.text_primary));
 
     if queue_jobs.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No jobs in queue")
-                .style(Style::default().fg(t.text_secondary).bg(t.body_background)),
-            queue_chunks[1],
-        );
+        // One content row: the summary. A second chunk would take that row and
+        // hide "Worker: idle …".
+        frame.render_widget(worker_line, inner);
+        map.queue_list = inner;
         map.queue_list_offset = 0;
     } else {
+        let queue_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+        frame.render_widget(worker_line, queue_chunks[0]);
+        map.queue_list = queue_chunks[1];
         let items: Vec<ListItem> = queue_jobs
             .iter()
             .map(|job| {
@@ -1729,6 +1732,19 @@ fn format_speed(bps: f64) -> String {
     }
 }
 
+/// Height of the bordered queue panel.
+///
+/// Zero visible jobs (pending, active, or failed) stay at 3 rows: the title
+/// border, the worker summary, and the bottom border. Each visible job adds a
+/// row, up to 8, or 12 when the queue pane is focused.
+fn queue_panel_height(job_count: usize, focused: bool) -> u16 {
+    if job_count == 0 {
+        return 3;
+    }
+    let cap = if focused { 12 } else { 8 };
+    (3 + job_count).min(cap) as u16
+}
+
 fn format_eta(d: Duration) -> String {
     let secs = d.as_secs();
     format!("{:02}:{:02}", secs / 60, secs % 60)
@@ -2164,6 +2180,87 @@ mod column_tests {
         assert!(meta_columns(25).date && !meta_columns(25).perms);
         assert!(meta_columns(7).size && !meta_columns(7).date);
         assert!(!meta_columns(6).size);
+    }
+
+    #[test]
+    fn queue_panel_height_tracks_visible_jobs() {
+        assert_eq!(queue_panel_height(0, false), 3);
+        assert_eq!(queue_panel_height(0, true), 3);
+        assert_eq!(queue_panel_height(1, false), 4);
+        assert_eq!(queue_panel_height(5, false), 8);
+        assert_eq!(queue_panel_height(5, true), 8);
+        assert_eq!(queue_panel_height(9, true), 12);
+        assert_eq!(queue_panel_height(40, false), 8);
+        assert_eq!(queue_panel_height(40, true), 12);
+    }
+
+    #[test]
+    fn idle_queue_strip_is_three_rows_and_omits_the_empty_message() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = AppState::default();
+        app.focus = FocusPane::Queue;
+        let mut map = LayoutMap::default();
+        terminal
+            .draw(|frame| render(frame, &app, &mut map))
+            .unwrap();
+        assert_eq!(map.queue.height, 3);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("[3] Queue"));
+        assert!(text.contains("Worker:"));
+        assert!(!text.contains("No jobs in queue"));
+    }
+
+    #[test]
+    fn queue_panel_grows_with_jobs_and_caps_when_focused() {
+        use dd_ftp_core::TransferDirection;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut idle_focus = AppState::default();
+        for n in 0..5 {
+            idle_focus.queue.enqueue(TransferJob::new(
+                format!("/tmp/{n}"),
+                format!("/pub/{n}"),
+                TransferDirection::Upload,
+            ));
+        }
+        let mut map = LayoutMap::default();
+        terminal
+            .draw(|frame| render(frame, &idle_focus, &mut map))
+            .unwrap();
+        assert_eq!(map.queue.height, 8);
+
+        idle_focus.focus = FocusPane::Queue;
+        terminal
+            .draw(|frame| render(frame, &idle_focus, &mut map))
+            .unwrap();
+        assert_eq!(map.queue.height, 8);
+
+        for n in 5..12 {
+            idle_focus.queue.enqueue(TransferJob::new(
+                format!("/tmp/{n}"),
+                format!("/pub/{n}"),
+                TransferDirection::Upload,
+            ));
+        }
+        terminal
+            .draw(|frame| render(frame, &idle_focus, &mut map))
+            .unwrap();
+        assert_eq!(map.queue.height, 12);
+        assert!(map.queue_list.height >= 1);
     }
 
     #[test]

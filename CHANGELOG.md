@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.0] - 2026-10-11
+
+### Changed
+- The queue panel sizes to its jobs. With nothing pending, active, or failed it is a 3-row strip (title, worker summary, bottom border), even when that pane is focused. Each visible job adds a row, up to 8, or 12 while the queue pane is focused. File lists take the freed rows.
+
 ## [1.7.0] - 2026-09-28
 
 ### Added

@@ -960,7 +960,15 @@ pub(crate) fn navigate_into_directory(app: &mut AppState, runtime: &mut Runtime)
 
             if let Some(entry) = app.selected_remote_entry().cloned() {
                 if entry.kind == dd_ftp_core::EntryKind::Directory {
-                    app.remote_cwd = crate::paths::join_remote_path(&app.remote_cwd, &entry.name);
+                    let next = match crate::paths::safe_remote_child(&app.remote_cwd, &entry.name)
+                    {
+                        Ok(p) => p,
+                        Err(_) => {
+                            reduce(app, Action::ShowError("path escapes directory".to_string()));
+                            return;
+                        }
+                    };
+                    app.remote_cwd = next;
                     runtime.list_ok_status = Some(format!("Remote cwd: {}", app.remote_cwd));
                     runtime.list_err_prefix = "Remote enter failed".to_string();
                     crate::session::list_remote(

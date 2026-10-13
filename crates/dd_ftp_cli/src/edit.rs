@@ -98,6 +98,59 @@ pub fn cache_root() -> PathBuf {
     base.join("dd_ftp").join("edit")
 }
 
+/// Create the edit cache directory as owner-only (`0700`). Remote file
+/// contents land here before the editor opens.
+pub fn prepare_edit_cache(file: &Path) -> std::io::Result<()> {
+    let root = cache_root();
+    std::fs::create_dir_all(&root)?;
+    tighten_dir_0700(&root)?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+        if parent.starts_with(&root) {
+            tighten_dir_0700(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// Make a cached edit file owner-readable only. Refuses to chmod a symlink.
+pub fn tighten_edit_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "edit cache path is a symlink",
+            ));
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn tighten_dir_0700(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 pub fn edit_cache_path(host: &str, port: u16, remote_path: &str) -> PathBuf {
     let mut path = cache_root().join(format!("{}_{port}", sanitize_component(host)));
     let mut pushed = false;

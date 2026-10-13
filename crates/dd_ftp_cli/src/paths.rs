@@ -16,6 +16,11 @@ fn is_safe_component(name: &str) -> bool {
     if name.contains('/') || name.contains('\\') {
         return false;
     }
+    // CR/LF/NUL in a name become FTP command injection when the server is
+    // asked to RETR, STOR, DELE, or CWD that name.
+    if name.chars().any(|c| c.is_control()) {
+        return false;
+    }
     true
 }
 
@@ -277,6 +282,14 @@ mod path_tests {
                 name: "foo/../../etc",
                 ok: false,
             },
+            Case {
+                name: "foo\nDELE /x",
+                ok: false,
+            },
+            Case {
+                name: "foo\rbar",
+                ok: false,
+            },
         ];
         for case in cases {
             let got = safe_local_child(cwd, case.name);
@@ -320,6 +333,10 @@ mod path_tests {
             },
             Case {
                 name: "/leading",
+                ok: false,
+            },
+            Case {
+                name: "ok\u{0}name",
                 ok: false,
             },
         ];

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use dd_ftp_app::{reduce, Action, AppState};
-use dd_ftp_core::{RemoteSession, TransferDirection, TransferJob};
+use dd_ftp_core::RemoteSession;
 
 use crate::paths::safe_local_child;
 use crate::paths::safe_remote_child;
@@ -63,7 +63,6 @@ pub(crate) fn create_file(app: &mut AppState, runtime: &mut Runtime, name: &str)
                     return;
                 }
             };
-            let temp_file = std::env::temp_dir().join(format!("dd_ftp_empty_{name}"));
             runtime.begin_fs(
                 app,
                 FsKind::CreateFile,
@@ -72,22 +71,11 @@ pub(crate) fn create_file(app: &mut AppState, runtime: &mut Runtime, name: &str)
             );
             runtime.spawn_remote_fs(FsKind::CreateFile, move |handle| async move {
                 let mut handle = handle;
-                let result = async {
-                    std::fs::File::create(&temp_file)?;
-                    let job = TransferJob::new(
-                        temp_file.to_string_lossy().to_string(),
-                        path,
-                        TransferDirection::Upload,
-                    );
-                    let r = match &mut handle {
-                        Some(SessionHandle::Ftp(f)) => f.upload(&job).await,
-                        Some(SessionHandle::Sftp(s)) => s.upload(&job).await,
-                        None => Err(anyhow::anyhow!("not connected")),
-                    };
-                    let _ = std::fs::remove_file(&temp_file);
-                    r
-                }
-                .await;
+                let result = match &mut handle {
+                    Some(SessionHandle::Ftp(f)) => f.create_empty_file(&path).await,
+                    Some(SessionHandle::Sftp(s)) => s.create_empty_file(&path).await,
+                    None => Err(anyhow::anyhow!("not connected")),
+                };
                 (handle, result)
             });
         }

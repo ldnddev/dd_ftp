@@ -482,6 +482,11 @@ fn parse_list_line(base_path: &str, line: &str) -> Option<FileEntry> {
     if entry.name == "." || entry.name == ".." {
         return None;
     }
+    // A CR or LF in a name is an FTP command injection when that name is later
+    // sent as CWD, RETR, STOR, or DELE. Drop the entry instead of offering it.
+    if entry.name.chars().any(char::is_control) {
+        return None;
+    }
     Some(entry)
 }
 
@@ -653,6 +658,15 @@ fn naive_utc(year: i32, month: u32, day: u32, hour: u32, min: u32) -> Option<Dat
 mod parse_list_tests {
     use super::*;
     use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn parse_list_entries_drops_names_with_control_characters() {
+        let entries = parse_list_entries(
+            "/pub",
+            vec!["-rw-r--r-- 1 user group 1 Jan  2 12:00 evil\u{1b}name".into()],
+        );
+        assert!(entries.is_empty());
+    }
 
     #[test]
     fn parse_list_entries_unix_file() {

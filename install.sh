@@ -49,6 +49,7 @@ Options:
   --uninstall         Remove the installed binary and default theme
   --print-target      Print the detected package target and exit
   --dry-run           Show what would be installed, then exit
+  --self-test         Check archive path and checksum handling, then exit
   -h, --help          Show this help
 
 Environment:
@@ -217,6 +218,47 @@ verify_checksum() {
   info "checksum ok"
 }
 
+# True when a tar member is absolute or has ".." as its own path component.
+# "foo..bar" is a normal name. GNU tar strips some of these on extract; other
+# tar implementations do not, so the archive is rejected before extract.
+archive_member_is_unsafe() {
+  local member="$1"
+  local part rest
+  case "$member" in
+    /* | [A-Za-z]:* | \\*) return 0 ;;
+  esac
+  rest="$member"
+  while [[ -n "$rest" ]]; do
+    part="${rest%%/*}"
+    if [[ "$part" == ".." ]]; then
+      return 0
+    fi
+    if [[ "$rest" == */* ]]; then
+      rest="${rest#*/}"
+    else
+      break
+    fi
+  done
+  return 1
+}
+
+reject_unsafe_archive_members() {
+  local archive="$1"
+  local member listing
+  listing="$(tar -tzf "$archive" 2>/dev/null)" || {
+    printf 'Error: could not list members of %s\n' "$(basename "$archive")" >&2
+    return 1
+  }
+  while IFS= read -r member || [[ -n "$member" ]]; do
+    [[ -n "$member" ]] || continue
+    if archive_member_is_unsafe "$member"; then
+      printf 'Error: refusing archive member %s\n' "$member" >&2
+      return 1
+    fi
+  done <<<"$listing"
+  return 0
+}
+
 install_file() {
   local src="$1"
   local dest="$2"
@@ -292,6 +334,7 @@ do_uninstall() {
 extract_package() {
   local archive="$1"
   local dest="$2"
+  reject_unsafe_archive_members "$archive" || return 1
   mkdir -p "$dest"
   tar -xzf "$archive" -C "$dest"
 }
@@ -347,14 +390,16 @@ install_from_release() {
   fi
 
   sums_url="$(checksums_url "$version")"
-  if download_optional "$sums_url" "${tmp}/SHA256SUMS"; then
-    verify_checksum "$archive" "${tmp}/SHA256SUMS"
-  else
-    warn "SHA256SUMS not found; skipping checksum verification"
-  fi
+  # Checksums are published with every release. A missing file is a failed
+  # download, not a reason to unpack an unverified archive. DD_FTP_PACKAGE_URL
+  # can replace the archive URL; the sums still come from REPO.
+  download_optional "$sums_url" "${tmp}/SHA256SUMS" \
+    || fail "could not download SHA256SUMS from ${sums_url}; refusing to install an unverified package"
+  verify_checksum "$archive" "${tmp}/SHA256SUMS"
 
   extracted="${tmp}/pkg"
-  extract_package "$archive" "$extracted"
+  extract_package "$archive" "$extracted" \
+    || fail "refusing to extract $(basename "$archive")"
   src_bin="$(find_extracted_bin "$extracted" "$(detect_os)")" \
     || fail "package did not contain a dd_ftp binary"
 
@@ -414,6 +459,84 @@ install_from_source() {
   build_and_install_from "${workdir}/src"
 }
 
+run_self_test() {
+  local work hash name bad
+  have python3 || fail "self-test requires python3"
+  have tar || fail "self-test requires tar"
+  file_sha256 /dev/null >/dev/null || fail "self-test requires sha256sum or shasum"
+
+  work="$(mktemp -d)"
+  CLEANUP_PATHS+=("$work")
+
+  python3 - "$work" <<'PY'
+import io, os, sys, tarfile
+
+work = sys.argv[1]
+
+def write(path, members):
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in members:
+            info = tarfile.TarInfo(name)
+            raw = data.encode()
+            info.size = len(raw)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(raw))
+
+write(os.path.join(work, "traversal.tar.gz"), [("../escaped", "nope")])
+write(os.path.join(work, "absolute.tar.gz"), [("/tmp/dd_ftp_should_not_exist", "nope")])
+write(os.path.join(work, "nested.tar.gz"), [("pkg/../../escaped", "nope")])
+write(
+    os.path.join(work, "good.tar.gz"),
+    [
+        ("dd_ftp", "#!/bin/sh\n"),
+        ("dd_ftp_theme.yml", "ok\n"),
+        ("foo..bar", "ok\n"),
+    ],
+)
+PY
+
+  for bad in traversal absolute nested; do
+    if reject_unsafe_archive_members "${work}/${bad}.tar.gz" 2>/dev/null; then
+      fail "self-test: ${bad} archive was accepted"
+    fi
+  done
+
+  mkdir -p "${work}/dest"
+  if extract_package "${work}/traversal.tar.gz" "${work}/dest" 2>/dev/null; then
+    fail "self-test: traversal archive was extracted"
+  fi
+  [[ ! -e "${work}/escaped" && ! -e "${work}/dest/escaped" ]] \
+    || fail "self-test: traversal member was written"
+  [[ ! -e /tmp/dd_ftp_should_not_exist ]] \
+    || fail "self-test: absolute member was written"
+
+  name="dd_ftp-self-test.tar.gz"
+  cp "${work}/good.tar.gz" "${work}/${name}"
+  hash="$(file_sha256 "${work}/${name}")"
+  printf '%s  %s\n' "$hash" "$name" >"${work}/SHA256SUMS"
+  verify_checksum "${work}/${name}" "${work}/SHA256SUMS"
+  printf '%s *%s\n' "$hash" "$name" >"${work}/SHA256SUMS"
+  verify_checksum "${work}/${name}" "${work}/SHA256SUMS"
+  extract_package "${work}/${name}" "${work}/good-out"
+  [[ -f "${work}/good-out/dd_ftp" ]] || fail "self-test: dd_ftp was not extracted"
+  [[ -f "${work}/good-out/foo..bar" ]] || fail "self-test: a name containing '..' as text was rejected"
+  [[ -f "${work}/good-out/dd_ftp_theme.yml" ]] || fail "self-test: theme was not extracted"
+
+  printf '0000000000000000000000000000000000000000000000000000000000000000  %s\n' "$name" \
+    >"${work}/badsums"
+  if ( trap - EXIT; verify_checksum "${work}/${name}" "${work}/badsums" ) 2>/dev/null; then
+    fail "self-test: checksum mismatch was accepted"
+  fi
+
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  other.tar.gz\n' \
+    >"${work}/nosuch"
+  if ( trap - EXIT; verify_checksum "${work}/${name}" "${work}/nosuch" ) 2>/dev/null; then
+    fail "self-test: archive with no checksum entry was accepted"
+  fi
+
+  info "self-test ok"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from-release) FROM_RELEASE=1; shift ;;
@@ -421,6 +544,10 @@ while [[ $# -gt 0 ]]; do
     --uninstall | -uninstall) UNINSTALL=1; shift ;;
     --print-target) PRINT_TARGET=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --self-test)
+      run_self_test
+      exit 0
+      ;;
     --version)
       VERSION="${2:-}"
       [[ -n "$VERSION" ]] || fail "--version requires a tag"

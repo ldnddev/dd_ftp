@@ -33,7 +33,10 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 # protocol backends (reserved for implementation)
 ssh2 = "0.9"
-async_ftp = { version = "6", features = ["secure"] }
+# Vendored so PASV cannot redirect the data connection and so a CR/LF
+# inside a command argument cannot inject a second FTP command.
+# See third_party/async_ftp/PATCHES.md.
+async_ftp = { path = "third_party/async_ftp", features = ["secure"] }
 tokio-rustls = "0.23"
 webpki-roots = "0.22"
 

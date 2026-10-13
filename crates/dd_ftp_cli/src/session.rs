@@ -580,6 +580,18 @@ pub(crate) fn request_fs(app: &mut AppState, runtime: &mut Runtime, kind: FsKind
     runtime.request_fs(app, kind, path);
 }
 
+fn connected_status(info: &ConnectionInfo, cwd: &str) -> String {
+    let via = match info.protocol {
+        Protocol::Ftp => "FTP (unencrypted)",
+        Protocol::Ftps => "FTPS",
+        Protocol::Sftp => "SFTP",
+    };
+    format!(
+        "Connected via {via} to {} as {} (cwd: {cwd})",
+        info.host, info.username
+    )
+}
+
 pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: IoMessage) {
     match msg {
         IoMessage::ConnectDone { generation, result } => {
@@ -610,10 +622,7 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                     app.active_connection = Some(info.clone());
                     reduce(
                         app,
-                        Action::SetStatus(format!(
-                            "Connected via {:?} to {} as {} (cwd: {})",
-                            info.protocol, info.host, info.username, app.remote_cwd
-                        )),
+                        Action::SetStatus(connected_status(&info, &app.remote_cwd)),
                     );
                 }
                 Ok(ConnectOk::Ftp {
@@ -633,10 +642,7 @@ pub(crate) fn handle_io_message(app: &mut AppState, runtime: &mut Runtime, msg: 
                     app.active_connection = Some(info.clone());
                     reduce(
                         app,
-                        Action::SetStatus(format!(
-                            "Connected via {:?} to {} as {} (cwd: {})",
-                            info.protocol, info.host, info.username, app.remote_cwd
-                        )),
+                        Action::SetStatus(connected_status(&info, &app.remote_cwd)),
                     );
                 }
                 Err(err) => {

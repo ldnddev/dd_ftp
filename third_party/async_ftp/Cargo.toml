@@ -1,0 +1,31 @@
+[package]
+name = "async_ftp"
+version = "6.0.0"
+authors = ["Daniel García <dani-garcia@users.noreply.github.com>", "Matt McCoy <mattnenterprise@yahoo.com>"]
+documentation = "https://docs.rs/async_ftp/"
+repository = "https://github.com/dani-garcia/rust_async_ftp"
+description = "FTP client for Rust"
+readme = "README.md"
+license = "Apache-2.0/MIT"
+edition = "2018"
+keywords = ["ftp"]
+categories = ["network-programming"]
+
+[features]
+# default = ["secure"]
+
+# Enable support of FTPS which requires openssl
+secure = ["tokio-rustls"]
+
+# Add debug output (to STDOUT) of commands sent to the server
+# and lines read from the server
+debug_print = []
+
+[dependencies]
+lazy_static = "1.4.0"
+regex = "1.3.9"
+chrono = "0.4.11"
+
+tokio = { version = "1.0.1", features = ["net", "io-util"] }
+tokio-rustls = { version = "0.23.0", optional = true }
+pin-project = "1.0.0"

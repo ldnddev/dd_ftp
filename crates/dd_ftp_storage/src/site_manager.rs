@@ -46,7 +46,7 @@ impl SiteManager {
     pub fn save_to_default_path(config: &SiteConfig) -> Result<()> {
         let path = Self::default_config_path();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::persist::ensure_private_dir(parent)?;
         }
 
         // Never persist plaintext passwords in sites.toml.
@@ -56,7 +56,29 @@ impl SiteManager {
         }
 
         let content = Self::save_to_toml(&sanitized)?;
-        fs::write(path, content)?;
+        crate::persist::write_private(&path, &content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dd_ftp_core::Protocol;
+
+    #[test]
+    fn save_to_toml_omits_password_even_if_the_caller_left_it_set() {
+        let site = ConnectionInfo {
+            protocol: Protocol::Ftp,
+            password: Some("s3cret-value".into()),
+            ..ConnectionInfo::default()
+        };
+        let cfg = SiteConfig {
+            sites: vec![site],
+            default_site: None,
+        };
+        let text = SiteManager::save_to_toml(&cfg).unwrap();
+        assert!(!text.contains("s3cret-value"));
+        assert!(!text.contains("password"));
     }
 }

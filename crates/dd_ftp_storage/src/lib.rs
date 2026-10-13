@@ -1,4 +1,6 @@
 pub mod app_config;
+mod persist;
+
 pub mod secrets;
 pub mod site_manager;
 

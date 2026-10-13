@@ -53,7 +53,7 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, self.to_toml()?)?;
+        crate::persist::write_private(&path, &self.to_toml()?)?;
         Ok(path)
     }
 

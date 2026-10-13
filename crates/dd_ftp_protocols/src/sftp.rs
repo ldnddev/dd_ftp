@@ -1,5 +1,5 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -13,7 +13,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, ProgressCb, RemoteSession, TransferJob};
+use dd_ftp_core::{
+    create_no_follow, create_private_new, open_append_no_follow, ConnectionInfo, EntryKind,
+    FileEntry, ProgressCb, RemoteSession, TransferJob,
+};
 use ssh2::{CheckResult, FileStat, HashType, HostKeyType, KnownHostFileKind, Session};
 use uuid::Uuid;
 
@@ -159,17 +162,18 @@ pub fn append_known_host(
 
     if let Some(parent) = file.parent() {
         if !parent.as_os_str().is_empty() {
+            let created_parent = !parent.exists();
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
+            if created_parent {
+                tighten_dir_0700(parent)?;
+            }
         }
     }
     if !file.exists() {
         create_known_hosts_0600(file)?;
     }
-    let mut out = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file)
+    let mut out = open_append_no_follow(file)
         .with_context(|| format!("cannot append {}", file.display()))?;
     out.write_all(line.as_bytes())?;
     if !line.ends_with('\n') {
@@ -179,15 +183,25 @@ pub fn append_known_host(
 }
 
 fn create_known_hosts_0600(file: &Path) -> Result<()> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true);
+    create_private_new(file).with_context(|| format!("cannot create {}", file.display()))?;
+    Ok(())
+}
+
+fn tighten_dir_0700(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir)
+            .with_context(|| format!("cannot stat {}", dir.display()))?
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir, perms)
+            .with_context(|| format!("cannot set permissions on {}", dir.display()))?;
     }
-    opts.open(file)
-        .with_context(|| format!("cannot create {}", file.display()))?;
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
     Ok(())
 }
 
@@ -415,6 +429,29 @@ impl SftpSession {
             .with_context(|| format!("failed to create remote directory: {path}"))
     }
 
+    fn create_empty_file_sync(session: &Session, path: &str) -> Result<()> {
+        let sftp = session
+            .sftp()
+            .context("failed to initialize sftp subsystem")?;
+        // Opening with create truncates or creates the remote file, then the
+        // handle is dropped so the file stays empty. No local temp file.
+        let _remote = sftp
+            .create(Path::new(path))
+            .with_context(|| format!("failed to create remote file: {path}"))?;
+        Ok(())
+    }
+
+    pub async fn create_empty_file(&self, path: &str) -> Result<()> {
+        let inner = self.inner.clone().context("not connected")?;
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let session = lock_session(&inner)?;
+            Self::create_empty_file_sync(&session, &path)
+        })
+        .await
+        .map_err(|e| anyhow!("join error during create_empty_file: {e}"))?
+    }
+
     fn set_permissions_sync(session: &Session, path: &str, mode: u32) -> Result<()> {
         let sftp = session
             .sftp()
@@ -499,7 +536,7 @@ impl SftpSession {
                 .with_context(|| format!("cannot create local parent dir: {}", parent.display()))?;
         }
 
-        let mut local_file = File::create(&local_path)
+        let mut local_file = create_no_follow(&local_path)
             .with_context(|| format!("cannot create local file: {}", local_path.display()))?;
 
         let mut transferred = 0_u64;

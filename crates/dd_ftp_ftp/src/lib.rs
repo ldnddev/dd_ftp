@@ -14,8 +14,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use dd_ftp_core::{
-    ConnectionInfo, CoreError, EntryKind, FileEntry, ProgressCb, Protocol, RemoteSession,
-    TransferJob,
+    create_no_follow, ConnectionInfo, CoreError, EntryKind, FileEntry, ProgressCb, Protocol,
+    RemoteSession, TransferJob,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_rustls::rustls::{client::ServerName, ClientConfig, OwnedTrustAnchor, RootCertStore};
@@ -204,6 +204,18 @@ impl UnifiedFtpSession {
             .with_context(|| format!("FTP create directory failed: {path}"))
     }
 
+    /// Create an empty remote file. The bytes come from an empty reader, not a
+    /// path under the system temp directory.
+    pub async fn create_empty_file(&mut self, path: &str) -> Result<()> {
+        let stream = self.stream.as_mut().context("not connected")?;
+        cwd_parent(stream, path).await;
+        let name = file_name_of(path);
+        stream
+            .put(&name, &mut tokio::io::empty())
+            .await
+            .with_context(|| format!("FTP create file failed: {path}"))
+    }
+
     pub async fn upload(&mut self, job: &TransferJob) -> Result<()> {
         self.upload_with_progress(job, Arc::new(AtomicBool::new(false)), |_id, _tx, _size| {})
             .await
@@ -284,9 +296,9 @@ impl UnifiedFtpSession {
                             format!("Cannot create local parent dir: {}", parent.display())
                         })?;
                     }
-                    let mut file = tokio::fs::File::create(&local_path)
-                        .await
+                    let file = create_no_follow(std::path::Path::new(&local_path))
                         .with_context(|| format!("Cannot write local file: {local_path}"))?;
+                    let mut file = tokio::fs::File::from_std(file);
                     copy_with_progress(
                         &mut reader,
                         &mut file,
@@ -366,7 +378,11 @@ impl RemoteSession for UnifiedFtpSession {
 }
 
 async fn cwd_to_remote_parent(stream: &mut async_ftp::FtpStream, job: &TransferJob) {
-    let remote_path = std::path::Path::new(&job.remote_path);
+    cwd_parent(stream, &job.remote_path).await;
+}
+
+async fn cwd_parent(stream: &mut async_ftp::FtpStream, remote_path: &str) {
+    let remote_path = std::path::Path::new(remote_path);
     if let Some(parent) = remote_path.parent() {
         if parent.as_os_str() != "" {
             stream.cwd(parent.to_string_lossy().as_ref()).await.ok();
@@ -374,12 +390,15 @@ async fn cwd_to_remote_parent(stream: &mut async_ftp::FtpStream, job: &TransferJ
     }
 }
 
-fn remote_name_from_job(job: &TransferJob) -> String {
-    let remote_path = std::path::Path::new(&job.remote_path);
-    remote_path
+fn file_name_of(remote_path: &str) -> String {
+    std::path::Path::new(remote_path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| job.remote_path.clone())
+        .unwrap_or_else(|| remote_path.to_string())
+}
+
+fn remote_name_from_job(job: &TransferJob) -> String {
+    file_name_of(&job.remote_path)
 }
 
 async fn transfer_size(

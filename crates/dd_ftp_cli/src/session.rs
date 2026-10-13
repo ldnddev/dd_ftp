@@ -1147,15 +1147,13 @@ pub(crate) fn begin_edit_download(app: &mut AppState, runtime: &mut Runtime) {
     let Some(edit) = runtime.edit_session.clone() else {
         return;
     };
-    if let Some(parent) = edit.local_path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            runtime.edit_session = None;
-            reduce(
-                app,
-                Action::ShowError(format!("Cannot create edit cache: {err}")),
-            );
-            return;
-        }
+    if let Err(err) = crate::edit::prepare_edit_cache(&edit.local_path) {
+        runtime.edit_session = None;
+        reduce(
+            app,
+            Action::ShowError(format!("Cannot create edit cache: {err}")),
+        );
+        return;
     }
     reduce(
         app,
@@ -1183,6 +1181,13 @@ pub(crate) fn on_edit_download_complete(app: &mut AppState, runtime: &mut Runtim
     let Some(edit) = runtime.edit_session.as_mut() else {
         return;
     };
+    if let Err(err) = crate::edit::tighten_edit_file(&edit.local_path) {
+        reduce(
+            app,
+            Action::ShowError(format!("Cannot protect edit cache: {err}")),
+        );
+        return;
+    }
     edit.fingerprint = crate::edit::fingerprint(&edit.local_path);
     if crate::edit::looks_binary(&edit.local_path) {
         reduce(
@@ -2162,6 +2167,7 @@ pub(crate) fn start_scan_entries(
 /// Local recursive walk. Reads only; never creates destination directories.
 pub(crate) fn walk_local_files(root: &Path, remote_root: &str) -> anyhow::Result<Vec<PendingFile>> {
     let mut out = Vec::new();
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut stack = vec![(root.to_path_buf(), remote_root.to_string())];
     while let Some((local_dir, remote_dir)) = stack.pop() {
         let rd = match std::fs::read_dir(&local_dir) {
@@ -2180,11 +2186,13 @@ pub(crate) fn walk_local_files(root: &Path, remote_root: &str) -> anyhow::Result
             };
             let ft = meta.file_type();
             if ft.is_symlink() {
-                // Do not follow directory symlinks (cycles / escape). Skip them.
-                if std::fs::metadata(entry.path())
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false)
-                {
+                // Follow a file symlink only when its target stays inside this
+                // walk. Directory links and links that leave the tree are skipped
+                // so a planted symlink cannot upload or recurse outside the folder.
+                let Ok(target) = std::fs::canonicalize(entry.path()) else {
+                    continue;
+                };
+                if !target.starts_with(&root_canon) || target.is_dir() {
                     continue;
                 }
             }
@@ -2715,6 +2723,41 @@ mod scan_tests {
             .collect();
         assert_eq!(names, vec!["ok.txt".to_string()]);
         assert!(!files.iter().any(|f| f.local_path.contains("/loop/")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_local_skips_file_symlinks_that_leave_the_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "dd_ftp_walk_file_link_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let tree = root.join("tree");
+        std::fs::create_dir_all(&tree).expect("tree");
+        std::fs::write(root.join("secret.txt"), b"secret").expect("secret");
+        std::fs::write(tree.join("ok.txt"), b"ok").expect("ok");
+        std::os::unix::fs::symlink(root.join("secret.txt"), tree.join("leak")).expect("leak");
+        std::os::unix::fs::symlink(tree.join("ok.txt"), tree.join("inside")).expect("inside");
+
+        let files = walk_local_files(&tree, "/pub").expect("walk");
+        let names: Vec<_> = files
+            .iter()
+            .map(|f| {
+                Path::new(&f.local_path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(names.iter().any(|n| n == "ok.txt"));
+        assert!(names.iter().any(|n| n == "inside"));
+        assert!(!names.iter().any(|n| n == "leak"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

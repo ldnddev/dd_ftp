@@ -34,6 +34,16 @@ impl SecretStore {
             .collect()
     }
 
+    // v4: hex of the normalized user and host, so `@` and `_` do not collapse
+    // onto the same keyring entry and send one account's password to another.
+    fn password_key_v4(username: &str, host: &str, port: u16) -> String {
+        format!(
+            "ddftp4-{}-{}-{port}",
+            encode_component(&Self::normalize_user(username)),
+            encode_component(&Self::normalize_host(host))
+        )
+    }
+
     // v3 (stable): independent from editable bookmark label/name and avoids special delimiters.
     fn password_key(username: &str, host: &str, port: u16) -> String {
         let u = Self::sanitize_component(username);
@@ -52,6 +62,7 @@ impl SecretStore {
         let host_norm = Self::normalize_host(host);
 
         let mut keys = vec![
+            Self::password_key_v4(&user, &host_raw, port),
             // v3 key format
             Self::password_key(&user, &host_raw, port),
             Self::password_key(&user, &host_norm, port),
@@ -157,5 +168,36 @@ impl SecretStore {
 
         let _ = probe.delete_credential();
         Ok(())
+    }
+}
+
+fn encode_component(input: &str) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(input.len() * 2);
+    for byte in input.as_bytes() {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distinct_usernames_do_not_share_a_key() {
+        let email = SecretStore::primary_key_for("site", "alice@ex.com", "files.example", 21);
+        let underscore = SecretStore::primary_key_for("site", "alice_ex.com", "files.example", 21);
+        assert_ne!(email, underscore);
+        assert!(email.starts_with("ddftp4-"));
+        assert!(underscore.starts_with("ddftp4-"));
+    }
+
+    #[test]
+    fn host_case_folds_into_one_key() {
+        let upper = SecretStore::primary_key_for("site", "alice", "Files.Example", 21);
+        let lower = SecretStore::primary_key_for("site", "alice", "files.example", 21);
+        assert_eq!(upper, lower);
     }
 }

@@ -1006,6 +1006,9 @@ pub(crate) fn connection_info_from_env() -> ConnectionInfo {
         .unwrap_or(22);
     let username = std::env::var("DD_FTP_USER").unwrap_or_else(|_| "user".to_string());
     let password = std::env::var("DD_FTP_PASS").ok();
+    // The editor and any other child inherit this process environment.
+    // Drop the password after copying it into the connection.
+    std::env::remove_var("DD_FTP_PASS");
     let private_key = std::env::var("DD_FTP_KEY").ok();
     let initial_path = std::env::var("DD_FTP_PATH").unwrap_or_else(|_| "/".to_string());
 

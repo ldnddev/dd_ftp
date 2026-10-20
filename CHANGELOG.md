@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.1] - 2026-10-19
+
+### Fixed
+- Downloads refuse a symlink at the destination, and creating a remote file no longer uses a predictable path under the system temp directory. Folder upload skips file symlinks that point outside the folder. The edit cache is private to your user, and a newly created `~/.ssh` is mode `0700`.
+- FTP data connections stay on the server you connected to. A command argument with a newline or NUL is rejected. A plain FTP session says it is unencrypted in the status line.
+- Passwords are left out of debug output and out of saved config. `sites.toml` and the app config are mode `0600`, and `DD_FTP_PASS` is removed from this process after startup. Keyring names no longer treat `@` and `_` as the same character.
+- The installer stops when `SHA256SUMS` cannot be downloaded, and it refuses an archive member that is absolute or contains `..`.
+
 ## [1.8.0] - 2026-10-11
 
 ### Changed

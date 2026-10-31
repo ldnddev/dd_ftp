@@ -78,6 +78,12 @@ async fn main() -> Result<()> {
     }
 
     let theme_loaded = dd_ftp_ui::reload_theme();
+    if matches!(
+        theme_loaded.theme.omarchy,
+        Some(ldnddev_theme::OmarchyChoice::Follow)
+    ) {
+        app.follow_stamp = ldnddev_theme::follow_stamp(&app.omarchy_paths);
+    }
     reduce(
         &mut app,
         Action::SetStatus(format!("Theme loaded: {}", theme_loaded.source.label())),
@@ -309,6 +315,10 @@ fn handle_terminal_event(
             Ok((LoopControl::Continue, draw))
         }
         Event::Resize(_, _) => Ok((LoopControl::Continue, true)),
+        Event::FocusGained => Ok((
+            LoopControl::Continue,
+            dd_ftp_ui::refresh_followed_theme(app),
+        )),
         _ => Ok((LoopControl::Continue, false)),
     }
 }

@@ -5,6 +5,66 @@ use crate::{
 };
 use dd_ftp_core::{FileEntry, Protocol};
 
+/// Footer status stays for live progress. Results the user can miss there
+/// also become a toast. Focus changes and the startup theme line do not.
+fn status_toast_level(msg: &str) -> Option<crate::ToastLevel> {
+    let s = msg.to_ascii_lowercase();
+    if s.is_empty()
+        || s.starts_with("focus:")
+        || s.starts_with("theme loaded")
+        || s.starts_with("listing ")
+        || s.starts_with("uploading")
+        || s.starts_with("downloading")
+        || s.starts_with("queue:")
+        || s.starts_with("connecting")
+        || s.starts_with("transfer active")
+        || s.starts_with("bookmark:")
+    {
+        return None;
+    }
+    // Absence and rejection, including "no failed ...", before the fail check.
+    if s.starts_with("no ")
+        || s.contains("not connected")
+        || s.contains("nothing")
+        || s.contains("cannot")
+        || s.contains("already")
+        || s.contains("not found")
+        || s.contains("not a ")
+    {
+        return Some(crate::ToastLevel::Warning);
+    }
+    if s.starts_with("requeued") || s.starts_with("cancel") {
+        return Some(crate::ToastLevel::Info);
+    }
+    if s.contains("removed") || s.contains("dismissed") || s.contains("cleared") {
+        return Some(crate::ToastLevel::Success);
+    }
+    if s.contains("fail") || s.contains("error") || s.contains("invalid") {
+        return Some(crate::ToastLevel::Error);
+    }
+    if s.contains("saved")
+        || s.contains("complete")
+        || s.contains("deleted")
+        || s.contains("updated")
+        || s == "disconnected"
+        || s.starts_with("loaded ")
+    {
+        return Some(crate::ToastLevel::Success);
+    }
+    if s.contains("connect") {
+        return None;
+    }
+    Some(crate::ToastLevel::Info)
+}
+
+fn set_status(state: &mut AppState, msg: impl Into<String>) {
+    let msg = msg.into();
+    if let Some(level) = status_toast_level(&msg) {
+        state.toast = Some(Toast::at(level, msg.clone()));
+    }
+    state.status = msg;
+}
+
 fn resolve_select(
     current: usize,
     visible: &[&FileEntry],
@@ -114,19 +174,15 @@ fn preserve_filter_selection(
 pub fn reduce(state: &mut AppState, action: Action) {
     match action {
         Action::Connect(info) => {
-            state.status = format!("Connecting to {}...", info.host);
+            set_status(state, format!("Connecting to {}...", info.host));
         }
         Action::Disconnect => {
             state.connected = false;
-            state.status = "Disconnected".to_string();
+            set_status(state, "Disconnected");
         }
         Action::SetConnected(value) => {
             state.connected = value;
-            state.status = if value {
-                "Connected".to_string()
-            } else {
-                "Disconnected".to_string()
-            };
+            set_status(state, if value { "Connected" } else { "Disconnected" });
         }
         Action::SetLocalEntries { entries, select } => {
             let previous_name = state.selected_local_entry().map(|e| e.name.clone());
@@ -178,9 +234,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             if !state.bookmarks.is_empty() {
                 state.selected_bookmark = (state.selected_bookmark + 1) % state.bookmarks.len();
                 let bm = &state.bookmarks[state.selected_bookmark];
-                state.status = format!("Bookmark: {} ({})", bm.name, bm.host);
+                let label = format!("Bookmark: {} ({})", bm.name, bm.host);
+                set_status(state, label);
             } else {
-                state.status = "No bookmarks saved".to_string();
+                set_status(state, "No bookmarks saved");
             }
         }
         Action::SelectPrevBookmark => {
@@ -191,9 +248,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
                     state.selected_bookmark -= 1;
                 }
                 let bm = &state.bookmarks[state.selected_bookmark];
-                state.status = format!("Bookmark: {} ({})", bm.name, bm.host);
+                let label = format!("Bookmark: {} ({})", bm.name, bm.host);
+                set_status(state, label);
             } else {
-                state.status = "No bookmarks saved".to_string();
+                set_status(state, "No bookmarks saved");
             }
         }
         Action::ToggleQuickConnect => {
@@ -343,51 +401,63 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.quick_connect = info;
             state.quick_connect_field = QuickConnectField::Name;
             state.qc_hydrate();
-            state.status = "Loaded bookmark into quick connect".to_string();
+            set_status(state, "Loaded bookmark into quick connect");
         }
         Action::QueueTransfer(job) => {
             let keep = state.selected_queue_job().map(|j| j.id);
             state.worker_cancel_requested = false;
             state.queue.enqueue(job);
-            state.status = format!("Queue: {} pending", state.queue.pending.len());
+            set_status(
+                state,
+                format!("Queue: {} pending", state.queue.pending.len()),
+            );
             preserve_queue_selection(state, keep);
         }
         Action::StartNextTransfer => {
             let keep = state.selected_queue_job().map(|j| j.id);
             if let Some(job) = state.queue.start_next() {
-                state.status = format!("Transfer active: {}", job.id);
+                set_status(state, format!("Transfer active: {}", job.id));
             } else {
-                state.status = "Queue is empty".to_string();
+                set_status(state, "Queue is empty");
             }
             preserve_queue_selection(state, keep);
         }
         Action::MarkTransferCompleted(job) => {
             let keep = state.selected_queue_job().map(|j| j.id);
             state.queue.mark_completed(job);
-            state.status = format!(
-                "Transfer complete. Pending: {} Active: {}",
-                state.queue.pending.len(),
-                state.queue.active.len()
+            set_status(
+                state,
+                format!(
+                    "Transfer complete. Pending: {} Active: {}",
+                    state.queue.pending.len(),
+                    state.queue.active.len()
+                ),
             );
             preserve_queue_selection(state, keep);
         }
         Action::MarkTransferFailed(job) => {
             let keep = state.selected_queue_job().map(|j| j.id);
             state.queue.mark_failed(job);
-            state.status = format!(
-                "Transfer failed. Pending: {} Active: {}",
-                state.queue.pending.len(),
-                state.queue.active.len()
+            set_status(
+                state,
+                format!(
+                    "Transfer failed. Pending: {} Active: {}",
+                    state.queue.pending.len(),
+                    state.queue.active.len()
+                ),
             );
             preserve_queue_selection(state, keep);
         }
         Action::MarkTransferCancelled(job) => {
             let keep = state.selected_queue_job().map(|j| j.id);
             state.queue.mark_cancelled(job);
-            state.status = format!(
-                "Transfer cancelled. Pending: {} Active: {}",
-                state.queue.pending.len(),
-                state.queue.active.len()
+            set_status(
+                state,
+                format!(
+                    "Transfer cancelled. Pending: {} Active: {}",
+                    state.queue.pending.len(),
+                    state.queue.active.len()
+                ),
             );
             preserve_queue_selection(state, keep);
         }
@@ -395,46 +465,55 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.worker_cancel_requested = false;
             if let Some(job) = state.queue.retry_last_failed() {
                 let id = job.id;
-                state.status = format!(
-                    "Requeued last failed transfer. Pending: {}",
-                    state.queue.pending.len()
+                set_status(
+                    state,
+                    format!(
+                        "Requeued last failed transfer. Pending: {}",
+                        state.queue.pending.len()
+                    ),
                 );
                 preserve_queue_selection(state, Some(id));
             } else {
-                state.status = "No failed transfer to retry".to_string();
+                set_status(state, "No failed transfer to retry");
             }
         }
         Action::RetryFailed(id) => {
             state.worker_cancel_requested = false;
             if state.queue.retry_failed(id).is_some() {
-                state.status = format!(
-                    "Requeued failed transfer. Pending: {}",
-                    state.queue.pending.len()
+                set_status(
+                    state,
+                    format!(
+                        "Requeued failed transfer. Pending: {}",
+                        state.queue.pending.len()
+                    ),
                 );
                 preserve_queue_selection(state, Some(id));
             } else {
-                state.status = "No failed transfer to retry".to_string();
+                set_status(state, "No failed transfer to retry");
             }
         }
         Action::RetryAllFailed => {
             state.worker_cancel_requested = false;
             let n = state.queue.retry_all_failed();
             if n == 0 {
-                state.status = "No failed transfer to retry".to_string();
+                set_status(state, "No failed transfer to retry");
             } else {
-                state.status = format!(
-                    "Requeued {n} failed transfer(s). Pending: {}",
-                    state.queue.pending.len()
+                set_status(
+                    state,
+                    format!(
+                        "Requeued {n} failed transfer(s). Pending: {}",
+                        state.queue.pending.len()
+                    ),
                 );
             }
             preserve_queue_selection(state, None);
         }
         Action::RemoveQueueJob(id) => {
             if state.queue.remove_pending(id).is_some() {
-                state.status = "Removed pending transfer".to_string();
+                set_status(state, "Removed pending transfer");
                 preserve_queue_selection(state, None);
             } else if state.queue.dismiss_failed(id).is_some() {
-                state.status = "Dismissed failed transfer".to_string();
+                set_status(state, "Dismissed failed transfer");
                 preserve_queue_selection(state, None);
             }
         }
@@ -450,7 +529,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ClearPendingTransfers => {
             let keep = state.selected_queue_job().map(|j| j.id);
             let removed = state.queue.clear_pending();
-            state.status = format!("Cleared {removed} pending transfer(s)");
+            set_status(state, format!("Cleared {removed} pending transfer(s)"));
             preserve_queue_selection(state, keep);
         }
         Action::SetWorkerView {
@@ -463,7 +542,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.worker_cancel_requested = cancel_requested;
         }
         Action::SetStatus(msg) => {
-            state.status = msg;
+            set_status(state, msg);
         }
         Action::SetBusy(value) => {
             state.busy = value;
@@ -1832,6 +1911,53 @@ mod reduce_table_tests {
         reduce(&mut s, Action::ShowError("boom".into()));
         assert!(s.toast.is_some());
         assert!(s.status.contains("boom"));
+    }
+
+    #[test]
+    fn status_messages_pick_toast_levels() {
+        let cases = [
+            (
+                "Theme saved to /tmp/dd_ftp_theme.yml",
+                Some(crate::ToastLevel::Success),
+            ),
+            ("Theme loaded: global", None),
+            ("Not connected", Some(crate::ToastLevel::Warning)),
+            ("Connected", None),
+            (
+                "No failed transfer to retry",
+                Some(crate::ToastLevel::Warning),
+            ),
+            (
+                "Save bookmark failed: denied",
+                Some(crate::ToastLevel::Error),
+            ),
+            (
+                "Requeued last failed transfer. Pending: 1",
+                Some(crate::ToastLevel::Info),
+            ),
+            ("Listing /tmp", None),
+            ("Focus: Local", None),
+            (
+                "Dismissed failed transfer",
+                Some(crate::ToastLevel::Success),
+            ),
+        ];
+        for (msg, want) in cases {
+            let mut s = AppState::default();
+            reduce(&mut s, Action::SetStatus(msg.into()));
+            assert_eq!(s.toast.as_ref().map(|toast| toast.level), want, "{msg}");
+        }
+    }
+
+    #[test]
+    fn disconnect_toasts_success() {
+        let mut s = AppState::default();
+        reduce(&mut s, Action::Disconnect);
+        assert_eq!(s.status, "Disconnected");
+        assert_eq!(
+            s.toast.as_ref().map(|toast| toast.level),
+            Some(crate::ToastLevel::Success)
+        );
     }
 
     #[test]

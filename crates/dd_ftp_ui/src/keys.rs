@@ -44,7 +44,7 @@ pub const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "F2",
-        action: "Toggle live theme editor (opening closes help)",
+        action: "Omarchy themes (Enter apply, e edit, s save; opening closes help)",
         group: KeyGroup::Global,
     },
     KeyBinding {

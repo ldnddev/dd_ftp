@@ -143,11 +143,9 @@ fn main() -> Result<()> {
     reduce(&mut app, Action::ToggleCompare);
     idle_workers(&mut app);
 
-    let loaded = dd_ftp_ui::cached_theme();
-    app.theme_editor = Some(ldnddev_theme::ThemeEditor::new(
-        dd_ftp_ui::palette_from_theme(&loaded.theme, loaded.header_quotes.clone()),
-        dd_ftp_ui::extra_theme_fields(),
-    ));
+    app.omarchy_paths =
+        ldnddev_theme::OmarchyPaths::from_root(Path::new("/nonexistent/dd_ftp_omarchy"));
+    dd_ftp_ui::open_theme_ui(&mut app);
     reduce(&mut app, Action::ToggleThemeDebug);
     capture(
         &mut app,
@@ -156,7 +154,7 @@ fn main() -> Result<()> {
         "09-theme",
         "F2 live theme editor",
     )?;
-    app.theme_editor = None;
+    dd_ftp_ui::close_theme(&mut app, true);
     reduce(&mut app, Action::ToggleThemeDebug);
 
     reduce(&mut app, Action::ToggleSettings);

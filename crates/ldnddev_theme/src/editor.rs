@@ -125,6 +125,10 @@ impl ThemeEditor {
         self.editing_hex = false;
     }
 
+    fn mark_override(&mut self, key: &str) {
+        self.palette.overrides.insert(key.to_string());
+    }
+
     pub fn select(&mut self, selected: usize) {
         let last = self.fields.len().saturating_sub(1);
         self.selected = selected.min(last);
@@ -213,6 +217,7 @@ impl ThemeEditor {
             .unwrap_or(crate::rgb::Rgb::new(0, 0, 0));
         let next = current.nudge_channel(self.channel, delta);
         self.palette.set(key, next);
+        self.mark_override(key);
         self.hex_draft = next.to_hex();
         self.editing_hex = false;
         EditorOutcome::PaletteChanged
@@ -229,6 +234,7 @@ impl ThemeEditor {
                 Ok(rgb) => {
                     let key = self.selected_key();
                     self.palette.set(key, rgb);
+                    self.mark_override(key);
                     self.hex_draft = rgb.to_hex();
                     self.editing_hex = false;
                     EditorOutcome::PaletteChanged

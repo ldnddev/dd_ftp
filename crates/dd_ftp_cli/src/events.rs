@@ -157,30 +157,28 @@ pub(crate) fn handle_key(
     }
 
     if key.code == KeyCode::F(1) && (!app.any_modal_open() || app.show_help) {
+        if app.show_theme_debug && !app.show_help {
+            dd_ftp_ui::close_theme(app, true);
+        }
         reduce(app, Action::ToggleHelp);
         return Ok(LoopControl::Continue);
     }
 
     if key.code == KeyCode::F(2) && (!app.any_modal_open() || app.show_theme_debug) {
         if app.show_theme_debug {
-            if let Some(mut editor) = app.theme_editor.take() {
-                editor.revert();
-            }
-            reduce(app, Action::ToggleThemeDebug);
+            dd_ftp_ui::close_theme(app, true);
         } else {
-            let loaded = dd_ftp_ui::cached_theme();
-            app.theme_editor = Some(ldnddev_theme::ThemeEditor::new(
-                dd_ftp_ui::palette_from_theme(&loaded.theme, loaded.header_quotes.clone()),
-                dd_ftp_ui::extra_theme_fields(),
-            ));
-            let _ = dd_ftp_ui::reload_theme();
-            reduce(app, Action::ToggleThemeDebug);
+            dd_ftp_ui::open_theme_ui(app);
         }
+        reduce(app, Action::ToggleThemeDebug);
         return Ok(LoopControl::Continue);
     }
 
-    if app.show_theme_debug && app.theme_editor.is_some() && key.code != KeyCode::F(1) {
-        handle_ftp_theme_editor(app, key);
+    if app.show_theme_debug
+        && (app.theme_editor.is_some() || app.theme_picker.is_some())
+        && key.code != KeyCode::F(1)
+    {
+        handle_theme_overlay(app, key);
         return Ok(LoopControl::Continue);
     }
 
@@ -960,8 +958,7 @@ pub(crate) fn navigate_into_directory(app: &mut AppState, runtime: &mut Runtime)
 
             if let Some(entry) = app.selected_remote_entry().cloned() {
                 if entry.kind == dd_ftp_core::EntryKind::Directory {
-                    let next = match crate::paths::safe_remote_child(&app.remote_cwd, &entry.name)
-                    {
+                    let next = match crate::paths::safe_remote_child(&app.remote_cwd, &entry.name) {
                         Ok(p) => p,
                         Err(_) => {
                             reduce(app, Action::ShowError("path escapes directory".to_string()));
@@ -1253,11 +1250,62 @@ pub(crate) fn key_picker_go_parent(app: &mut AppState) {
     key_picker_load(app, parent, SelectPolicy::Reset, came_from);
 }
 
-fn handle_ftp_theme_editor(app: &mut AppState, key: KeyEvent) {
+fn handle_theme_overlay(app: &mut AppState, key: KeyEvent) {
     let Some(ek) = map_editor_key(key) else {
         return;
     };
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if app.theme_editor.is_some() {
+        dispatch_theme_editor(app, ek, shift);
+    } else {
+        dispatch_theme_picker(app, ek);
+    }
+}
+
+fn dispatch_theme_picker(app: &mut AppState, ek: ldnddev_theme::EditorKey) {
+    let outcome = {
+        let Some(picker) = app.theme_picker.as_mut() else {
+            return;
+        };
+        picker.handle(ek)
+    };
+    match outcome {
+        ldnddev_theme::PickerOutcome::Applied => {
+            if let Some(picker) = app.theme_picker.as_ref() {
+                let palette = picker.palette.clone();
+                dd_ftp_ui::apply_live_theme(&palette);
+            }
+        }
+        ldnddev_theme::PickerOutcome::EditColors => {
+            let Some(picker) = app.theme_picker.as_ref() else {
+                return;
+            };
+            let mut editor = ldnddev_theme::ThemeEditor::new(
+                picker.palette.clone(),
+                dd_ftp_ui::extra_theme_fields(),
+            );
+            editor.save_target = picker.save_target;
+            app.theme_editor = Some(editor);
+        }
+        ldnddev_theme::PickerOutcome::RequestSave => {
+            let saved = app
+                .theme_picker
+                .as_ref()
+                .map(|picker| (picker.palette.clone(), picker.save_target));
+            if let Some((palette, target)) = saved {
+                let fields = theme_fields(app);
+                save_theme_palette(app, &palette, target, &fields);
+            }
+        }
+        ldnddev_theme::PickerOutcome::Error(msg) => {
+            reduce(app, Action::ShowError(msg));
+        }
+        ldnddev_theme::PickerOutcome::Closed { .. } => dismiss_theme(app),
+        ldnddev_theme::PickerOutcome::None => {}
+    }
+}
+
+fn dispatch_theme_editor(app: &mut AppState, ek: ldnddev_theme::EditorKey, shift: bool) {
     let outcome = {
         let Some(editor) = app.theme_editor.as_mut() else {
             return;
@@ -1266,50 +1314,109 @@ fn handle_ftp_theme_editor(app: &mut AppState, key: KeyEvent) {
     };
     match outcome {
         ldnddev_theme::EditorOutcome::PaletteChanged => {
-            if let Some(editor) = &app.theme_editor {
-                dd_ftp_ui::apply_live_theme(&editor.palette);
+            let Some(editor) = app.theme_editor.as_ref() else {
+                return;
+            };
+            let palette = editor.palette.clone();
+            let target = editor.save_target;
+            if let Some(picker) = app.theme_picker.as_mut() {
+                picker.palette = palette.clone();
+                picker.save_target = target;
             }
+            dd_ftp_ui::apply_live_theme(&palette);
         }
         ldnddev_theme::EditorOutcome::RequestSave => {
-            if let Some(editor) = &app.theme_editor {
-                let root =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                match ldnddev_theme::save_theme(
-                    &editor.palette,
-                    &root,
-                    "dd_ftp_theme.yml",
+            let saved = app.theme_editor.as_ref().map(|editor| {
+                (
+                    editor.palette.clone(),
                     editor.save_target,
-                    ldnddev_theme::default_config_home().as_deref(),
-                    &editor.fields,
-                ) {
-                    Ok(path) => {
-                        dd_ftp_ui::apply_live_theme(&editor.palette);
-                        app.theme_editor = None;
-                        reduce(app, Action::ToggleThemeDebug);
-                        reduce(
-                            app,
-                            Action::SetStatus(format!("Theme saved to {}", path.display())),
-                        );
-                    }
-                    Err(err) => {
-                        reduce(
-                            app,
-                            Action::ShowError(format!("Could not save theme: {err}")),
-                        );
-                    }
-                }
+                    editor.fields.clone(),
+                )
+            });
+            if let Some((palette, target, fields)) = saved {
+                save_theme_palette(app, &palette, target, &fields);
             }
         }
         ldnddev_theme::EditorOutcome::Closed { .. } => {
-            if let Some(mut editor) = app.theme_editor.take() {
-                editor.revert();
-                dd_ftp_ui::apply_live_theme(&editor.palette);
+            if app.theme_picker.is_some() {
+                if let Some(editor) = app.theme_editor.take() {
+                    let palette = editor.palette.clone();
+                    let target = editor.save_target;
+                    if let Some(picker) = app.theme_picker.as_mut() {
+                        picker.palette = palette.clone();
+                        picker.save_target = target;
+                    }
+                    dd_ftp_ui::apply_live_theme(&palette);
+                }
+            } else {
+                dismiss_theme(app);
             }
+        }
+        ldnddev_theme::EditorOutcome::HexError(msg) => {
+            reduce(app, Action::ShowError(msg));
+        }
+        ldnddev_theme::EditorOutcome::None => {}
+    }
+}
+
+fn dismiss_theme(app: &mut AppState) {
+    dd_ftp_ui::close_theme(app, true);
+    if app.show_theme_debug {
+        reduce(app, Action::ToggleThemeDebug);
+    }
+}
+
+fn theme_fields(app: &AppState) -> Vec<ldnddev_theme::ColorField> {
+    if let Some(editor) = app.theme_editor.as_ref() {
+        return editor.fields.clone();
+    }
+    let mut fields = ldnddev_theme::COLOR_FIELDS.to_vec();
+    for extra in dd_ftp_ui::extra_theme_fields() {
+        if !fields.iter().any(|field| field.key == extra.key) {
+            fields.push(*extra);
+        }
+    }
+    fields
+}
+
+fn save_theme_palette(
+    app: &mut AppState,
+    palette: &ldnddev_theme::Palette,
+    target: ldnddev_theme::ThemeSaveTarget,
+    fields: &[ldnddev_theme::ColorField],
+) {
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match ldnddev_theme::save_theme(
+        palette,
+        &root,
+        "dd_ftp_theme.yml",
+        target,
+        ldnddev_theme::default_config_home().as_deref(),
+        fields,
+    ) {
+        Ok(path) => {
+            let source = match target {
+                ldnddev_theme::ThemeSaveTarget::Local => dd_ftp_ui::ThemeSource::Local,
+                ldnddev_theme::ThemeSaveTarget::Global => dd_ftp_ui::ThemeSource::Global,
+            };
+            dd_ftp_ui::apply_saved_theme(palette, source, path.clone());
+            app.follow_stamp = ldnddev_theme::follow_stamp(&app.omarchy_paths);
+            app.theme_editor = None;
+            app.theme_picker = None;
             if app.show_theme_debug {
                 reduce(app, Action::ToggleThemeDebug);
             }
+            reduce(
+                app,
+                Action::SetStatus(format!("Theme saved to {}", path.display())),
+            );
         }
-        ldnddev_theme::EditorOutcome::HexError(_) | ldnddev_theme::EditorOutcome::None => {}
+        Err(err) => {
+            reduce(
+                app,
+                Action::ShowError(format!("Could not save theme: {err}")),
+            );
+        }
     }
 }
 
@@ -1687,6 +1794,115 @@ fn jump_focused(app: &mut AppState, layout: &LayoutMap, jump: Jump) {
                 Jump::Page(dir) => offset_index(current, last, dir.saturating_mul(rows as i32)),
             };
             reduce(app, Action::SelectIndex { pane, index });
+        }
+    }
+}
+
+#[cfg(test)]
+mod theme_overlay_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ldnddev_theme::PickerRow;
+    use ratatui::style::Color;
+    use std::path::PathBuf;
+
+    struct RestoreTheme;
+
+    impl Drop for RestoreTheme {
+        fn drop(&mut self) {
+            let _ = dd_ftp_ui::reload_theme();
+        }
+    }
+
+    fn body_hex() -> String {
+        match dd_ftp_ui::cached_theme().theme.body_background {
+            Color::Rgb(r, g, b) => format!("#{r:02X}{g:02X}{b:02X}"),
+            _ => String::new(),
+        }
+    }
+
+    fn press(app: &mut AppState, code: KeyCode) {
+        let (mut runtime, _rx) = crate::session::test_runtime();
+        let layout = LayoutMap::default();
+        handle_key(
+            app,
+            &mut runtime,
+            KeyEvent::new(code, KeyModifiers::NONE),
+            &layout,
+        )
+        .expect("key");
+    }
+
+    #[test]
+    fn f2_lists_omarchy_themes_and_esc_reverts() {
+        let _restore = RestoreTheme;
+        let dir = std::env::temp_dir().join(format!(
+            "dd_ftp_omarchy_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _cleanup = scopeguard_dir(&dir);
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../ldnddev_theme/tests/fixtures/omarchy/tokyo-night/colors.toml");
+        std::fs::create_dir_all(dir.join("stock/tokyo-night")).expect("mkdir");
+        std::fs::copy(&src, dir.join("stock/tokyo-night/colors.toml")).expect("copy");
+        std::fs::create_dir_all(dir.join("state/theme")).expect("state");
+        std::fs::write(dir.join("state/theme.name"), "tokyo-night\n").expect("name");
+        std::fs::copy(&src, dir.join("state/theme/colors.toml")).expect("current");
+
+        dd_ftp_ui::apply_live_theme(&ldnddev_theme::Palette::builtin());
+        let mut app = AppState {
+            omarchy_paths: ldnddev_theme::OmarchyPaths::from_root(&dir),
+            ..Default::default()
+        };
+        let before = body_hex();
+
+        press(&mut app, KeyCode::F(2));
+        assert!(app.show_theme_debug);
+        assert!(app.theme_picker.is_some());
+        assert!(app.theme_editor.is_none());
+        let picker = app.theme_picker.as_ref().expect("picker");
+        assert!(matches!(
+            picker.rows.get(picker.selected),
+            Some(PickerRow::Custom)
+        ));
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(body_hex(), before);
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(body_hex(), "#1A1B26");
+
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.theme_editor.is_some());
+        assert!(app.theme_picker.is_some());
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.show_theme_debug);
+        assert!(app.theme_editor.is_none());
+        assert!(app.theme_picker.is_some());
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_theme_debug);
+        assert!(app.theme_picker.is_none());
+        assert!(app.theme_editor.is_none());
+        assert_eq!(body_hex(), before);
+    }
+
+    struct RmDir(PathBuf);
+
+    fn scopeguard_dir(path: &std::path::Path) -> RmDir {
+        std::fs::create_dir_all(path).expect("tmpdir");
+        RmDir(path.to_path_buf())
+    }
+
+    impl Drop for RmDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }

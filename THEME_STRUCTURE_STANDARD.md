@@ -64,6 +64,38 @@ colors:
   links: "#FFA087"
 ```
 
+`version` stays `1`. An optional Omarchy link does not bump the schema:
+
+```yaml
+version: 1
+omarchy: tokyo-night   # or: follow
+colors:
+  text_labels: "#ABCDEF"  # sparse overrides; other tokens may be omitted
+```
+
+`omarchy` is either a theme slug or `follow` (the desktop's current theme). When it is set, `colors` lists only the keys the user changed on top of that theme. Those keys may be omitted entirely. Apps read the Omarchy `colors.toml` files and map them. They do not shell out to `omarchy` and do not call `omarchy theme set` (that would retint the desktop).
+
+| token | Omarchy source |
+|---|---|
+| `base_background` | `darker_background` |
+| `body_background` | `background` |
+| `modal_background` | `dark_background` |
+| `selected_background`, `selection` | `selection` |
+| `text_primary` | `foreground`, repaired to 4.5:1 against the shell and the body |
+| `text_secondary` | `dark_foreground`, repaired to 3:1 |
+| `text_disabled` | `muted` |
+| `text_inverse` | `background` |
+| `text_labels`, `scrollbar` | `orange` |
+| `text_active_focus`, `modal_labels`, `modal_header`, `scrollbar_hover`, `input_border_focus` | `accent` |
+| `modal_text`, `input_text_default` | `foreground` |
+| `border_default`, `input_border_default` | `muted` |
+| `border_active` | `active_border_color`, otherwise `accent` |
+| `input_text_focus`, `cursor` | `bright_foreground` |
+| `success`, `warning`, `error`, `info` | `green`, `yellow`, `red`, `cyan` |
+| `folders`, `files`, `links` | `blue`, `yellow`, `cyan` |
+
+A missing `colors.toml` keeps the built-in palette.
+
 ---
 
 ## Required Mapping Rules

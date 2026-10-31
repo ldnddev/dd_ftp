@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.2] - 2026-10-31
+
+### Added
+- F2 opens the installed Omarchy themes. Enter applies one, e edits its colors, and a save stores the theme name so the app re-reads colors.toml.
+- Theme save, settings save, bookmark changes, transfer completion and failure, disconnect, and action rejections show a toast. Connecting, listing, and transfers in progress stay on the footer.
+
+### Changed
+- Toasts match the other ldnddev apps: a 60-column box above the footer, with the status color shifted until the text clears 4.5:1 on the modal background.
+
 ## [1.8.1] - 2026-10-19
 
 ### Fixed

@@ -1,6 +1,8 @@
 use ratatui::style::Color;
 use serde::Deserialize;
-use std::{fs, path::PathBuf, sync::RwLock};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::{fs, sync::RwLock};
 
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -32,6 +34,8 @@ pub struct Theme {
     pub folder: Color,
     pub file: Color,
     pub link: Color,
+    pub omarchy: Option<ldnddev_theme::OmarchyChoice>,
+    pub overrides: BTreeSet<String>,
 }
 
 impl Default for Theme {
@@ -68,6 +72,8 @@ impl Default for Theme {
             folder: Color::Rgb(0x64, 0xb4, 0xf5),
             file: Color::Rgb(0xff, 0xaf, 0x46),
             link: Color::Rgb(0xff, 0xa0, 0x87),
+            omarchy: None,
+            overrides: BTreeSet::new(),
         }
     }
 }
@@ -184,58 +190,35 @@ pub fn load_theme() -> Theme {
 }
 
 pub fn load_theme_with_source() -> LoadedTheme {
-    let candidates = [
-        (ThemeSource::Local, PathBuf::from("dd_ftp_theme.yml")),
-        (
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    load_resolved(&cwd, Some(&home), &ldnddev_theme::OmarchyPaths::system())
+}
+
+fn load_resolved(
+    project_root: &Path,
+    home: Option<&Path>,
+    omarchy: &ldnddev_theme::OmarchyPaths,
+) -> LoadedTheme {
+    let mut candidates = vec![(ThemeSource::Local, project_root.join("dd_ftp_theme.yml"))];
+    if let Some(home) = home {
+        candidates.push((
             ThemeSource::Global,
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".config/ldnddev/dd_ftp_theme.yml"),
-        ),
-    ];
+            home.join(".config/ldnddev/dd_ftp_theme.yml"),
+        ));
+    }
 
     for (source, path) in candidates {
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(theme_file) = parse_theme(&content) {
-                    let version = theme_file.version;
-                    let header_quotes = theme_file.header_quotes.clone().unwrap_or_default();
-                    let shown = path.display().to_string();
-                    return match version {
-                        Some(v) if v == THEME_SCHEMA_VERSION => LoadedTheme {
-                            theme: map_theme(theme_file),
-                            source,
-                            path: Some(path),
-                            version,
-                            warning: None,
-                            header_quotes,
-                        },
-                        Some(v) => LoadedTheme {
-                            // Unsupported schema version: fall back to defaults.
-                            theme: Theme::default(),
-                            source,
-                            path: Some(path),
-                            version,
-                            warning: Some(format!(
-                                "theme {shown}: unsupported version {v} (expected {THEME_SCHEMA_VERSION}); using built-in defaults"
-                            )),
-                            header_quotes,
-                        },
-                        None => LoadedTheme {
-                            // Missing version: load leniently but warn.
-                            theme: map_theme(theme_file),
-                            source,
-                            path: Some(path),
-                            version,
-                            warning: Some(format!(
-                                "theme {shown}: missing 'version: {THEME_SCHEMA_VERSION}' field; loaded anyway"
-                            )),
-                            header_quotes,
-                        },
-                    };
-                }
-            }
+        if !path.exists() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(loaded) = interpret_theme(&content, source, &path, omarchy) {
+            return loaded;
         }
     }
 
@@ -247,6 +230,124 @@ pub fn load_theme_with_source() -> LoadedTheme {
         warning: None,
         header_quotes: Vec::new(),
     }
+}
+
+fn interpret_theme(
+    content: &str,
+    source: ThemeSource,
+    path: &Path,
+    omarchy: &ldnddev_theme::OmarchyPaths,
+) -> Option<LoadedTheme> {
+    match ldnddev_theme::load_from_str(content, ldnddev_theme::ParseMode::Strict, to_ldnd(source)) {
+        Ok(palette) => Some(finish_palette(palette, source, path, omarchy, None)),
+        Err(err) => {
+            let msg = err.to_string();
+            if let Some(version) = unsupported_version(&msg) {
+                let shown = path.display();
+                return Some(LoadedTheme {
+                    theme: Theme::default(),
+                    source,
+                    path: Some(path.to_path_buf()),
+                    version: Some(version),
+                    warning: Some(format!(
+                        "theme {shown}: unsupported version {version} (expected {THEME_SCHEMA_VERSION}); using built-in defaults"
+                    )),
+                    header_quotes: probe_quotes(content),
+                });
+            }
+            let theme_file = parse_theme(content).ok()?;
+            let version = theme_file.version;
+            let header_quotes = theme_file.header_quotes.clone().unwrap_or_default();
+            let shown = path.display().to_string();
+            match version {
+                Some(v) if v == THEME_SCHEMA_VERSION => {
+                    let theme = map_theme(theme_file);
+                    let mut palette = palette_from_theme(&theme, header_quotes);
+                    palette.source = to_ldnd(source);
+                    palette.version = u64::from(v);
+                    Some(finish_palette(palette, source, path, omarchy, None))
+                }
+                Some(v) => Some(LoadedTheme {
+                    theme: Theme::default(),
+                    source,
+                    path: Some(path.to_path_buf()),
+                    version: Some(v),
+                    warning: Some(format!(
+                        "theme {shown}: unsupported version {v} (expected {THEME_SCHEMA_VERSION}); using built-in defaults"
+                    )),
+                    header_quotes,
+                }),
+                None => Some(LoadedTheme {
+                    theme: map_theme(theme_file),
+                    source,
+                    path: Some(path.to_path_buf()),
+                    version: None,
+                    warning: Some(format!(
+                        "theme {shown}: missing 'version: {THEME_SCHEMA_VERSION}' field; loaded anyway"
+                    )),
+                    header_quotes,
+                }),
+            }
+        }
+    }
+}
+
+fn finish_palette(
+    palette: ldnddev_theme::Palette,
+    source: ThemeSource,
+    path: &Path,
+    omarchy: &ldnddev_theme::OmarchyPaths,
+    warning: Option<String>,
+) -> LoadedTheme {
+    let quotes = palette.header_quotes.clone();
+    let version = u32::try_from(palette.version).ok();
+    match ldnddev_theme::apply_omarchy(&palette, omarchy) {
+        Ok(resolved) => LoadedTheme {
+            theme: theme_from_palette(&resolved),
+            source,
+            path: Some(path.to_path_buf()),
+            version,
+            warning,
+            header_quotes: resolved.header_quotes,
+        },
+        Err(err) => LoadedTheme {
+            theme: Theme::default(),
+            source: ThemeSource::Default,
+            path: Some(path.to_path_buf()),
+            version,
+            warning: Some(format!(
+                "omarchy theme failed ({err}); using built-in defaults"
+            )),
+            header_quotes: quotes,
+        },
+    }
+}
+
+fn to_ldnd(source: ThemeSource) -> ldnddev_theme::ThemeSource {
+    match source {
+        ThemeSource::Local => ldnddev_theme::ThemeSource::Local,
+        ThemeSource::Global => ldnddev_theme::ThemeSource::Global,
+        ThemeSource::Default => ldnddev_theme::ThemeSource::Default,
+    }
+}
+
+fn unsupported_version(msg: &str) -> Option<u32> {
+    let marker = "Unsupported theme schema version `";
+    let start = msg.find(marker)? + marker.len();
+    let rest = msg.get(start..)?;
+    let end = rest.find('`')?;
+    rest[..end].parse().ok()
+}
+
+fn probe_quotes(content: &str) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        header_quotes: Vec<String>,
+    }
+    serde_yaml::from_str::<Probe>(content)
+        .map(|probe| probe.header_quotes)
+        .unwrap_or_default()
 }
 
 fn parse_theme(content: &str) -> anyhow::Result<ThemeFile> {
@@ -391,6 +492,46 @@ fn map_theme(tf: ThemeFile) -> Theme {
             .as_deref()
             .and_then(parse_hex)
             .unwrap_or(Theme::default().link),
+        omarchy: None,
+        overrides: BTreeSet::new(),
+    }
+}
+
+fn theme_from_palette(palette: &ldnddev_theme::Palette) -> Theme {
+    let get = |key: &str| palette.get(key).map(rgb_to_color);
+    let fallback = Theme::default();
+    let text_active_focus = get("text_active_focus").unwrap_or(fallback.text_active_focus);
+    Theme {
+        base_background: get("base_background").unwrap_or(fallback.base_background),
+        body_background: get("body_background").unwrap_or(fallback.body_background),
+        modal_background: get("modal_background").unwrap_or(fallback.modal_background),
+        text_primary: get("text_primary").unwrap_or(fallback.text_primary),
+        text_secondary: get("text_secondary").unwrap_or(fallback.text_secondary),
+        text_labels: get("text_labels").unwrap_or(fallback.text_labels),
+        text_labels_active: get("text_labels_active").unwrap_or(text_active_focus),
+        text_active_focus,
+        modal_labels: get("modal_labels").unwrap_or(fallback.modal_labels),
+        modal_text: get("modal_text").unwrap_or(fallback.modal_text),
+        selected_background: get("selected_background").unwrap_or(fallback.selected_background),
+        border_default: get("border_default").unwrap_or(fallback.border_default),
+        border_active: get("border_active").unwrap_or(fallback.border_active),
+        input_border_default: get("input_border_default").unwrap_or(fallback.input_border_default),
+        input_border_focus: get("input_border_focus").unwrap_or(fallback.input_border_focus),
+        input_text_default: get("input_text_default").unwrap_or(fallback.input_text_default),
+        input_text_focus: get("input_text_focus").unwrap_or(fallback.input_text_focus),
+        cursor: get("cursor").unwrap_or(fallback.cursor),
+        scrollbar: get("scrollbar").unwrap_or(fallback.scrollbar),
+        scrollbar_hover: get("scrollbar_hover").unwrap_or(fallback.scrollbar_hover),
+        selection: get("selection").unwrap_or(fallback.selection),
+        success: get("success").unwrap_or(fallback.success),
+        warning: get("warning").unwrap_or(fallback.warning),
+        error: get("error").unwrap_or(fallback.error),
+        info: get("info").unwrap_or(fallback.info),
+        folder: get("folders").unwrap_or(fallback.folder),
+        file: get("files").unwrap_or(fallback.file),
+        link: get("links").unwrap_or(fallback.link),
+        omarchy: palette.omarchy.clone(),
+        overrides: palette.overrides.clone(),
     }
 }
 
@@ -457,6 +598,8 @@ pub fn palette_from_theme(theme: &Theme, quotes: Vec<String>) -> ldnddev_theme::
             palette.set(key, rgb);
         }
     }
+    palette.omarchy = theme.omarchy.clone();
+    palette.overrides = theme.overrides.clone();
     palette
 }
 
@@ -544,6 +687,8 @@ pub fn apply_palette(theme: &mut Theme, palette: &ldnddev_theme::Palette) {
     if let Some(c) = get("selection") {
         theme.selection = c;
     }
+    theme.omarchy = palette.omarchy.clone();
+    theme.overrides = palette.overrides.clone();
 }
 
 pub fn apply_live_theme(palette: &ldnddev_theme::Palette) {
@@ -551,6 +696,88 @@ pub fn apply_live_theme(palette: &ldnddev_theme::Palette) {
     apply_palette(&mut loaded.theme, palette);
     loaded.header_quotes = palette.header_quotes.clone();
     *THEME.write().unwrap() = Some(loaded);
+}
+
+pub fn apply_saved_theme(palette: &ldnddev_theme::Palette, source: ThemeSource, path: PathBuf) {
+    apply_live_theme(palette);
+    let mut loaded = cached_theme();
+    loaded.source = source;
+    loaded.path = Some(path);
+    loaded.version = Some(u32::try_from(palette.version).unwrap_or(THEME_SCHEMA_VERSION));
+    loaded.warning = None;
+    *THEME.write().unwrap() = Some(loaded);
+}
+
+pub fn open_theme_ui(app: &mut dd_ftp_app::AppState) {
+    let loaded = cached_theme();
+    let mut palette = palette_from_theme(&loaded.theme, loaded.header_quotes.clone());
+    palette.source = to_ldnd(loaded.source);
+    if let Some(version) = loaded.version {
+        palette.version = u64::from(version);
+    }
+    let picker = ldnddev_theme::ThemePicker::new(
+        palette.clone(),
+        extra_theme_fields(),
+        app.omarchy_paths.clone(),
+    );
+    if picker.lists_omarchy() {
+        app.theme_picker = Some(picker);
+        app.theme_editor = None;
+    } else {
+        app.theme_picker = None;
+        app.theme_editor = Some(ldnddev_theme::ThemeEditor::new(
+            palette,
+            extra_theme_fields(),
+        ));
+    }
+}
+
+pub fn close_theme(app: &mut dd_ftp_app::AppState, revert: bool) {
+    if revert {
+        if let Some(picker) = app.theme_picker.as_ref() {
+            let palette = picker.revert_palette();
+            apply_live_theme(&palette);
+        } else if let Some(mut editor) = app.theme_editor.take() {
+            editor.revert();
+            apply_live_theme(&editor.palette);
+        }
+    }
+    app.theme_picker = None;
+    app.theme_editor = None;
+}
+
+/// Re-read `omarchy: follow` when the desktop theme file changes.
+/// Does not touch the header tagline.
+pub fn refresh_followed_theme(app: &mut dd_ftp_app::AppState) -> bool {
+    if app.show_theme_debug {
+        return false;
+    }
+    if !matches!(
+        cached_theme().theme.omarchy,
+        Some(ldnddev_theme::OmarchyChoice::Follow)
+    ) {
+        return false;
+    }
+    let stamp = ldnddev_theme::follow_stamp(&app.omarchy_paths);
+    if stamp == app.follow_stamp {
+        return false;
+    }
+    let loaded = reload_at(&app.omarchy_paths);
+    app.follow_stamp = stamp;
+    if let Some(msg) = loaded.warning {
+        app.toast = Some(dd_ftp_app::Toast::warning(msg));
+    }
+    true
+}
+
+fn reload_at(omarchy: &ldnddev_theme::OmarchyPaths) -> LoadedTheme {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let loaded = load_resolved(&cwd, Some(&home), omarchy);
+    *THEME.write().unwrap() = Some(loaded.clone());
+    loaded
 }
 
 #[cfg(test)]
@@ -589,5 +816,111 @@ mod tests {
         assert_eq!(cached.version, loaded.version);
         assert_eq!(cached.warning, loaded.warning);
         assert_eq!(cached.source.label(), loaded.source.label());
+    }
+
+    fn hex(color: Color) -> String {
+        match color {
+            Color::Rgb(r, g, b) => format!("#{r:02X}{g:02X}{b:02X}"),
+            _ => "?".into(),
+        }
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dd_ftp_theme_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).expect("tmpdir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn missing_file_stays_builtin() {
+        let dir = TempDir::new();
+        let loaded = load_resolved(
+            dir.path(),
+            None,
+            &ldnddev_theme::OmarchyPaths::from_root(dir.path()),
+        );
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.source.label(), "default");
+        assert!(loaded.theme.omarchy.is_none());
+        assert_eq!(hex(loaded.theme.base_background), "#0F1114");
+    }
+
+    #[test]
+    fn omarchy_link_maps_colors_and_keeps_override() {
+        let project = TempDir::new();
+        let root = TempDir::new();
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../ldnddev_theme/tests/fixtures/omarchy/tokyo-night/colors.toml");
+        fs::create_dir_all(root.path().join("stock/tokyo-night")).expect("mkdir");
+        fs::copy(src, root.path().join("stock/tokyo-night/colors.toml")).expect("copy");
+        fs::write(
+            project.path().join("dd_ftp_theme.yml"),
+            "version: 1\nomarchy: tokyo-night\ncolors:\n  text_labels: \"#ABCDEF\"\n",
+        )
+        .expect("yaml");
+        let loaded = load_resolved(
+            project.path(),
+            None,
+            &ldnddev_theme::OmarchyPaths::from_root(root.path()),
+        );
+        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+        assert_eq!(hex(loaded.theme.body_background), "#1A1B26");
+        assert_eq!(hex(loaded.theme.text_labels), "#ABCDEF");
+        assert_eq!(
+            loaded.theme.omarchy,
+            Some(ldnddev_theme::OmarchyChoice::Theme("tokyo-night".into()))
+        );
+        assert!(loaded.theme.overrides.contains("text_labels"));
+        let palette = palette_from_theme(&loaded.theme, loaded.header_quotes.clone());
+        assert_eq!(palette.omarchy, loaded.theme.omarchy);
+        assert!(palette.overrides.contains("text_labels"));
+        let mut round = Theme::default();
+        apply_palette(&mut round, &palette);
+        assert_eq!(round.omarchy, loaded.theme.omarchy);
+        assert!(round.overrides.contains("text_labels"));
+        assert_eq!(hex(round.text_labels), "#ABCDEF");
+        assert_eq!(hex(round.body_background), "#1A1B26");
+    }
+
+    #[test]
+    fn missing_omarchy_theme_uses_builtin_with_warning() {
+        let project = TempDir::new();
+        let root = TempDir::new();
+        fs::write(
+            project.path().join("dd_ftp_theme.yml"),
+            "version: 1\nomarchy: missing-theme\n",
+        )
+        .expect("yaml");
+        let loaded = load_resolved(
+            project.path(),
+            None,
+            &ldnddev_theme::OmarchyPaths::from_root(root.path()),
+        );
+        let warning = loaded.warning.unwrap_or_default();
+        assert!(warning.contains("omarchy theme failed"), "{warning}");
+        assert_eq!(loaded.source.label(), "default");
+        assert_eq!(hex(loaded.theme.base_background), "#0F1114");
+        assert!(loaded.theme.omarchy.is_none());
     }
 }

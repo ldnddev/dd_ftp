@@ -108,10 +108,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
     // Idle queue is a 3-row strip (title, worker summary, bottom border), even
     // when focused. With jobs the panel grows by one row each, capped at 8,
     // or 12 while the queue pane is focused.
-    let queue_height = queue_panel_height(
-        app.visible_queue().len(),
-        app.focus == FocusPane::Queue,
-    );
+    let queue_height = queue_panel_height(app.visible_queue().len(), app.focus == FocusPane::Queue);
     let filter_height = if app.show_filter { 1 } else { 0 };
 
     let vertical = Layout::default()
@@ -1300,87 +1297,9 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
 
     if app.show_theme_debug {
         if let Some(editor) = &app.theme_editor {
-            render_theme_editor(frame, &t, editor);
-        } else {
-            let area = centered_rect(60, 70, frame.area());
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                Block::default().style(Style::default().bg(t.modal_background)),
-                area,
-            );
-
-            let p = loaded
-                .path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(built-in defaults)".to_string());
-
-            let version_str = loaded
-                .version
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "(none)".to_string());
-
-            let mut lines = vec![
-                Line::from(vec![Span::styled(
-                    "Theme Debug",
-                    Style::default()
-                        .fg(t.modal_labels)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(format!("source:  {}", loaded.source.label())),
-                Line::from(format!("path:    {}", p)),
-                Line::from(format!("version: {}", version_str)),
-            ];
-            if let Some(w) = loaded.warning.as_ref() {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("warning: {}", w),
-                    Style::default().fg(t.warning),
-                )]));
-            }
-            lines.extend([
-                Line::from(""),
-                Line::from("color tokens:"),
-                Line::from("base_background / body_background / modal_background"),
-                Line::from("border_default / border_active / scrollbar / scrollbar_hover"),
-                Line::from("text_primary / text_secondary / text_labels"),
-                Line::from("text_active_focus / text_labels_active"),
-                Line::from("modal_labels / modal_text / selected_background"),
-                Line::from("input_border_default / input_border_focus"),
-                Line::from("input_text_default / input_text_focus / cursor"),
-                Line::from("success / warning / error / info"),
-                Line::from("folder / file / link"),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "Press F2 to close",
-                    Style::default().fg(t.warning),
-                )]),
-            ]);
-
-            let modal = Paragraph::new(lines)
-                .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-                .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .title(Line::from(vec![Span::styled(
-                            " Theme ",
-                            Style::default()
-                                .fg(t.modal_labels)
-                                .add_modifier(Modifier::BOLD),
-                        )]))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(t.border_active)),
-                );
-
-            frame.render_widget(modal, area);
-            render_scrollbar(
-                frame,
-                area,
-                0,
-                12,
-                t.scrollbar,
-                t.scrollbar_hover,
-                app.mouse_pos,
-            );
+            render_theme_editor(frame, &t, editor, app.theme_picker.is_some());
+        } else if let Some(picker) = &app.theme_picker {
+            render_theme_picker(frame, &t, picker);
         }
     }
 
@@ -1674,49 +1593,29 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
 }
 
 fn render_toast(frame: &mut Frame, area: Rect, toast: &dd_ftp_app::Toast, t: &Theme) {
-    let width = area.width.min(56);
-    let height = area.height.min(5);
-
-    if width == 0 || height == 0 {
-        return;
-    }
-
-    let x = area.x + area.width.saturating_sub(width);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height.saturating_add(1)));
-    let toast_area = Rect {
-        x,
-        y,
-        width,
-        height,
+    let kind = match toast.level {
+        ToastLevel::Info => crate::toast_chrome::ToastKind::Info,
+        ToastLevel::Success => crate::toast_chrome::ToastKind::Success,
+        ToastLevel::Warning => crate::toast_chrome::ToastKind::Warning,
+        ToastLevel::Error => crate::toast_chrome::ToastKind::Error,
     };
-
-    let (title, border_color) = match toast.level {
-        ToastLevel::Info => (" Info ", t.info),
-        ToastLevel::Success => (" Success ", t.success),
-        ToastLevel::Warning => (" Warning ", t.warning),
-        ToastLevel::Error => (" Error ", t.error),
-    };
-
-    frame.render_widget(Clear, toast_area);
-
-    let toast_widget = Paragraph::new(toast.message.clone())
-        .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .title(Line::from(vec![Span::styled(
-                    title,
-                    Style::default()
-                        .fg(t.modal_labels)
-                        .add_modifier(Modifier::BOLD),
-                )]))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        );
-
-    frame.render_widget(toast_widget, toast_area);
+    let _ = crate::toast_chrome::render_toast_stack(
+        frame,
+        area,
+        &[crate::toast_chrome::ToastLine {
+            kind,
+            message: toast.message.as_str(),
+        }],
+        crate::toast_chrome::ToastPaint {
+            modal_background: t.modal_background,
+            text: t.text_primary,
+            success: t.success,
+            info: t.info,
+            warning: t.warning,
+            error: t.error,
+        },
+        0,
+    );
 }
 
 fn format_speed(bps: f64) -> String {
@@ -2054,16 +1953,66 @@ fn render_scrollbar(
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
-fn render_theme_editor(frame: &mut Frame, t: &Theme, editor: &ldnddev_theme::ThemeEditor) {
+fn render_theme_picker(frame: &mut Frame, t: &Theme, picker: &ldnddev_theme::ThemePicker) {
+    use ldnddev_theme::PickerRow;
+    let area = centered_rect(70, 80, frame.area());
+    frame.render_widget(Clear, area);
+    let mut lines = vec![
+        Line::from(format!(
+            "Save: {} (Tab)    Enter apply    e edit colors    s save    Esc revert",
+            picker.save_target.label()
+        )),
+        Line::from(""),
+    ];
+    let view_h = area.height.saturating_sub(5) as usize;
+    for (idx, row) in picker
+        .rows
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(view_h.max(1))
+    {
+        let (label, detail) = match row {
+            PickerRow::Follow { name } => ("Follow desktop".to_string(), name.clone()),
+            PickerRow::Theme(theme) => (theme.name.clone(), theme.mode.label().to_string()),
+            PickerRow::Custom => ("Custom".to_string(), "built-in".to_string()),
+        };
+        let cursor = if idx == picker.selected { ">" } else { " " };
+        lines.push(Line::from(format!("{cursor} {label:<22} {detail}")));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
+            .block(
+                Block::default()
+                    .title("F2 Themes")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.border_active)),
+            ),
+        area,
+    );
+}
+
+fn render_theme_editor(
+    frame: &mut Frame,
+    t: &Theme,
+    editor: &ldnddev_theme::ThemeEditor,
+    picker_behind: bool,
+) {
     use ldnddev_theme::{theme_editor_rows, ThemeEditorRow};
     let area = centered_rect(80, 80, frame.area());
     frame.render_widget(Clear, area);
     let rows = theme_editor_rows(&editor.fields);
     let channel = ["R", "G", "B"][editor.channel.min(2)];
     let target = editor.save_target.label().to_uppercase();
+    let esc = if picker_behind {
+        "Esc back"
+    } else {
+        "Esc revert"
+    };
     let mut lines = vec![
         Line::from(format!(
-            "Save: {target} (Tab)   Channel: {channel} ([/])   Y save   R reset   Esc revert"
+            "Save: {target} (Tab)   Channel: {channel} ([/])   Y save   R reset   {esc}"
         )),
         Line::from(if editor.editing_hex {
             format!("Hex: {}█", editor.hex_draft)

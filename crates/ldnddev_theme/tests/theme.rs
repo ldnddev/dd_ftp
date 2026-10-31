@@ -1,8 +1,9 @@
 use ldnddev_theme::{
-    load_from_str, parse_hex_input, render_yaml, save_theme, EditorKey, EditorOutcome, Palette,
-    ParseMode, ThemeEditor, ThemeSaveTarget, ThemeSource, COLOR_FIELDS, EXTRA_MODAL_HEADER,
-    EXTRA_SELECTION,
+    load_from_file, load_from_str, parse_hex_input, render_yaml, save_theme, EditorKey,
+    EditorOutcome, Palette, ParseMode, ThemeEditor, ThemeSaveTarget, ThemeSource, COLOR_FIELDS,
+    EXTRA_MODAL_HEADER, EXTRA_SELECTION,
 };
+use std::process::Command;
 
 fn full_yaml() -> String {
     let mut body = String::from("version: 1\nheader_quotes:\n  - \"Hello\"\ncolors:\n");
@@ -76,6 +77,65 @@ fn extra_fields_appear_and_save() {
     let yaml = std::fs::read_to_string(path).expect("read");
     assert!(yaml.contains("modal_header:"));
     assert!(yaml.contains("selection:"));
+}
+
+#[test]
+fn quoted_ampersand_is_not_an_alias() {
+    let mut yaml = "version: 1\nheader_quotes:\n  - \"rock & roll\"\ncolors:\n".to_string();
+    for field in COLOR_FIELDS {
+        yaml.push_str(&format!("  {}: \"#010203\"\n", field.key));
+    }
+    let palette = load_from_str(&yaml, ParseMode::Strict, ThemeSource::Local).expect("load");
+    assert_eq!(palette.header_quotes, vec!["rock & roll".to_string()]);
+}
+
+#[test]
+fn yaml_aliases_are_rejected() {
+    let err = load_from_str(
+        "version: &v 1\ncolors:\n  base_background: \"#010203\"\n",
+        ParseMode::Lenient,
+        ThemeSource::Local,
+    )
+    .expect_err("alias");
+    assert!(err.to_string().contains("anchors and aliases"), "{err}");
+}
+
+#[test]
+fn theme_fifo_is_refused_without_blocking() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let fifo = dir.path().join("theme.yml");
+    let status = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+    assert!(status.success());
+    let err = load_from_file(&fifo, ParseMode::Lenient, ThemeSource::Local).expect_err("fifo");
+    assert!(format!("{err:#}").contains("non-file"), "{err:#}");
+}
+
+#[test]
+fn save_theme_does_not_follow_symlink() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let target = dir.path().join("important.txt");
+    std::fs::write(&target, "ORIGINAL").expect("write target");
+    let link = dir.path().join("dd_test_theme.yml");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let editor = ThemeEditor::new(Palette::builtin(), &[]);
+    let err = save_theme(
+        &editor.palette,
+        dir.path(),
+        "dd_test_theme.yml",
+        ThemeSaveTarget::Local,
+        None,
+        &editor.fields,
+    )
+    .expect_err("refuse symlink");
+    assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("target"),
+        "ORIGINAL"
+    );
+    assert!(std::fs::symlink_metadata(&link)
+        .expect("link")
+        .file_type()
+        .is_symlink());
 }
 
 #[test]

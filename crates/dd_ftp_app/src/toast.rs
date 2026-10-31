@@ -30,6 +30,14 @@ impl Toast {
         Self::new(message, ToastLevel::Error)
     }
 
+    pub fn success(message: String) -> Self {
+        Self::new(message, ToastLevel::Success)
+    }
+
+    pub fn at(level: ToastLevel, message: impl Into<String>) -> Self {
+        Self::new(message.into(), level)
+    }
+
     fn new(message: String, level: ToastLevel) -> Self {
         Self {
             message,

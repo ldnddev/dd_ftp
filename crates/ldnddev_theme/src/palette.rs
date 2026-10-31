@@ -1,6 +1,7 @@
 use crate::fields::{extra_default, is_canonical_key, CANONICAL_DEFAULTS, COLOR_FIELDS};
+use crate::omarchy::OmarchyChoice;
 use crate::rgb::Rgb;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeSource {
@@ -25,6 +26,10 @@ pub struct Palette {
     pub header_quotes: Vec<String>,
     pub version: u64,
     pub source: ThemeSource,
+    /// Linked Omarchy theme. `None` is the hand-authored YAML palette.
+    pub omarchy: Option<OmarchyChoice>,
+    /// Keys in `colors` that the user edited on top of an Omarchy theme.
+    pub overrides: BTreeSet<String>,
 }
 
 impl Palette {
@@ -38,6 +43,8 @@ impl Palette {
             header_quotes: Vec::new(),
             version: crate::SUPPORTED_THEME_VERSION,
             source: ThemeSource::Default,
+            omarchy: None,
+            overrides: BTreeSet::new(),
         }
     }
 

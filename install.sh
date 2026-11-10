@@ -7,7 +7,7 @@
 # From a git checkout:
 #   ./install.sh                 # release cargo build (developer default)
 #   ./install.sh --from-release  # prebuilt GitHub package
-#   ./install.sh --uninstall
+#   ./install.sh --uninstall     # binary, Linux launcher, default theme
 set -euo pipefail
 
 if [[ -z "${BASH_VERSION:-}" ]]; then
@@ -46,10 +46,10 @@ Options:
   --version TAG       Release tag to install (default: latest)
   --branch NAME       Git branch to clone when building from source
   --prefix DIR        Install the binary into DIR (same as INSTALL_DIR)
-  --uninstall         Remove the installed binary and default theme
+  --uninstall         Remove the binary, Linux desktop launcher, and default theme
   --print-target      Print the detected package target and exit
   --dry-run           Show what would be installed, then exit
-  --self-test         Check archive path and checksum handling, then exit
+  --self-test         Check archive, checksum, and launcher handling, then exit
   -h, --help          Show this help
 
 Environment:
@@ -58,6 +58,10 @@ Environment:
   VERSION             Release tag or "latest"
   REPO                GitHub owner/name (default: ldnddev/dd_ftp)
   CONFIG_DIR          Theme directory (default: ~/.config/ldnddev)
+  XDG_DATA_HOME       Linux launcher parent when the binary stays under \$HOME
+
+Uninstall uses the same INSTALL_DIR, BIN_NAME, CONFIG_DIR, and XDG_DATA_HOME
+as the install. Bookmarks and keyring secrets are left in place.
 
 Examples:
   INSTALL_DIR=/usr/local/bin ./install.sh
@@ -305,24 +309,137 @@ installed_bin_path() {
   fi
 }
 
+# Menus look in $XDG_DATA_HOME/applications, then the system data dirs.
+# A binary under $HOME is published where the session looks. A binary
+# outside $HOME (for example /usr/local/bin) is published under that
+# prefix's share/applications.
+apps_dir() {
+  local dir prefix
+  dir="${INSTALL_DIR%/}"
+  case "$dir" in
+    "$HOME" | "$HOME"/*)
+      if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+        printf '%s/applications\n' "${XDG_DATA_HOME%/}"
+      else
+        printf '%s/.local/share/applications\n' "$HOME"
+      fi
+      ;;
+    */bin)
+      prefix="${dir%/bin}"
+      if [[ -z "$prefix" || "$prefix" == "/" ]]; then
+        printf '/share/applications\n'
+      else
+        printf '%s/share/applications\n' "$prefix"
+      fi
+      ;;
+    *)
+      printf '%s/share/applications\n' "$(dirname "$dir")"
+      ;;
+  esac
+}
+
+launcher_name_ok() {
+  case "$BIN_DST_NAME" in
+    '' | *[[:cntrl:]]* | *'/'* | *'\\'* ) return 1 ;;
+  esac
+  return 0
+}
+
+desktop_path() {
+  launcher_name_ok || {
+    printf 'Error: BIN_NAME cannot be a desktop file name: %s\n' "$BIN_DST_NAME" >&2
+    return 1
+  }
+  printf '%s/%s.desktop\n' "$(apps_dir)" "$BIN_DST_NAME"
+}
+
+# Quote one Exec argument. A literal % is %%.
+desktop_quote() {
+  local s=$1
+  [[ "$s" != *$'\n'* ]] || return 1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//\`/\\\`}
+  s=${s//\$/\\\$}
+  s=${s//%/%%}
+  printf '"%s"' "$s"
+}
+
+write_desktop() {
+  local dest=$1
+  local bin=$2
+  local exec_q
+  exec_q="$(desktop_quote "$bin")" || fail "desktop path contains a newline: ${bin}"
+  {
+    printf '%s\n' "[Desktop Entry]"
+    printf '%s\n' "Type=Application"
+    printf '%s\n' "Version=1.0"
+    printf '%s\n' "Name=${BIN_DST_NAME}"
+    printf '%s\n' "GenericName=FTP client"
+    printf '%s\n' "Comment=Terminal FTP, SFTP, and FTPS client"
+    printf '%s\n' "Exec=${exec_q}"
+    printf '%s\n' "TryExec=${bin}"
+    printf '%s\n' "Terminal=true"
+    printf '%s\n' "Categories=Network;FileTransfer;"
+    printf '%s\n' "Keywords=ftp;sftp;ftps;file;transfer;"
+    printf '%s\n' "StartupNotify=false"
+    printf '%s\n' "Icon=utilities-terminal"
+  } >"$dest"
+  chmod 644 "$dest"
+}
+
+refresh_desktop_database() {
+  local dir=$1
+  if have update-desktop-database; then
+    update-desktop-database "$dir" >/dev/null 2>&1 || true
+  fi
+}
+
+install_desktop_launcher() {
+  local bin dest dir
+  if [[ "$(detect_os)" != "linux" ]]; then
+    info "desktop launcher skipped on $(detect_os)"
+    return 0
+  fi
+  bin="$(installed_bin_path)"
+  [[ -e "$bin" || -L "$bin" ]] || fail "cannot write a desktop launcher; binary missing at ${bin}"
+  dest="$(desktop_path)" || fail "BIN_NAME cannot be a desktop file name: ${BIN_DST_NAME}"
+  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  write_desktop "$dest" "$bin"
+  info "installed launcher ${dest}"
+  refresh_desktop_database "$dir"
+}
+
+remove_if_present() {
+  local path=$1
+  local label=$2
+  if [[ -e "$path" || -L "$path" ]]; then
+    rm -f -- "$path"
+    info "removed ${path}"
+  else
+    info "${label} not found at ${path}"
+  fi
+}
+
 do_uninstall() {
-  local bin theme
+  local bin theme desktop desktop_dir
   bin="$(installed_bin_path)"
   theme="${CONFIG_DIR}/${THEME_FILE}"
 
-  if [[ -e "$bin" || -L "$bin" ]]; then
-    rm -f "$bin"
-    info "removed ${bin}"
-  else
-    info "binary not found at ${bin}"
+  remove_if_present "$bin" "binary"
+
+  if [[ "$(detect_os)" == "linux" ]]; then
+    if desktop="$(desktop_path)"; then
+      desktop_dir="$(dirname "$desktop")"
+      remove_if_present "$desktop" "launcher"
+      refresh_desktop_database "$desktop_dir"
+    else
+      warn "skipped launcher removal; pass the same BIN_NAME used at install"
+    fi
   fi
 
-  if [[ -e "$theme" || -L "$theme" ]]; then
-    rm -f "$theme"
-    info "removed ${theme}"
-  else
-    info "theme not found at ${theme}"
-  fi
+  remove_if_present "$theme" "theme"
 
   if [[ -d "$CONFIG_DIR" ]] && rmdir "$CONFIG_DIR" 2>/dev/null; then
     info "removed empty ${CONFIG_DIR}"
@@ -534,6 +651,99 @@ PY
     fail "self-test: archive with no checksum entry was accepted"
   fi
 
+  # Launcher paths stay inside the temp tree. These overrides end with the
+  # process: --self-test exits as soon as this function returns.
+  HOME="${work}/home"
+  INSTALL_DIR="${HOME}/.local/bin"
+  XDG_DATA_HOME=""
+  CONFIG_DIR="${work}/config"
+  BIN_DST_NAME="dd_ftp"
+  mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
+  printf '#!/bin/sh\nexit 0\n' >"$(installed_bin_path)"
+  chmod 755 "$(installed_bin_path)"
+  printf 'theme\n' >"${CONFIG_DIR}/${THEME_FILE}"
+
+  [[ "$(apps_dir)" == "${HOME}/.local/share/applications" ]] \
+    || fail "self-test: user apps dir was $(apps_dir)"
+
+  XDG_DATA_HOME="${work}/xdg"
+  [[ "$(apps_dir)" == "${XDG_DATA_HOME}/applications" ]] \
+    || fail "self-test: XDG apps dir was $(apps_dir)"
+
+  INSTALL_DIR="/usr/local/bin"
+  [[ "$(apps_dir)" == "/usr/local/share/applications" ]] \
+    || fail "self-test: /usr/local apps dir was $(apps_dir)"
+
+  INSTALL_DIR="/usr/bin"
+  [[ "$(apps_dir)" == "/usr/share/applications" ]] \
+    || fail "self-test: /usr apps dir was $(apps_dir)"
+
+  INSTALL_DIR="/bin"
+  [[ "$(apps_dir)" == "/share/applications" ]] \
+    || fail "self-test: /bin apps dir was $(apps_dir)"
+
+  INSTALL_DIR="/opt/dd_ftp"
+  [[ "$(apps_dir)" == "/opt/share/applications" ]] \
+    || fail "self-test: non-bin prefix apps dir was $(apps_dir)"
+
+  INSTALL_DIR="${HOME}/.local/bin"
+  XDG_DATA_HOME="${work}/xdg"
+  install_desktop_launcher
+  local desk="${XDG_DATA_HOME}/applications/dd_ftp.desktop"
+  local bin_path
+  bin_path="$(installed_bin_path)"
+  [[ -f "$desk" ]] || fail "self-test: launcher was not written"
+  [[ "$(stat -c '%a' "$desk")" == "644" ]] || fail "self-test: launcher mode was $(stat -c '%a' "$desk")"
+  grep -F 'Terminal=true' "$desk" >/dev/null || fail "self-test: launcher is not a terminal app"
+  grep -F 'Categories=Network;FileTransfer;' "$desk" >/dev/null \
+    || fail "self-test: launcher categories missing"
+  grep -F "Exec=$(desktop_quote "$bin_path")" "$desk" >/dev/null \
+    || fail "self-test: launcher Exec does not match ${bin_path}"
+  grep -F "TryExec=${bin_path}" "$desk" >/dev/null \
+    || fail "self-test: launcher TryExec does not match ${bin_path}"
+  if have desktop-file-validate; then
+    desktop-file-validate "$desk" || fail "self-test: desktop-file-validate failed"
+  fi
+
+  do_uninstall
+  [[ ! -e "$desk" ]] || fail "self-test: launcher survived uninstall"
+  [[ ! -e "$bin_path" ]] || fail "self-test: binary survived uninstall"
+  [[ ! -e "${CONFIG_DIR}/${THEME_FILE}" ]] \
+    || fail "self-test: theme survived uninstall"
+
+  local quoted
+  quoted="$(desktop_quote '/tmp/a b%c$"')" || fail "self-test: quote rejected a normal path"
+  [[ "$quoted" == '"/tmp/a b%%c\$\""' ]] || fail "self-test: quote produced ${quoted}"
+  if desktop_quote $'/tmp/has\nnewline' >/dev/null 2>&1; then
+    fail "self-test: a newline in the binary path was accepted"
+  fi
+
+  BIN_DST_NAME="dd/ftp"
+  if desktop_path >/dev/null 2>&1; then
+    fail "self-test: a slash in BIN_NAME was accepted"
+  fi
+
+  BIN_DST_NAME="dd ftp"
+  HOME="${work}/spaced-home"
+  INSTALL_DIR="${HOME}/.local/bin"
+  XDG_DATA_HOME="${work}/spaced-xdg"
+  mkdir -p "$INSTALL_DIR"
+  printf '#!/bin/sh\nexit 0\n' >"${INSTALL_DIR}/dd ftp"
+  chmod 755 "${INSTALL_DIR}/dd ftp"
+  install_desktop_launcher
+  local spaced_desk
+  spaced_desk="$(desktop_path)"
+  [[ "$spaced_desk" == "${XDG_DATA_HOME}/applications/dd ftp.desktop" ]] \
+    || fail "self-test: spaced launcher path was ${spaced_desk}"
+  [[ -f "$spaced_desk" ]] || fail "self-test: spaced launcher name was not written"
+  grep -F "Exec=$(desktop_quote "${INSTALL_DIR}/dd ftp")" "$spaced_desk" >/dev/null \
+    || fail "self-test: spaced Exec was not quoted"
+
+  do_uninstall
+  [[ ! -e "$spaced_desk" ]] || fail "self-test: spaced launcher survived uninstall"
+  [[ ! -e "${INSTALL_DIR}/dd ftp" ]] \
+    || fail "self-test: spaced binary survived uninstall"
+
   info "self-test ok"
 }
 
@@ -588,6 +798,11 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   printf 'package:     %s\n' "$(package_url "$(detect_target)" "$(normalize_version "$VERSION")")"
   printf 'install to:  %s\n' "$(installed_bin_path)"
   printf 'theme:       %s/%s\n' "$CONFIG_DIR" "$THEME_FILE"
+  if [[ "$(detect_os)" == "linux" ]]; then
+    printf 'launcher:    %s\n' "$(desktop_path)"
+  else
+    printf 'launcher:    desktop files are Linux-only\n'
+  fi
   if is_local_checkout; then
     printf 'checkout:    %s\n' "$(script_dir)"
   else
@@ -627,5 +842,9 @@ else
   fi
 fi
 
+install_desktop_launcher
 path_note
 printf '\nRun: %s\n' "$BIN_DST_NAME"
+if [[ "$(detect_os)" == "linux" ]]; then
+  printf 'Launcher: %s\n' "$(desktop_path)"
+fi

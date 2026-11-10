@@ -247,10 +247,11 @@
         <p>Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) and installs <code>dd_ftp</code> to <code>~/.local/bin</code>. If no package exists for your machine, the script builds from source. Pipe to <code>bash</code>, not <code>sh</code>.</p>
         <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash</code></pre>
         <p>Pin a release:</p>
-        <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --version v1.8.2</code></pre>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --version v1.8.3</code></pre>
         <div class="callout">
           <p>The installer warns if the target directory is not on <code>PATH</code>. Add <code>~/.local/bin</code> if <code>dd_ftp</code> is not found after install.</p>
         </div>
+        <p>On Linux the same run writes <code>dd_ftp.desktop</code> so the TUI shows up in the application menu and opens in a terminal. A home install uses <code>${XDG_DATA_HOME:-~/.local/share}/applications</code>. A prefix outside your home directory, such as <code>/usr/local/bin</code>, uses that prefix's <code>share/applications</code>. Each install refreshes the launcher. macOS and Windows skip it.</p>
 
         <h3>From a local checkout</h3>
         <pre><code>./install.sh                  # release cargo build → ~/.local/bin
@@ -528,7 +529,7 @@ export DD_FTP_PATH=/</code></pre>
         <pre><code>curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --uninstall
 # or from a checkout
 ./install.sh --uninstall</code></pre>
-        <p>Removes the installed binary and the default theme copy. Bookmarks in <code>~/.config/ldnddev/</code> and keyring secrets are left in place so a reinstall can pick them up.</p>
+        <p>Removes the installed binary, the Linux desktop launcher, and the default theme copy. Pass the same <code>INSTALL_DIR</code>, <code>BIN_NAME</code>, <code>CONFIG_DIR</code>, and <code>XDG_DATA_HOME</code> you used to install. Bookmarks in <code>~/.config/ldnddev/</code> and keyring secrets are left in place so a reinstall can pick them up.</p>
       </section>
 
       <section id="screenshots">

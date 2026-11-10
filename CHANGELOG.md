@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.3] - 2026-11-09
+
+### Added
+- `install.sh` writes a Linux desktop launcher so the TUI appears in the application menu. `--uninstall` removes that launcher along with the binary and the default theme.
+
 ## [1.8.2] - 2026-10-31
 
 ### Added

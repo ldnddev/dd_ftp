@@ -8,13 +8,13 @@ Terminal FTP/SFTP/FTPS client built with Rust + ratatui.
 
 ## Install
 
-Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) and installs `dd_ftp` to `~/.local/bin`. If no package exists for your machine, the script builds from source.
+Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) and installs `dd_ftp` to `~/.local/bin`. On Linux it also adds an application-menu launcher. If no package exists for your machine, the script builds from source.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
 ```
 
-Pin a release: `bash -s -- --version v1.8.2`. Uninstall: `bash -s -- --uninstall`. From a checkout: `./install.sh`. Full options, PATH notes, and env vars are in the [tutorial](https://ldnddev.github.io/dd_ftp/#install).
+Pin a release: `bash -s -- --version v1.8.3`. Uninstall (binary, Linux launcher, and default theme): `bash -s -- --uninstall`. From a checkout: `./install.sh`. Full options, PATH notes, and env vars are in the [tutorial](https://ldnddev.github.io/dd_ftp/#install).
 
 ## Run
 

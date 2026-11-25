@@ -14,7 +14,7 @@ Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows) an
 curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
 ```
 
-Pin a release: `bash -s -- --version v1.8.3`. Uninstall (binary, Linux launcher, and default theme): `bash -s -- --uninstall`. From a checkout: `./install.sh`. Full options, PATH notes, and env vars are in the [tutorial](https://ldnddev.github.io/dd_ftp/#install).
+Pin a release: `bash -s -- --version v1.8.4`. Uninstall removes the binary and Linux launcher and leaves `dd_ftp_theme.yml`: `bash -s -- --uninstall`. From a checkout: `./install.sh`. Full options, PATH notes, and env vars are in the [tutorial](https://ldnddev.github.io/dd_ftp/#install).
 
 ## Run
 

@@ -1,7 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-use dd_ftp_app::{reduce, Action, AppState, FocusPane, QuickConnectField, SettingsField};
+use dd_ftp_app::{
+    reduce, Action, AppState, FocusPane, QuickConnectField, SettingsField, SETTINGS_LAST,
+    SETTINGS_SESSION,
+};
 use dd_ftp_ui::{
     hit_test, path_seg_action, ControlId, FieldId, Pane, PathSegAction, Region, ScrollRegion,
 };
@@ -120,6 +123,26 @@ pub(crate) fn handle_mouse(
                 })
                 .unwrap_or(false);
             *last_click = Some((mx, my, now));
+            if app.show_settings {
+                if let Some(nav) = app_layout.settings_nav {
+                    if mx >= nav.x
+                        && mx < nav.x.saturating_add(nav.width)
+                        && my >= nav.y
+                        && my < nav.y.saturating_add(nav.height)
+                    {
+                        let row = (my - nav.y) as u8;
+                        if row <= SETTINGS_LAST && app.settings_page != row {
+                            app.settings_page = row;
+                            app.help_scroll = 0;
+                            app.settings_follow = true;
+                            if row == SETTINGS_SESSION {
+                                app.settings_field = SettingsField::Editor;
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
             match hit_test(app_layout, mx, my) {
                 Some(Region::QueueList) if !app.any_modal_open() => {
                     reduce(app, Action::SetFocus(FocusPane::Queue));
@@ -241,7 +264,9 @@ pub(crate) fn handle_mouse(
                     }
                 }
                 Some(Region::Control(_)) if app.show_prompt => {}
-                Some(Region::Control(cid)) if app.show_settings => {
+                Some(Region::Control(cid))
+                    if app.show_settings && app.settings_page == SETTINGS_SESSION =>
+                {
                     if let Some(field) = match cid {
                         ControlId::SettingsWorkers => Some(SettingsField::Workers),
                         ControlId::SettingsHideDotfiles => Some(SettingsField::HideDotfiles),
@@ -312,7 +337,7 @@ pub(crate) fn handle_mouse(
                             }
                             FieldId::Prompt => {}
                             FieldId::SettingsEditor | FieldId::SettingsLastLocal
-                                if app.show_settings =>
+                                if app.show_settings && app.settings_page == SETTINGS_SESSION =>
                             {
                                 let field = match fid {
                                     FieldId::SettingsLastLocal => SettingsField::LastLocalCwd,
@@ -356,7 +381,7 @@ pub(crate) fn handle_mouse(
                         }
                         FieldId::Prompt => {}
                         FieldId::SettingsEditor | FieldId::SettingsLastLocal
-                            if app.show_settings =>
+                            if app.show_settings && app.settings_page == SETTINGS_SESSION =>
                         {
                             let len = app.settings_text_mut().map(|tf| tf.len()).unwrap_or(0);
                             let idx = dd_ftp_ui::char_index_at(&fr, mx, len);

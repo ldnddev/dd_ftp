@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use dd_ftp_app::{
     is_dot_or_dotdot, is_public_key_name, AppState, ChoicePromptKind, FocusPane, PromptKind,
-    QuickConnectField, SettingsField, TextPromptKind, ToastLevel,
+    QuickConnectField, SettingsField, TextPromptKind, ToastLevel, SETTINGS_HELP, SETTINGS_LAST,
+    SETTINGS_SESSION, SETTINGS_THEMES,
 };
 use dd_ftp_core::{Protocol, TransferJob, TransferStatus};
 use dd_ftp_transfer::TransferQueue;
@@ -94,7 +95,7 @@ fn render_field_line(tf: &dd_ftp_app::TextField, masked: bool, t: &Theme) -> Vec
     spans
 }
 
-pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
+pub fn render(frame: &mut Frame, app: &mut AppState, map: &mut LayoutMap) {
     *map = LayoutMap::default();
     let loaded = cached_theme();
     let t = loaded.theme;
@@ -412,7 +413,7 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
 
     if !app.connected {
         frame.render_widget(
-            Paragraph::new("Not connected — o Quick Connect · m Bookmarks · F1 Help")
+            Paragraph::new("Not connected — o Quick Connect · m Bookmarks · F1 Settings")
                 .style(Style::default().fg(t.text_secondary).bg(t.body_background))
                 .wrap(Wrap { trim: true }),
             inner_list_rect(panes[1]),
@@ -572,134 +573,40 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
         app.mouse_pos,
     );
 
-    // Footer: width-adaptive key hints (terse on narrow, full on wide).
-    // Always leads with F1:Help. Connection state lives in the header; the
-    // transient status string is shown right-aligned only when there is room.
-    let keys = if status_area.width < 75 {
-        "F1:Help  F3:Set  Tab:Pane  j/k:Nav  /:Filter  u/d:Xfer  m:Sites  ^Q:Quit"
-    } else if status_area.width < 110 {
-        "F1: Help   F3: Settings   Tab: Pane   j/k: Nav   h/l: Dir   /: Filter   u/d: Up/Down   m: Bookmarks   o: Connect   Ctrl+q: Quit"
-    } else {
-        "F1: Help   F3: Settings   Tab: Pane   j/k: Nav   PgUp/PgDn: Page   h/l: Dir   /: Filter   u: Upload   d: Download   m: Bookmarks   o: Connect   Ctrl+q: Quit"
-    };
-    let footer_keys =
-        Paragraph::new(keys).style(Style::default().fg(t.text_secondary).bg(t.base_background));
+    let footer_keys = Paragraph::new(footer_hint(app, status_area.width))
+        .style(Style::default().fg(t.text_secondary).bg(t.base_background));
     frame.render_widget(footer_keys, status_area);
 
-    // Right-aligned working loader and/or transient status. The loader is
-    // short enough to show even on narrower terminals; status still needs room.
-    let show_status = status_area.width >= 90 && !app.status.is_empty();
-    if app.busy || show_status {
-        let s = app.status.to_lowercase();
-        let status_color = if s.contains("failed") || s.contains("error") {
-            t.error
-        } else if s.contains("saved") || s.contains("connected") || s.contains("complete") {
-            t.success
-        } else if s.contains("loading") || s.contains("refresh") || s.contains("processing") {
-            t.info
-        } else {
-            t.text_secondary
-        };
-        let mut spans: Vec<Span> = Vec::new();
-        if app.busy {
-            spans.extend(busy_spans(tick_ms, &t));
-            if show_status {
-                spans.push(Span::raw("  "));
-            }
-        }
-        if show_status {
+    if app.busy {
+        let mut spans = busy_spans(tick_ms, &t);
+        if !app.status.is_empty() {
+            let s = app.status.to_lowercase();
+            let status_color = if s.contains("failed") || s.contains("error") {
+                t.error
+            } else if s.contains("saved") || s.contains("connected") || s.contains("complete") {
+                t.success
+            } else if s.contains("loading") || s.contains("refresh") || s.contains("processing") {
+                t.info
+            } else {
+                t.info
+            };
+            spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 app.status.clone(),
                 Style::default().fg(status_color),
             ));
         }
         spans.push(Span::raw(" "));
-        let status = Paragraph::new(Line::from(spans))
-            .alignment(Alignment::Right)
-            .style(Style::default().bg(t.base_background));
-        frame.render_widget(status, status_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .alignment(Alignment::Right)
+                .style(Style::default().bg(t.base_background)),
+            status_area,
+        );
     }
 
-    if app.show_help {
-        let backdrop = Block::default().style(
-            Style::default()
-                .bg(t.base_background)
-                .add_modifier(Modifier::DIM),
-        );
-        frame.render_widget(backdrop, frame.area());
-
-        let area = centered_rect(70, 70, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Block::default().style(Style::default().bg(t.modal_background)),
-            area,
-        );
-
-        let mut lines = vec![
-            Line::from(vec![Span::styled(
-                "Controls",
-                Style::default()
-                    .fg(t.modal_labels)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(""),
-        ];
-        let mut last_group: Option<KeyGroup> = None;
-        for kb in KEYMAP {
-            if last_group != Some(kb.group) {
-                if last_group.is_some() {
-                    lines.push(Line::from(""));
-                }
-                lines.push(Line::from(kb.group.title()));
-                last_group = Some(kb.group);
-            }
-            lines.push(Line::from(format!("  {} -> {}", kb.keys, kb.action)));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            "Press F1 or Esc to close",
-            Style::default().fg(t.warning),
-        )]));
-        map.help_line_count = lines.len();
-
-        let help = Paragraph::new(lines.clone())
-            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .scroll((app.help_scroll as u16, 0))
-            .alignment(Alignment::Left)
-            .block(
-                Block::default()
-                    .title(Line::from(vec![Span::styled(
-                        " Help ",
-                        Style::default()
-                            .fg(t.modal_labels)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.border_active)),
-            );
-
-        frame.render_widget(help, area);
-        let viewport_height = area.height.saturating_sub(2) as usize;
-        let content_height = lines.len();
-        if content_height > viewport_height {
-            render_scrollbar(
-                frame,
-                area,
-                app.help_scroll,
-                content_height,
-                t.scrollbar,
-                t.scrollbar_hover,
-                app.mouse_pos,
-            );
-        }
-
-        map.help = Some(area);
-        map.help_scrollbar = Some(Rect {
-            x: area.x + area.width.saturating_sub(1),
-            y: area.y,
-            width: 1,
-            height: area.height,
-        });
+    if app.show_settings {
+        render_settings(frame, app, map, &t);
     }
 
     if app.show_quick_connect {
@@ -1118,188 +1025,6 @@ pub fn render(frame: &mut Frame, app: &AppState, map: &mut LayoutMap) {
                     });
                 }
             }
-        }
-    }
-
-    if app.show_settings {
-        let area = centered_rect(74, 80, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Block::default().style(Style::default().bg(t.modal_background)),
-            area,
-        );
-
-        let env_override = std::env::var("VISUAL")
-            .ok()
-            .or_else(|| std::env::var("EDITOR").ok())
-            .filter(|s| !s.trim().is_empty());
-        let active = env_override.as_deref().unwrap_or_else(|| {
-            if app.editor.trim().is_empty() {
-                "vi"
-            } else {
-                app.editor.trim()
-            }
-        });
-
-        let row = |field: SettingsField| -> Style {
-            if app.settings_field == field {
-                Style::default()
-                    .fg(t.input_text_focus)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(t.modal_text)
-            }
-        };
-        let cycle_line = |field: SettingsField, label: &str, value: &str| -> Line<'static> {
-            let mark = if app.settings_field == field {
-                ">"
-            } else {
-                " "
-            };
-            Line::from(vec![Span::styled(
-                format!("{mark} {label:<16} {value}"),
-                row(field),
-            )])
-        };
-
-        let mut editor_spans = vec![Span::styled(
-            if app.settings_field == SettingsField::Editor {
-                "> "
-            } else {
-                "  "
-            },
-            row(SettingsField::Editor),
-        )];
-        editor_spans.extend(render_field_line(&app.settings_editor, false, &t));
-
-        let mut last_spans = vec![Span::styled(
-            if app.settings_field == SettingsField::LastLocalCwd {
-                "> "
-            } else {
-                "  "
-            },
-            row(SettingsField::LastLocalCwd),
-        )];
-        last_spans.extend(render_field_line(&app.settings_last_local, false, &t));
-
-        let hide = if app.settings_hide_dotfiles {
-            "on"
-        } else {
-            "off"
-        };
-        let auto = if app.settings_auto_connect {
-            "on"
-        } else {
-            "off"
-        };
-
-        let lines = vec![
-            Line::from(vec![Span::styled(
-                "Editor  (empty = $VISUAL, then $EDITOR, then vi)",
-                Style::default().fg(t.modal_labels),
-            )]),
-            Line::from(editor_spans),
-            Line::from(vec![Span::styled(
-                format!("Active now: {active}"),
-                Style::default().fg(t.text_secondary),
-            )]),
-            if env_override.is_some() {
-                Line::from(vec![Span::styled(
-                    "Environment variable overrides the saved editor",
-                    Style::default().fg(t.warning),
-                )])
-            } else {
-                Line::from("")
-            },
-            Line::from(""),
-            cycle_line(
-                SettingsField::Workers,
-                "Workers",
-                &app.settings_workers.to_string(),
-            ),
-            cycle_line(SettingsField::HideDotfiles, "Hide dotfiles", hide),
-            cycle_line(
-                SettingsField::Overwrite,
-                "Overwrite",
-                app.settings_overwrite.settings_label(),
-            ),
-            cycle_line(SettingsField::AutoConnect, "Auto-connect", auto),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Last local path (restored at launch)",
-                Style::default().fg(t.modal_labels),
-            )]),
-            Line::from(last_spans),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Saved to ~/.config/ldnddev/dd_ftp.toml (not the theme file)",
-                Style::default().fg(t.text_secondary),
-            )]),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Tab cycle | Left/Right/Space change | Enter save | Esc cancel",
-                Style::default().fg(t.warning),
-            )]),
-        ];
-
-        let modal = Paragraph::new(lines)
-            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .block(
-                Block::default()
-                    .title(Line::from(vec![Span::styled(
-                        " Settings ",
-                        Style::default()
-                            .fg(t.modal_labels)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.border_active)),
-            );
-        frame.render_widget(modal, area);
-
-        let content_y = area.y.saturating_add(1);
-        let inner_x = area.x.saturating_add(1);
-        let inner_w = area.width.saturating_sub(2);
-        let row_area = |line: u16| Rect {
-            x: inner_x,
-            y: content_y.saturating_add(line),
-            width: inner_w,
-            height: 1,
-        };
-
-        map.fields.push(FieldRegion {
-            id: FieldId::SettingsEditor,
-            area: row_area(1),
-            text_x: inner_x.saturating_add(2),
-        });
-        map.fields.push(FieldRegion {
-            id: FieldId::SettingsLastLocal,
-            area: row_area(11),
-            text_x: inner_x.saturating_add(2),
-        });
-        map.controls.push(ControlRegion {
-            id: ControlId::SettingsWorkers,
-            area: row_area(5),
-        });
-        map.controls.push(ControlRegion {
-            id: ControlId::SettingsHideDotfiles,
-            area: row_area(6),
-        });
-        map.controls.push(ControlRegion {
-            id: ControlId::SettingsOverwrite,
-            area: row_area(7),
-        });
-        map.controls.push(ControlRegion {
-            id: ControlId::SettingsAutoConnect,
-            area: row_area(8),
-        });
-    }
-
-    if app.show_theme_debug {
-        if let Some(editor) = &app.theme_editor {
-            render_theme_editor(frame, &t, editor, app.theme_picker.is_some());
-        } else if let Some(picker) = &app.theme_picker {
-            render_theme_picker(frame, &t, picker);
         }
     }
 
@@ -1953,113 +1678,688 @@ fn render_scrollbar(
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
-fn render_theme_picker(frame: &mut Frame, t: &Theme, picker: &ldnddev_theme::ThemePicker) {
-    use ldnddev_theme::PickerRow;
-    let area = centered_rect(70, 80, frame.area());
-    frame.render_widget(Clear, area);
-    let mut lines = vec![
-        Line::from(format!(
-            "Save: {} (Tab)    Enter apply    e edit colors    s save    Esc revert",
-            picker.save_target.label()
-        )),
-        Line::from(""),
-    ];
-    let view_h = area.height.saturating_sub(5) as usize;
-    for (idx, row) in picker
-        .rows
-        .iter()
-        .enumerate()
-        .skip(picker.scroll)
-        .take(view_h.max(1))
-    {
-        let (label, detail) = match row {
-            PickerRow::Follow { name } => ("Follow desktop".to_string(), name.clone()),
-            PickerRow::Theme(theme) => (theme.name.clone(), theme.mode.label().to_string()),
-            PickerRow::Custom => ("Custom".to_string(), "built-in".to_string()),
+fn footer_hint(app: &AppState, width: u16) -> String {
+    let blocking = app.show_settings
+        || app.show_prompt
+        || app.show_quick_connect
+        || app.show_bookmarks
+        || app.show_key_picker;
+    if blocking {
+        return if width < 80 {
+            "F1:Settings  Esc:Close  ^Q:Quit".to_string()
+        } else {
+            "F1: Settings  Esc: Close  Ctrl+Q: Quit".to_string()
         };
-        let cursor = if idx == picker.selected { ">" } else { " " };
-        lines.push(Line::from(format!("{cursor} {label:<22} {detail}")));
+    }
+    let (f1, quit) = if width < 80 {
+        ("F1:Settings", "^Q:Quit")
+    } else {
+        ("F1: Settings", "Ctrl+Q: Quit")
+    };
+    let middle: &[&str] = if width < 80 {
+        &[
+            "Tab:Pane",
+            "j/k:Nav",
+            "/:Filter",
+            "u/d:Xfer",
+            "m:Sites",
+            "F3:Session",
+        ]
+    } else {
+        &[
+            "F3:Session",
+            "Tab: Pane",
+            "j/k: Nav",
+            "h/l: Dir",
+            "/: Filter",
+            "u/d: Up/Down",
+            "m: Bookmarks",
+            "o: Connect",
+        ]
+    };
+    fit_footer(width, &[f1], middle, &[quit])
+}
+
+/// One footer row. Drops middle tokens from the right so F1 and quit stay.
+fn fit_footer(width: u16, left: &[&str], middle: &[&str], right: &[&str]) -> String {
+    let limit = width as usize;
+    let mut mid: Vec<&str> = middle.to_vec();
+    loop {
+        let mut parts = Vec::with_capacity(left.len() + mid.len() + right.len());
+        parts.extend_from_slice(left);
+        parts.extend(mid.iter().copied());
+        parts.extend_from_slice(right);
+        let line = parts.join("  ");
+        if line.chars().count() <= limit || mid.is_empty() {
+            return line;
+        }
+        mid.pop();
+    }
+}
+
+const SETTINGS_NAV: [&str; 3] = ["Themes", "Session", "Help"];
+
+struct SessionMarks {
+    editor: usize,
+    workers: usize,
+    hide: usize,
+    overwrite: usize,
+    auto: usize,
+    last_local: usize,
+    selected: usize,
+}
+
+fn render_settings(frame: &mut Frame, app: &mut AppState, map: &mut LayoutMap, t: &Theme) {
+    let frame_area = frame.area();
+    if frame_area.height < 4 || frame_area.width == 0 {
+        return;
+    }
+    let width = (frame_area.width / 2).max(1).min(frame_area.width);
+    let height = frame_area.height - 4;
+    if height == 0 {
+        return;
+    }
+    let area = Rect {
+        x: frame_area.x + frame_area.width - width,
+        y: frame_area.y + 3,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Settings ",
+            Style::default()
+                .fg(t.modal_header)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border_active))
+        .style(Style::default().bg(t.modal_background).fg(t.modal_text));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    map.help = Some(area);
+    map.help_scrollbar = Some(Rect {
+        x: area.x + area.width.saturating_sub(1),
+        y: area.y,
+        width: 1,
+        height: area.height,
+    });
+    if app.settings_page > SETTINGS_LAST {
+        app.settings_page = SETTINGS_THEMES;
+    }
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let nav_w = {
+        let max_nav = inner.width.saturating_sub(1).max(1).min(inner.width);
+        let preferred = if area.width < 22 {
+            let spare = inner.width.saturating_sub(8);
+            if spare == 0 {
+                1
+            } else {
+                14.min(spare).max(1)
+            }
+        } else {
+            14
+        };
+        preferred.min(max_nav).max(1).min(inner.width)
+    };
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(nav_w), Constraint::Min(1)])
+        .split(inner);
+    let nav = cols[0];
+    let page = cols[1];
+    paint_settings_nav(frame, app, nav, t, map);
+
+    let section = SETTINGS_NAV
+        .get(app.settings_page as usize)
+        .copied()
+        .unwrap_or("Themes");
+    let title_h = u16::from(page.height > 0);
+    let title_area = Rect {
+        x: page.x,
+        y: page.y,
+        width: page.width,
+        height: title_h,
+    };
+    let content = Rect {
+        x: page.x,
+        y: page.y.saturating_add(title_h),
+        width: page.width,
+        height: page.height.saturating_sub(title_h),
+    };
+    if title_h > 0 {
+        let shown: String = section.chars().take(page.width as usize).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                shown,
+                Style::default()
+                    .fg(t.modal_header)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .style(Style::default().bg(t.modal_background).fg(t.modal_header)),
+            title_area,
+        );
+    }
+
+    let page_kind = app.settings_page;
+    let (lines, selected, marks) = if page_kind == SETTINGS_HELP {
+        (help_lines(t, content.width as usize), None, None)
+    } else if page_kind == SETTINGS_SESSION {
+        let (lines, marks) = session_lines(app, t);
+        let selected = marks.selected;
+        (lines, Some(selected), Some(marks))
+    } else {
+        let (lines, selected) = theme_lines(app, t, content.width as usize);
+        (lines, selected, None)
+    };
+    let line_count = lines.len();
+    map.help_line_count = line_count;
+    paint_settings_lines(frame, app, content, lines, selected, t);
+    if let Some(marks) = marks {
+        record_session_hits(map, content, app.help_scroll, &marks);
+    }
+    render_scrollbar(
+        frame,
+        area,
+        app.help_scroll,
+        line_count,
+        t.scrollbar,
+        t.scrollbar_hover,
+        app.mouse_pos,
+    );
+}
+
+fn paint_settings_nav(
+    frame: &mut Frame,
+    app: &AppState,
+    nav: Rect,
+    t: &Theme,
+    map: &mut LayoutMap,
+) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(t.border_default))
+        .style(Style::default().bg(t.body_background).fg(t.modal_text));
+    let inner = block.inner(nav);
+    frame.render_widget(block, nav);
+    map.settings_nav = Some(inner);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let selected_style = Style::default()
+        .fg(t.text_active_focus)
+        .bg(t.selected_background);
+    let idle = Style::default().fg(t.modal_text).bg(t.body_background);
+    let width = inner.width as usize;
+    let mut lines = Vec::new();
+    for (index, label) in SETTINGS_NAV.iter().enumerate() {
+        let on = app.settings_page == index as u8;
+        let marker = if on { ">" } else { " " };
+        let mut text = format!("{marker} {label}");
+        let count = text.chars().count();
+        if count < width {
+            text.push_str(&" ".repeat(width - count));
+        } else {
+            text = text.chars().take(width).collect();
+        }
+        let style = if on { selected_style } else { idle };
+        lines.push(Line::from(Span::styled(text, style)));
     }
     frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(t.body_background).fg(t.modal_text)),
+        inner,
+    );
+}
+
+fn settings_top(title: &str, width: usize, edge: Style, title_style: Style) -> Line<'static> {
+    let width = width.max(2);
+    let inner = width - 2;
+    let mut label = format!(" {title} ");
+    if label.chars().count() > inner {
+        label = label.chars().take(inner).collect();
+    }
+    let pad = inner - label.chars().count();
+    Line::from(vec![
+        Span::styled("┌", edge),
+        Span::styled(label, title_style),
+        Span::styled(format!("{}┐", "─".repeat(pad)), edge),
+    ])
+}
+
+fn settings_bottom(width: usize, edge: Style) -> Line<'static> {
+    let width = width.max(2);
+    Line::from(Span::styled(format!("└{}┘", "─".repeat(width - 2)), edge))
+}
+
+fn settings_row(body: &str, width: usize, edge: Style, fill: Style) -> Line<'static> {
+    let width = width.max(2);
+    let inner = width - 2;
+    let mut text: String = body.chars().take(inner).collect();
+    let pad = inner - text.chars().count();
+    text.push_str(&" ".repeat(pad));
+    Line::from(vec![
+        Span::styled("│", edge),
+        Span::styled(text, fill),
+        Span::styled("│", edge),
+    ])
+}
+
+fn paint_settings_lines(
+    frame: &mut Frame,
+    app: &mut AppState,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    selected_line: Option<usize>,
+    t: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        app.help_scroll_max = 0;
+        app.help_scroll = 0;
+        return;
+    }
+    let view_h = area.height as usize;
+    let max_scroll = lines.len().saturating_sub(view_h);
+    app.help_scroll_max = max_scroll;
+    if app.settings_follow {
+        if let Some(sel) = selected_line {
+            let top = app.help_scroll;
+            if sel < top {
+                app.help_scroll = sel;
+            } else if sel >= top + view_h {
+                app.help_scroll = sel + 1 - view_h;
+            }
+        }
+        app.settings_follow = false;
+    }
+    if app.help_scroll > max_scroll {
+        app.help_scroll = max_scroll;
+    }
+    let scroll = u16::try_from(app.help_scroll).unwrap_or(u16::MAX);
+    frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .block(
-                Block::default()
-                    .title("F2 Themes")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.border_active)),
-            ),
+            .style(Style::default().fg(t.modal_text).bg(t.modal_background))
+            .scroll((scroll, 0)),
         area,
     );
 }
 
-fn render_theme_editor(
-    frame: &mut Frame,
-    t: &Theme,
-    editor: &ldnddev_theme::ThemeEditor,
-    picker_behind: bool,
-) {
-    use ldnddev_theme::{theme_editor_rows, ThemeEditorRow};
-    let area = centered_rect(80, 80, frame.area());
-    frame.render_widget(Clear, area);
-    let rows = theme_editor_rows(&editor.fields);
-    let channel = ["R", "G", "B"][editor.channel.min(2)];
-    let target = editor.save_target.label().to_uppercase();
-    let esc = if picker_behind {
-        "Esc back"
-    } else {
-        "Esc revert"
-    };
-    let mut lines = vec![
-        Line::from(format!(
-            "Save: {target} (Tab)   Channel: {channel} ([/])   Y save   R reset   {esc}"
-        )),
-        Line::from(if editor.editing_hex {
-            format!("Hex: {}█", editor.hex_draft)
+fn save_target_word(target: ldnddev_theme::ThemeSaveTarget) -> &'static str {
+    match target {
+        ldnddev_theme::ThemeSaveTarget::Local => "Local",
+        ldnddev_theme::ThemeSaveTarget::Global => "Global",
+    }
+}
+
+fn theme_lines(app: &AppState, t: &Theme, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+    use ldnddev_theme::{theme_editor_rows, PickerRow, ThemeEditorRow};
+    let editor = app.theme_editor.clone();
+    let picker = app.theme_picker.clone();
+    let box_w = width.max(2);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut selected_line = None;
+    let rule = Style::default().fg(t.border_default);
+    let header = Style::default()
+        .fg(t.modal_header)
+        .add_modifier(Modifier::BOLD);
+    let hint = if let Some(editor) = &editor {
+        let word = save_target_word(editor.save_target);
+        let esc = if picker.is_some() {
+            "Esc back"
         } else {
-            format!("Hex: {}   Enter / +/- / h l", editor.hex_draft)
-        }),
-        Line::from(""),
-    ];
-    let view_h = area.height.saturating_sub(6) as usize;
-    let start = rows
-        .iter()
-        .position(|row| match row {
-            ThemeEditorRow::Color(idx) => *idx >= editor.scroll,
-            ThemeEditorRow::Header(_) => false,
-        })
-        .unwrap_or(0);
-    let start = if start > 0 && matches!(rows[start - 1], ThemeEditorRow::Header(_)) {
-        start - 1
+            "Esc revert"
+        };
+        format!("j/k move   t {word}   y/s save   R reset   {esc}")
+    } else if let Some(picker) = &picker {
+        let word = save_target_word(picker.save_target);
+        format!("j/k move   Enter apply   e colors   t {word}   y/s save")
     } else {
-        start
+        "j/k move   Enter apply   e colors   t Global/Local   y/s save".to_string()
     };
-    for row in rows.iter().skip(start).take(view_h.max(1)) {
-        match row {
-            ThemeEditorRow::Header(name) => lines.push(Line::from(*name)),
-            ThemeEditorRow::Color(idx) => {
-                let field = editor.fields[*idx];
-                let hex = editor
-                    .palette
-                    .get(field.key)
-                    .map(|c| c.to_hex())
-                    .unwrap_or_else(|| "#000000".into());
-                let cursor = if *idx == editor.selected { ">" } else { " " };
-                lines.push(Line::from(format!("{cursor} {:<22} {hex}", field.key)));
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(t.text_secondary),
+    )));
+
+    if let Some(editor) = &editor {
+        let channel = ["R", "G", "B"][editor.channel.min(2)];
+        if editor.editing_hex {
+            lines.push(Line::from(format!(
+                "Hex: {}█   Channel: {channel}",
+                editor.hex_draft
+            )));
+        } else {
+            lines.push(Line::from(format!(
+                "Hex: {}   Channel: {channel}   Enter edit",
+                editor.hex_draft
+            )));
+        }
+        let selected_style = Style::default()
+            .fg(t.text_active_focus)
+            .bg(t.selected_background);
+        let idle = Style::default().fg(t.modal_text).bg(t.modal_background);
+        let mut open = false;
+        for row in theme_editor_rows(&editor.fields) {
+            match row {
+                ThemeEditorRow::Header(name) => {
+                    if open {
+                        lines.push(settings_bottom(box_w, rule));
+                    }
+                    lines.push(Line::from(""));
+                    lines.push(settings_top(name, box_w, rule, header));
+                    open = true;
+                }
+                ThemeEditorRow::Color(idx) => {
+                    if idx == editor.selected {
+                        selected_line = Some(lines.len());
+                    }
+                    let field = editor.fields[idx];
+                    let hex = editor
+                        .palette
+                        .get(field.key)
+                        .map(|color| color.to_hex())
+                        .unwrap_or_else(|| "#000000".into());
+                    let cursor = if idx == editor.selected { ">" } else { " " };
+                    let style = if idx == editor.selected {
+                        selected_style
+                    } else {
+                        idle
+                    };
+                    lines.push(settings_row(
+                        &format!("{cursor} {:<22} {hex}", field.key),
+                        box_w,
+                        rule,
+                        style,
+                    ));
+                }
             }
         }
+        if open {
+            lines.push(settings_bottom(box_w, rule));
+        }
+    } else if let Some(picker) = &picker {
+        lines.push(Line::from(""));
+        lines.push(settings_top("Themes", box_w, rule, header));
+        let selected_style = Style::default()
+            .fg(t.text_active_focus)
+            .bg(t.selected_background);
+        let idle = Style::default().fg(t.modal_text).bg(t.modal_background);
+        for (idx, row) in picker.rows.iter().enumerate() {
+            if idx == picker.selected {
+                selected_line = Some(lines.len());
+            }
+            let (label, detail) = match row {
+                PickerRow::Follow { name } => ("Follow desktop".to_string(), name.clone()),
+                PickerRow::Theme(theme) => (theme.name.clone(), theme.mode.label().to_string()),
+                PickerRow::Custom => ("Custom".to_string(), "built-in".to_string()),
+            };
+            let cursor = if idx == picker.selected { ">" } else { " " };
+            let style = if idx == picker.selected {
+                selected_style
+            } else {
+                idle
+            };
+            lines.push(settings_row(
+                &format!("{cursor} {label:<22} {detail}"),
+                box_w,
+                rule,
+                style,
+            ));
+        }
+        lines.push(settings_bottom(box_w, rule));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(t.modal_background).fg(t.modal_text))
-            .block(
-                Block::default()
-                    .title("F2 Theme editor")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.border_active)),
-            ),
-        area,
+    (lines, selected_line)
+}
+
+fn session_lines(app: &AppState, t: &Theme) -> (Vec<Line<'static>>, SessionMarks) {
+    let env_override = std::env::var("VISUAL")
+        .ok()
+        .or_else(|| std::env::var("EDITOR").ok())
+        .filter(|s| !s.trim().is_empty());
+    let active = env_override.as_deref().unwrap_or_else(|| {
+        if app.editor.trim().is_empty() {
+            "vi"
+        } else {
+            app.editor.trim()
+        }
+    });
+    let row = |field: SettingsField| -> Style {
+        if app.settings_field == field {
+            Style::default()
+                .fg(t.input_text_focus)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.modal_text)
+        }
+    };
+    let cycle_line = |field: SettingsField, label: &str, value: &str| -> Line<'static> {
+        let mark = if app.settings_field == field {
+            ">"
+        } else {
+            " "
+        };
+        Line::from(Span::styled(
+            format!("{mark} {label:<16} {value}"),
+            row(field),
+        ))
+    };
+    let mut editor_spans = vec![Span::styled(
+        if app.settings_field == SettingsField::Editor {
+            "> "
+        } else {
+            "  "
+        },
+        row(SettingsField::Editor),
+    )];
+    editor_spans.extend(render_field_line(&app.settings_editor, false, t));
+    let mut last_spans = vec![Span::styled(
+        if app.settings_field == SettingsField::LastLocalCwd {
+            "> "
+        } else {
+            "  "
+        },
+        row(SettingsField::LastLocalCwd),
+    )];
+    last_spans.extend(render_field_line(&app.settings_last_local, false, t));
+    let hide = if app.settings_hide_dotfiles {
+        "on"
+    } else {
+        "off"
+    };
+    let auto = if app.settings_auto_connect {
+        "on"
+    } else {
+        "off"
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Editor  (empty = $VISUAL, then $EDITOR, then vi)",
+        Style::default().fg(t.modal_labels),
+    )));
+    let editor = lines.len();
+    lines.push(Line::from(editor_spans));
+    lines.push(Line::from(Span::styled(
+        format!("Active now: {active}"),
+        Style::default().fg(t.text_secondary),
+    )));
+    if env_override.is_some() {
+        lines.push(Line::from(Span::styled(
+            "Environment variable overrides the saved editor",
+            Style::default().fg(t.warning),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(""));
+    let workers = lines.len();
+    lines.push(cycle_line(
+        SettingsField::Workers,
+        "Workers",
+        &app.settings_workers.to_string(),
+    ));
+    let hide_line = lines.len();
+    lines.push(cycle_line(
+        SettingsField::HideDotfiles,
+        "Hide dotfiles",
+        hide,
+    ));
+    let overwrite = lines.len();
+    lines.push(cycle_line(
+        SettingsField::Overwrite,
+        "Overwrite",
+        app.settings_overwrite.settings_label(),
+    ));
+    let auto_line = lines.len();
+    lines.push(cycle_line(SettingsField::AutoConnect, "Auto-connect", auto));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Last local path (restored at launch)",
+        Style::default().fg(t.modal_labels),
+    )));
+    let last_local = lines.len();
+    lines.push(Line::from(last_spans));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Saved to ~/.config/ldnddev/dd_ftp.toml (not the theme file)",
+        Style::default().fg(t.text_secondary),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab cycle | Left/Right/Space change | Enter save | Esc cancel",
+        Style::default().fg(t.warning),
+    )));
+    let selected = match app.settings_field {
+        SettingsField::Editor => editor,
+        SettingsField::Workers => workers,
+        SettingsField::HideDotfiles => hide_line,
+        SettingsField::Overwrite => overwrite,
+        SettingsField::AutoConnect => auto_line,
+        SettingsField::LastLocalCwd => last_local,
+    };
+    (
+        lines,
+        SessionMarks {
+            editor,
+            workers,
+            hide: hide_line,
+            overwrite,
+            auto: auto_line,
+            last_local,
+            selected,
+        },
+    )
+}
+
+fn record_session_hits(map: &mut LayoutMap, content: Rect, scroll: usize, marks: &SessionMarks) {
+    let push_field = |map: &mut LayoutMap, id: FieldId, line: usize| {
+        let Some(area) = visible_line_rect(content, scroll, line) else {
+            return;
+        };
+        map.fields.push(FieldRegion {
+            id,
+            area,
+            text_x: content.x.saturating_add(2),
+        });
+    };
+    let push_control = |map: &mut LayoutMap, id: ControlId, line: usize| {
+        let Some(area) = visible_line_rect(content, scroll, line) else {
+            return;
+        };
+        map.controls.push(ControlRegion { id, area });
+    };
+    push_field(map, FieldId::SettingsEditor, marks.editor);
+    push_field(map, FieldId::SettingsLastLocal, marks.last_local);
+    push_control(map, ControlId::SettingsWorkers, marks.workers);
+    push_control(map, ControlId::SettingsHideDotfiles, marks.hide);
+    push_control(map, ControlId::SettingsOverwrite, marks.overwrite);
+    push_control(map, ControlId::SettingsAutoConnect, marks.auto);
+}
+
+fn visible_line_rect(content: Rect, scroll: usize, line: usize) -> Option<Rect> {
+    if content.width == 0 || content.height == 0 || line < scroll {
+        return None;
+    }
+    let rel = line - scroll;
+    if rel >= content.height as usize {
+        return None;
+    }
+    Some(Rect {
+        x: content.x,
+        y: content.y.saturating_add(rel as u16),
+        width: content.width,
+        height: 1,
+    })
+}
+
+fn help_lines(t: &Theme, width: usize) -> Vec<Line<'static>> {
+    let header = Style::default()
+        .fg(t.modal_header)
+        .add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(t.modal_text);
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled("Controls", header)));
+    lines.push(Line::from(""));
+    let mut last_group: Option<KeyGroup> = None;
+    for kb in KEYMAP {
+        if last_group != Some(kb.group) {
+            if last_group.is_some() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(kb.group.title(), header)));
+            last_group = Some(kb.group);
+        }
+        push_wrapped(
+            &mut lines,
+            &format!("  {}  {}", kb.keys, kb.action),
+            width,
+            body,
+        );
+    }
+    lines.push(Line::from(""));
+    push_wrapped(
+        &mut lines,
+        "Press F1 or Esc to close",
+        width,
+        Style::default().fg(t.warning),
     );
+    lines.push(Line::from(Span::styled(
+        "j/k scroll",
+        Style::default().fg(t.text_secondary),
+    )));
+    lines
+}
+
+fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        lines.push(Line::from(""));
+        return;
+    }
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + width).min(chars.len());
+        if end < chars.len() {
+            if let Some(rel) = chars[start..end].iter().rposition(|c| c.is_whitespace()) {
+                if rel > 0 {
+                    end = start + rel;
+                }
+            }
+        }
+        let slice: String = chars[start..end].iter().collect();
+        lines.push(Line::from(Span::styled(
+            slice.trim_end().to_string(),
+            style,
+        )));
+        start = end;
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -2154,7 +2454,7 @@ mod column_tests {
         app.focus = FocusPane::Queue;
         let mut map = LayoutMap::default();
         terminal
-            .draw(|frame| render(frame, &app, &mut map))
+            .draw(|frame| render(frame, &mut app, &mut map))
             .unwrap();
         assert_eq!(map.queue.height, 3);
         let text: String = terminal
@@ -2188,13 +2488,13 @@ mod column_tests {
         }
         let mut map = LayoutMap::default();
         terminal
-            .draw(|frame| render(frame, &idle_focus, &mut map))
+            .draw(|frame| render(frame, &mut idle_focus, &mut map))
             .unwrap();
         assert_eq!(map.queue.height, 8);
 
         idle_focus.focus = FocusPane::Queue;
         terminal
-            .draw(|frame| render(frame, &idle_focus, &mut map))
+            .draw(|frame| render(frame, &mut idle_focus, &mut map))
             .unwrap();
         assert_eq!(map.queue.height, 8);
 
@@ -2206,7 +2506,7 @@ mod column_tests {
             ));
         }
         terminal
-            .draw(|frame| render(frame, &idle_focus, &mut map))
+            .draw(|frame| render(frame, &mut idle_focus, &mut map))
             .unwrap();
         assert_eq!(map.queue.height, 12);
         assert!(map.queue_list.height >= 1);
@@ -2231,5 +2531,73 @@ mod column_tests {
         );
         // Speed lives on the queue, not TransferJob.
         let _ = queue.speed_and_eta(started.id);
+    }
+
+    #[test]
+    fn footer_hints_match_the_settings_sheet() {
+        let mut app = AppState::default();
+        let narrow = footer_hint(&app, 79);
+        assert!(
+            narrow.starts_with("F1:Settings"),
+            "narrow footer was {narrow}"
+        );
+        assert!(narrow.contains("^Q:Quit"), "narrow footer was {narrow}");
+        assert!(!narrow.contains("F1:Help"));
+        assert!(!narrow.contains("F3:Set"));
+        let wide = footer_hint(&app, 80);
+        assert!(wide.starts_with("F1: Settings"), "wide footer was {wide}");
+        assert!(wide.contains("Ctrl+Q: Quit"), "wide footer was {wide}");
+        assert!(!wide.contains("F1:Help"));
+        assert!(!wide.contains("F3:Set"));
+        app.show_settings = true;
+        assert_eq!(footer_hint(&app, 79), "F1:Settings  Esc:Close  ^Q:Quit");
+        assert_eq!(
+            footer_hint(&app, 80),
+            "F1: Settings  Esc: Close  Ctrl+Q: Quit"
+        );
+    }
+
+    #[test]
+    fn settings_sheet_paints_session_on_the_right_half() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = AppState::default();
+        app.show_settings = true;
+        app.settings_page = SETTINGS_SESSION;
+        let mut map = LayoutMap::default();
+        terminal
+            .draw(|frame| render(frame, &mut app, &mut map))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Settings"));
+        assert!(text.contains("Themes"));
+        assert!(text.contains("Session"));
+        assert!(text.contains("Help"));
+        assert!(text.contains("Workers"));
+        assert!(text.contains("Hide dotfiles"));
+        assert!(text.contains("Auto-connect"));
+        assert!(text.contains("Saved to"));
+        assert!(text.contains("F1: Settings"));
+        assert!(text.contains("Ctrl+Q: Quit"));
+        assert!(!text.contains("F1:Help"));
+        let nav = map.settings_nav.expect("settings nav");
+        assert!(nav.x >= 50, "nav x was {}", nav.x);
+        assert!(map
+            .fields
+            .iter()
+            .any(|field| field.id == FieldId::SettingsEditor));
+        assert!(map
+            .controls
+            .iter()
+            .any(|control| control.id == ControlId::SettingsWorkers));
     }
 }

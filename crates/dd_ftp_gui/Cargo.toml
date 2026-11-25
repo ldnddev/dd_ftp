@@ -1,0 +1,33 @@
+[package]
+name = "dd_ftp_gui"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "GPUI window for dd_ftp"
+
+[[bin]]
+name = "dd_ftp-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+dd_ftp_app = { path = "../dd_ftp_app" }
+dd_ftp_core = { path = "../dd_ftp_core" }
+dd_ftp_storage = { path = "../dd_ftp_storage" }
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+# Linux windows need a backend. wayland and x11 are off by default.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = [
+    "wayland",
+    "x11",
+] }
+gpui_macros = { package = "gpui-pre-macros", version = "=0.3.12" }
+gpui-component = "=0.9.1"
+ldnddev_theme.workspace = true
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
+tempfile = "3"

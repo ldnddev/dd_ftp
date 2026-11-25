@@ -9,11 +9,25 @@ members = [
   "crates/dd_ftp_transfer",
   "crates/dd_ftp_storage",
   "crates/ldnddev_theme",
+  "crates/dd_ftp_gui",
+]
+# dd_ftp_gui is a member so `cargo test --workspace` sees it. It stays off
+# this list so `cargo build` and a terminal install do not compile GPUI.
+default-members = [
+  "crates/dd_ftp_cli",
+  "crates/dd_ftp_app",
+  "crates/dd_ftp_ui",
+  "crates/dd_ftp_core",
+  "crates/dd_ftp_ftp",
+  "crates/dd_ftp_protocols",
+  "crates/dd_ftp_transfer",
+  "crates/dd_ftp_storage",
+  "crates/ldnddev_theme",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "1.8.3"
+version = "1.8.4"
 edition = "2021"
 authors = ["ldnddev"]
 license = "MIT"

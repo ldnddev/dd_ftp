@@ -336,6 +336,12 @@ impl QuickConnectField {
     }
 }
 
+/// Settings sheet pages. Themes is first. Help is last.
+pub const SETTINGS_THEMES: u8 = 0;
+pub const SETTINGS_SESSION: u8 = 1;
+pub const SETTINGS_HELP: u8 = 2;
+pub const SETTINGS_LAST: u8 = 2;
+
 #[derive(Debug)]
 pub struct AppState {
     pub connected: bool,
@@ -349,14 +355,17 @@ pub struct AppState {
     /// Last focused file pane (`Local` or `Remote`). Filter-bar counts use this when Queue is focused.
     pub last_file_pane: FocusPane,
     pub header_copy: String,
-    pub show_help: bool,
-    pub show_theme_debug: bool,
+    /// The Settings sheet (Themes, Session, Help) is open.
+    pub show_settings: bool,
+    pub settings_page: u8,
     pub theme_editor: Option<ldnddev_theme::ThemeEditor>,
     pub theme_picker: Option<ldnddev_theme::ThemePicker>,
     pub omarchy_paths: ldnddev_theme::OmarchyPaths,
     pub follow_stamp: Option<String>,
-    pub show_settings: bool,
     pub help_scroll: usize,
+    pub help_scroll_max: usize,
+    /// Keep the highlighted settings row on screen on the next paint.
+    pub settings_follow: bool,
     pub show_quick_connect: bool,
     pub show_key_picker: bool,
     pub key_picker_cwd: String,
@@ -492,13 +501,23 @@ impl AppState {
     }
 
     pub fn any_modal_open(&self) -> bool {
-        self.show_help
+        self.show_settings
             || self.show_filter
             || self.show_prompt
             || self.show_quick_connect
             || self.show_bookmarks
             || self.show_key_picker
-            || self.show_settings
+    }
+
+    /// Copy live session prefs into the Session page drafts.
+    pub fn hydrate_settings_drafts(&mut self) {
+        self.settings_field = SettingsField::Editor;
+        self.settings_editor = TextField::from_str(&self.editor);
+        self.settings_workers = clamp_worker_concurrency(self.worker_max_concurrency);
+        self.settings_hide_dotfiles = self.hide_dotfiles;
+        self.settings_overwrite = self.default_overwrite_policy;
+        self.settings_auto_connect = self.auto_connect_default;
+        self.settings_last_local = TextField::from_str(&self.local_cwd);
     }
 
     pub fn is_text_prompt(&self) -> bool {
@@ -763,14 +782,15 @@ impl Default for AppState {
             focus: FocusPane::Local,
             last_file_pane: FocusPane::Local,
             header_copy: random_header_copy(),
-            show_help: false,
-            show_theme_debug: false,
+            show_settings: false,
+            settings_page: SETTINGS_THEMES,
             theme_editor: None,
             theme_picker: None,
             omarchy_paths: ldnddev_theme::OmarchyPaths::system(),
             follow_stamp: None,
-            show_settings: false,
             help_scroll: 0,
+            help_scroll_max: 0,
+            settings_follow: false,
             show_quick_connect: false,
             show_key_picker: false,
             key_picker_cwd: String::new(),

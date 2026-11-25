@@ -1,6 +1,6 @@
 # ldnddev TUI Visual Standard
 
-**Single source of truth for consistent look, feel, and structure across all ldnddev terminal user interface applications.**
+**Shell notes for dd_ftp.** The family rule is `dd-tui-template-master.md`. dd_vault is the tie-break. F1 toggles one Settings sheet (Themes, Session, Help). F2 is the same toggle. F3 opens Session. Where this file still says F1 Help or a separate theme screen, follow the family master.
 
 This document incorporates and supersedes the previous separate guides (THEME_STRUCTURE_STANDARD.md for core theming, plus the now-deleted HEADER_FOOTER_GUIDE.md and SOURCE_PANEL_GUIDE.md).
 
@@ -22,7 +22,7 @@ All new ldnddev TUI apps (e.g. dd_dotstore, dd_ftp, etc.) **must** follow this s
 
 7. Port the header tagline randomization (supporting `header_quotes` override from theme) and width-adaptive key hints.
 
-8. Populate F1 Help with the full key + mouse reference, and F2 Credits with theme source/status.
+8. Populate Settings. Themes is first, Help is last and holds the key + mouse reference. F3 opens Session.
 
 9. Test on both narrow (<80 cols) and wide terminals; verify no overflow, good density, and consistent behavior.
 

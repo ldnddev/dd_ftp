@@ -15,6 +15,7 @@ pub struct Theme {
     pub text_labels_active: Color,
     pub text_active_focus: Color,
     pub modal_labels: Color,
+    pub modal_header: Color,
     pub modal_text: Color,
     pub selected_background: Color,
     pub border_default: Color,
@@ -51,6 +52,7 @@ impl Default for Theme {
             text_labels_active: Color::Rgb(0x64, 0xb4, 0xf5),
             text_active_focus: Color::Rgb(0x64, 0xb4, 0xf5),
             modal_labels: Color::Rgb(0x64, 0xb4, 0xf5),
+            modal_header: Color::Rgb(0x64, 0xb4, 0xf5),
             modal_text: Color::Rgb(0xf5, 0xf6, 0xf7),
             selected_background: Color::Rgb(0x0f, 0x11, 0x14),
             border_default: Color::Rgb(0xf5, 0xf6, 0xf7),
@@ -101,6 +103,8 @@ struct ThemeColors {
     text_labels_active: Option<String>,
     text_active_focus: Option<String>,
     modal_labels: String,
+    #[serde(default)]
+    modal_header: Option<String>,
     modal_text: String,
     selected_background: String,
     border_default: String,
@@ -148,7 +152,7 @@ pub struct LoadedTheme {
     /// or files missing the field).
     pub version: Option<u32>,
     /// Non-fatal load warning (bad version, parse fallback). Surfaced at
-    /// startup as a toast and in the F2 Credits modal.
+    /// startup as a toast and on the Themes page.
     pub warning: Option<String>,
     /// Optional per-theme header tagline override. Empty = use built-in list.
     pub header_quotes: Vec<String>,
@@ -395,6 +399,7 @@ fn parse_theme(content: &str) -> anyhow::Result<ThemeFile> {
             text_labels_active: map.get("text_labels_active").cloned(),
             text_active_focus: map.get("text_active_focus").cloned(),
             modal_labels: get("modal_labels")?,
+            modal_header: map.get("modal_header").cloned(),
             modal_text: get("modal_text")?,
             selected_background: get("selected_background")?,
             border_default: get("border_default")?,
@@ -440,6 +445,11 @@ fn map_theme(tf: ThemeFile) -> Theme {
             .and_then(parse_hex)
             .unwrap_or(Theme::default().text_active_focus),
         modal_labels: parse_hex(&c.modal_labels).unwrap_or(Theme::default().modal_labels),
+        modal_header: c
+            .modal_header
+            .as_deref()
+            .and_then(parse_hex)
+            .unwrap_or(Theme::default().modal_header),
         modal_text: parse_hex(&c.modal_text).unwrap_or(Theme::default().modal_text),
         selected_background: parse_hex(&c.selected_background)
             .unwrap_or(Theme::default().selected_background),
@@ -511,6 +521,7 @@ fn theme_from_palette(palette: &ldnddev_theme::Palette) -> Theme {
         text_labels_active: get("text_labels_active").unwrap_or(text_active_focus),
         text_active_focus,
         modal_labels: get("modal_labels").unwrap_or(fallback.modal_labels),
+        modal_header: get("modal_header").unwrap_or(fallback.modal_header),
         modal_text: get("modal_text").unwrap_or(fallback.modal_text),
         selected_background: get("selected_background").unwrap_or(fallback.selected_background),
         border_default: get("border_default").unwrap_or(fallback.border_default),
@@ -547,7 +558,10 @@ fn parse_hex(input: &str) -> Option<Color> {
 }
 
 pub fn extra_theme_fields() -> &'static [ldnddev_theme::ColorField] {
-    &[ldnddev_theme::EXTRA_SELECTION]
+    &[
+        ldnddev_theme::EXTRA_MODAL_HEADER,
+        ldnddev_theme::EXTRA_SELECTION,
+    ]
 }
 
 fn color_to_rgb(color: Color) -> Option<ldnddev_theme::Rgb> {
@@ -573,6 +587,7 @@ pub fn palette_from_theme(theme: &Theme, quotes: Vec<String>) -> ldnddev_theme::
         ("text_labels", theme.text_labels),
         ("text_active_focus", theme.text_active_focus),
         ("modal_labels", theme.modal_labels),
+        ("modal_header", theme.modal_header),
         ("modal_text", theme.modal_text),
         ("selected_background", theme.selected_background),
         ("border_default", theme.border_default),
@@ -629,6 +644,9 @@ pub fn apply_palette(theme: &mut Theme, palette: &ldnddev_theme::Palette) {
     }
     if let Some(c) = get("modal_labels") {
         theme.modal_labels = c;
+    }
+    if let Some(c) = get("modal_header") {
+        theme.modal_header = c;
     }
     if let Some(c) = get("modal_text") {
         theme.modal_text = c;
@@ -749,7 +767,7 @@ pub fn close_theme(app: &mut dd_ftp_app::AppState, revert: bool) {
 /// Re-read `omarchy: follow` when the desktop theme file changes.
 /// Does not touch the header tagline.
 pub fn refresh_followed_theme(app: &mut dd_ftp_app::AppState) -> bool {
-    if app.show_theme_debug {
+    if app.show_settings {
         return false;
     }
     if !matches!(

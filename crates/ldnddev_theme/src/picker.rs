@@ -71,6 +71,13 @@ impl ThemePicker {
         self.snapshot.clone()
     }
 
+    /// Paint the highlighted row into [`Self::palette`].
+    /// The snapshot from [`Self::new`] stays, so Esc can still revert.
+    /// `handle` does not call this for j/k; the sheet applies after those keys.
+    pub fn preview_selected(&mut self) -> PickerOutcome {
+        self.apply_selected()
+    }
+
     pub fn select(&mut self, selected: usize) {
         let last = self.rows.len().saturating_sub(1);
         self.selected = selected.min(last);

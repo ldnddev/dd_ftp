@@ -11,7 +11,10 @@ use std::{future::poll_fn, io, path::Path, time::Duration};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, EventStream},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -23,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
 use crate::bookmarks::{hydrate_password_from_keyring, run_keyring_health_check};
-use crate::events::{accept_key_event, handle_key, LoopControl};
+use crate::events::{accept_key_event, handle_key, paste_text, LoopControl};
 use crate::mouse::handle_mouse;
 use crate::paths::local_list;
 use crate::session::{connection_info_from_env, handle_io_message, Runtime};
@@ -36,7 +39,12 @@ use crate::workers::{
 async fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -116,6 +124,7 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
@@ -301,6 +310,10 @@ fn handle_terminal_event(
     drag_field: &mut Option<dd_ftp_ui::FieldId>,
 ) -> Result<(LoopControl, bool)> {
     match ev {
+        Event::Paste(text) => {
+            paste_text(app, &text);
+            Ok((LoopControl::Continue, true))
+        }
         Event::Key(key) => {
             if !accept_key_event(key, app) {
                 return Ok((LoopControl::Continue, false));
@@ -327,6 +340,7 @@ fn suspend_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
@@ -345,7 +359,8 @@ fn resume_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        EnableMouseCapture
+        EnableMouseCapture,
+        EnableBracketedPaste
     )?;
     terminal.hide_cursor()?;
     terminal.clear()?;

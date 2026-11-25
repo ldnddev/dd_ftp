@@ -34,27 +34,27 @@ pub struct KeyBinding {
 pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "F1",
-        action: "Toggle help (opening closes theme debug)",
+        action: "Toggle Settings (opens on Themes; again closes and reverts the theme)",
         group: KeyGroup::Global,
     },
     KeyBinding {
         keys: "Esc",
-        action: "Close current modal; when compare is on and no modal is open, close compare; otherwise clear marks",
+        action: "Settings: step back from the color editor, then close and revert the theme. Otherwise close the current modal; when compare is on and no modal is open, close compare; otherwise clear marks",
         group: KeyGroup::Global,
     },
     KeyBinding {
         keys: "F2",
-        action: "Omarchy themes (Enter apply, e edit, s save; opening closes help)",
+        action: "Same Settings toggle as F1",
         group: KeyGroup::Global,
     },
     KeyBinding {
         keys: "F3",
-        action: "Toggle settings (editor, workers, hide-dotfiles, overwrite, auto-connect, last path; saved to ~/.config/ldnddev/dd_ftp.toml)",
+        action: "Open Settings on Session (editor, workers, hide-dotfiles, overwrite, auto-connect, last path; saved to ~/.config/ldnddev/dd_ftp.toml)",
         group: KeyGroup::Global,
     },
     KeyBinding {
         keys: "Tab (settings)",
-        action: "Cycle settings fields",
+        action: "Themes and Help: change page ([ and ] too, except inside a hex field). Session: cycle fields",
         group: KeyGroup::Global,
     },
     KeyBinding {
@@ -69,7 +69,7 @@ pub const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Ctrl+C",
-        action: "Cancel in-flight transfers (ignored while help, filter, prompt, or quick-connect is open)",
+        action: "Cancel in-flight transfers (ignored while the Help page, filter, prompt, or quick-connect is open)",
         group: KeyGroup::Global,
     },
     KeyBinding {

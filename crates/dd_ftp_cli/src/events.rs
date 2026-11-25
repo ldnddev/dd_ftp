@@ -5,7 +5,8 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dd_ftp_app::{
     parse_octal_mode, reduce, Action, AppState, ChoicePromptKind, FocusPane, PromptKind,
-    QuickConnectField, SelectPolicy, TextPromptKind,
+    QuickConnectField, SelectPolicy, SettingsField, TextPromptKind, SETTINGS_HELP, SETTINGS_LAST,
+    SETTINGS_SESSION, SETTINGS_THEMES,
 };
 use dd_ftp_core::{ConnectionInfo, TransferStatus};
 use dd_ftp_storage::SecretStore;
@@ -47,8 +48,7 @@ fn key_repeat_is_useful(code: KeyCode, app: &AppState) -> bool {
     let typing = app.show_filter
         || app.is_text_prompt()
         || app.show_quick_connect
-        || app.show_settings
-        || app.show_theme_debug;
+        || app.show_settings;
     match code {
         KeyCode::Char(_) if typing => true,
         KeyCode::Char('j' | 'k' | 'h' | 'l') if !typing => true,
@@ -72,8 +72,7 @@ pub(crate) fn handle_key(
     layout: &LayoutMap,
 ) -> Result<LoopControl> {
     if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if app.show_help
-            || app.show_prompt
+        if app.show_prompt
             || app.show_quick_connect
             || app.show_settings
             || app.show_bookmarks
@@ -86,7 +85,11 @@ pub(crate) fn handle_key(
     }
 
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if app.show_help || app.show_filter || app.show_prompt || app.show_quick_connect {
+        if (app.show_settings && app.settings_page == SETTINGS_HELP)
+            || app.show_filter
+            || app.show_prompt
+            || app.show_quick_connect
+        {
             return Ok(LoopControl::Continue);
         }
         reduce(
@@ -156,59 +159,24 @@ pub(crate) fn handle_key(
         return Ok(LoopControl::Continue);
     }
 
-    if key.code == KeyCode::F(1) && (!app.any_modal_open() || app.show_help) {
-        if app.show_theme_debug && !app.show_help {
-            dd_ftp_ui::close_theme(app, true);
-        }
-        reduce(app, Action::ToggleHelp);
+    // A confirm stays above the sheet. The sheet must not swallow it.
+    if app.show_settings && !app.show_prompt {
+        handle_settings_sheet(app, runtime, key, layout);
         return Ok(LoopControl::Continue);
     }
 
-    if key.code == KeyCode::F(2) && (!app.any_modal_open() || app.show_theme_debug) {
-        if app.show_theme_debug {
-            dd_ftp_ui::close_theme(app, true);
-        } else {
-            dd_ftp_ui::open_theme_ui(app);
-        }
-        reduce(app, Action::ToggleThemeDebug);
+    if !app.any_modal_open() && matches!(key.code, KeyCode::F(1) | KeyCode::F(2)) {
+        open_settings_sheet(app, SETTINGS_THEMES);
         return Ok(LoopControl::Continue);
     }
 
-    if app.show_theme_debug
-        && (app.theme_editor.is_some() || app.theme_picker.is_some())
-        && key.code != KeyCode::F(1)
-    {
-        handle_theme_overlay(app, key);
-        return Ok(LoopControl::Continue);
-    }
-
-    if key.code == KeyCode::F(3)
-        && (!app.any_modal_open() || app.show_settings || app.show_help || app.show_theme_debug)
-    {
-        reduce(app, Action::ToggleSettings);
+    if !app.any_modal_open() && key.code == KeyCode::F(3) {
+        open_settings_sheet(app, SETTINGS_SESSION);
         return Ok(LoopControl::Continue);
     }
 
     if !app.any_modal_open() && key.code == KeyCode::Char('/') {
         reduce(app, Action::ToggleFilter);
-        return Ok(LoopControl::Continue);
-    }
-
-    if app.show_help {
-        match key.code {
-            KeyCode::Esc => reduce(app, Action::ToggleHelp),
-            KeyCode::Up | KeyCode::Char('k') => {
-                reduce(app, Action::HelpScroll(-1));
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                reduce(app, Action::HelpScroll(1));
-            }
-            KeyCode::PageUp => jump_help(app, layout, Jump::Page(-1)),
-            KeyCode::PageDown => jump_help(app, layout, Jump::Page(1)),
-            KeyCode::Home => jump_help(app, layout, Jump::Home),
-            KeyCode::End => jump_help(app, layout, Jump::End),
-            _ => {}
-        }
         return Ok(LoopControl::Continue);
     }
 
@@ -218,59 +186,6 @@ pub(crate) fn handle_key(
             KeyCode::Enter => reduce(app, Action::CloseFilterKeep),
             KeyCode::Backspace => reduce(app, Action::FilterBackspace),
             KeyCode::Char(ch) => reduce(app, Action::FilterInput(ch)),
-            _ => {}
-        }
-        return Ok(LoopControl::Continue);
-    }
-
-    if app.show_settings {
-        match key.code {
-            KeyCode::Esc | KeyCode::F(3) => reduce(app, Action::ToggleSettings),
-            KeyCode::Enter => save_settings(app, runtime),
-            KeyCode::Tab | KeyCode::Down => reduce(app, Action::SettingsNextField),
-            KeyCode::BackTab | KeyCode::Up => reduce(app, Action::SettingsPrevField),
-            KeyCode::Backspace if app.settings_field.is_text() => {
-                reduce(app, Action::SettingsBackspace);
-            }
-            KeyCode::Left => {
-                if app.settings_field.is_text() {
-                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                    reduce(app, Action::SettingsMoveCursor { dir: -1, shift });
-                } else {
-                    reduce(app, Action::SettingsCycleValue(-1));
-                }
-            }
-            KeyCode::Right => {
-                if app.settings_field.is_text() {
-                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                    reduce(app, Action::SettingsMoveCursor { dir: 1, shift });
-                } else {
-                    reduce(app, Action::SettingsCycleValue(1));
-                }
-            }
-            KeyCode::Home if app.settings_field.is_text() => {
-                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                if let Some(tf) = app.settings_text_mut() {
-                    tf.move_home(shift);
-                }
-            }
-            KeyCode::End if app.settings_field.is_text() => {
-                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                if let Some(tf) = app.settings_text_mut() {
-                    tf.move_end(shift);
-                }
-            }
-            KeyCode::Delete if app.settings_field.is_text() => {
-                if let Some(tf) = app.settings_text_mut() {
-                    tf.delete();
-                }
-            }
-            KeyCode::Char(' ') if !app.settings_field.is_text() => {
-                reduce(app, Action::SettingsCycleValue(1));
-            }
-            KeyCode::Char(ch) if app.settings_field.is_text() => {
-                reduce(app, Action::SettingsInput(ch));
-            }
             _ => {}
         }
         return Ok(LoopControl::Continue);
@@ -1078,7 +993,7 @@ fn save_settings(app: &mut AppState, runtime: &mut Runtime) {
                     auto_connect: app.settings_auto_connect,
                 },
             );
-            reduce(app, Action::ToggleSettings);
+            close_settings_sheet(app);
             runtime.default_overwrite_policy = app.default_overwrite_policy;
             if !crate::session::drain_busy(runtime) {
                 runtime.overwrite_policy = app.default_overwrite_policy;
@@ -1250,6 +1165,247 @@ pub(crate) fn key_picker_go_parent(app: &mut AppState) {
     key_picker_load(app, parent, SelectPolicy::Reset, came_from);
 }
 
+fn open_settings_sheet(app: &mut AppState, page: u8) {
+    let opening = !app.show_settings;
+    if opening {
+        dd_ftp_ui::open_theme_ui(app);
+        app.hydrate_settings_drafts();
+        app.show_settings = true;
+    }
+    if opening || app.settings_page != page {
+        app.settings_page = page;
+        app.help_scroll = 0;
+        app.settings_follow = true;
+        if page == SETTINGS_SESSION {
+            app.settings_field = SettingsField::Editor;
+        }
+    }
+}
+
+fn close_settings_sheet(app: &mut AppState) {
+    dd_ftp_ui::close_theme(app, true);
+    app.show_settings = false;
+    app.settings_page = SETTINGS_THEMES;
+    app.help_scroll = 0;
+    app.settings_follow = false;
+}
+
+fn handle_settings_sheet(
+    app: &mut AppState,
+    runtime: &mut Runtime,
+    key: KeyEvent,
+    layout: &LayoutMap,
+) {
+    if matches!(key.code, KeyCode::F(1) | KeyCode::F(2)) {
+        close_settings_sheet(app);
+        return;
+    }
+    if key.code == KeyCode::F(3) {
+        open_settings_sheet(app, SETTINGS_SESSION);
+        return;
+    }
+    if key.code == KeyCode::PageDown {
+        let rows = sheet_page_rows(layout);
+        scroll_settings(app, rows);
+        return;
+    }
+    if key.code == KeyCode::PageUp {
+        let rows = sheet_page_rows(layout);
+        scroll_settings(app, -rows);
+        return;
+    }
+    match app.settings_page {
+        SETTINGS_HELP => handle_help_page(app, key),
+        SETTINGS_SESSION => handle_session_page(app, runtime, key),
+        _ => handle_themes_page(app, key),
+    }
+}
+
+fn sheet_page_rows(layout: &LayoutMap) -> i32 {
+    layout
+        .help
+        .map(|area| i32::from(area.height).max(1))
+        .unwrap_or(10)
+}
+
+fn scroll_settings(app: &mut AppState, delta: i32) {
+    app.settings_follow = false;
+    if delta < 0 {
+        app.help_scroll = app.help_scroll.saturating_sub(delta.unsigned_abs() as usize);
+    } else {
+        app.help_scroll = app
+            .help_scroll
+            .saturating_add(delta as usize)
+            .min(app.help_scroll_max);
+    }
+}
+
+fn change_settings_page(app: &mut AppState, dir: isize) {
+    let next = (app.settings_page as isize + dir).clamp(0, SETTINGS_LAST as isize) as u8;
+    if next != app.settings_page {
+        app.settings_page = next;
+        app.settings_field = SettingsField::Editor;
+        app.help_scroll = 0;
+        app.settings_follow = true;
+    }
+}
+
+fn editing_theme_hex(app: &AppState) -> bool {
+    app.theme_editor
+        .as_ref()
+        .is_some_and(|editor| editor.editing_hex)
+}
+
+/// Tab, Shift-Tab, `[`, and `]` change page. A hex field keeps the brackets.
+fn settings_section_key(app: &mut AppState, key: KeyEvent) -> bool {
+    let Some(dir) = settings_section_dir(key) else {
+        return false;
+    };
+    let tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+    if !tab && editing_theme_hex(app) {
+        return false;
+    }
+    change_settings_page(app, dir);
+    true
+}
+
+fn settings_section_dir(key: KeyEvent) -> Option<isize> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::BackTab => Some(-1),
+        KeyCode::Tab => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                Some(-1)
+            } else {
+                Some(1)
+            }
+        }
+        KeyCode::Char(']') => Some(1),
+        KeyCode::Char('[') => Some(-1),
+        _ => None,
+    }
+}
+
+fn save_target_key(app: &AppState, key: KeyEvent) -> bool {
+    if editing_theme_hex(app) || key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+}
+
+fn toggle_save_target(app: &mut AppState) {
+    let from_editor = if let Some(editor) = app.theme_editor.as_mut() {
+        editor.save_target = editor.save_target.toggled();
+        Some(editor.save_target)
+    } else {
+        None
+    };
+    if let Some(target) = from_editor {
+        if let Some(picker) = app.theme_picker.as_mut() {
+            picker.save_target = target;
+        }
+        return;
+    }
+    if let Some(picker) = app.theme_picker.as_mut() {
+        picker.save_target = picker.save_target.toggled();
+    }
+}
+
+fn handle_help_page(app: &mut AppState, key: KeyEvent) {
+    if settings_section_key(app, key) {
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => close_settings_sheet(app),
+        KeyCode::Down | KeyCode::Char('j') => scroll_settings(app, 1),
+        KeyCode::Up | KeyCode::Char('k') => scroll_settings(app, -1),
+        KeyCode::Home | KeyCode::Char('g') => app.help_scroll = 0,
+        KeyCode::End | KeyCode::Char('G') => app.help_scroll = app.help_scroll_max,
+        _ => {}
+    }
+}
+
+fn handle_session_page(app: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
+    if !app.settings_field.is_text() {
+        if let Some(dir) = match key.code {
+            KeyCode::Char(']') => Some(1),
+            KeyCode::Char('[') => Some(-1),
+            _ => None,
+        } {
+            change_settings_page(app, dir);
+            return;
+        }
+    }
+    match key.code {
+        KeyCode::Esc => close_settings_sheet(app),
+        KeyCode::Enter => save_settings(app, runtime),
+        KeyCode::Tab | KeyCode::Down => reduce(app, Action::SettingsNextField),
+        KeyCode::BackTab | KeyCode::Up => reduce(app, Action::SettingsPrevField),
+        KeyCode::Backspace if app.settings_field.is_text() => {
+            reduce(app, Action::SettingsBackspace);
+        }
+        KeyCode::Left => {
+            if app.settings_field.is_text() {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                reduce(app, Action::SettingsMoveCursor { dir: -1, shift });
+            } else {
+                reduce(app, Action::SettingsCycleValue(-1));
+            }
+        }
+        KeyCode::Right => {
+            if app.settings_field.is_text() {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                reduce(app, Action::SettingsMoveCursor { dir: 1, shift });
+            } else {
+                reduce(app, Action::SettingsCycleValue(1));
+            }
+        }
+        KeyCode::Home if app.settings_field.is_text() => {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            if let Some(tf) = app.settings_text_mut() {
+                tf.move_home(shift);
+            }
+        }
+        KeyCode::End if app.settings_field.is_text() => {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            if let Some(tf) = app.settings_text_mut() {
+                tf.move_end(shift);
+            }
+        }
+        KeyCode::Delete if app.settings_field.is_text() => {
+            if let Some(tf) = app.settings_text_mut() {
+                tf.delete();
+            }
+        }
+        KeyCode::Char(' ') if !app.settings_field.is_text() => {
+            reduce(app, Action::SettingsCycleValue(1));
+        }
+        KeyCode::Char(ch) if app.settings_field.is_text() => {
+            reduce(app, Action::SettingsInput(ch));
+        }
+        _ => {}
+    }
+}
+
+fn handle_themes_page(app: &mut AppState, key: KeyEvent) {
+    if settings_section_key(app, key) {
+        return;
+    }
+    if save_target_key(app, key) {
+        toggle_save_target(app);
+        return;
+    }
+    if app.theme_editor.is_some() || app.theme_picker.is_some() {
+        handle_theme_overlay(app, key);
+    } else if key.code == KeyCode::Esc {
+        close_settings_sheet(app);
+    }
+}
+
 fn handle_theme_overlay(app: &mut AppState, key: KeyEvent) {
     let Some(ek) = map_editor_key(key) else {
         return;
@@ -1259,6 +1415,39 @@ fn handle_theme_overlay(app: &mut AppState, key: KeyEvent) {
         dispatch_theme_editor(app, ek, shift);
     } else {
         dispatch_theme_picker(app, ek);
+    }
+}
+
+fn theme_motion(key: ldnddev_theme::EditorKey) -> bool {
+    matches!(
+        key,
+        ldnddev_theme::EditorKey::Down
+            | ldnddev_theme::EditorKey::Up
+            | ldnddev_theme::EditorKey::Char('j')
+            | ldnddev_theme::EditorKey::Char('k')
+            | ldnddev_theme::EditorKey::Char('g')
+            | ldnddev_theme::EditorKey::Char('G')
+    )
+}
+
+fn preview_theme_row(app: &mut AppState) {
+    let outcome = {
+        let Some(picker) = app.theme_picker.as_mut() else {
+            return;
+        };
+        picker.preview_selected()
+    };
+    match outcome {
+        ldnddev_theme::PickerOutcome::Applied => {
+            if let Some(picker) = app.theme_picker.as_ref() {
+                let palette = picker.palette.clone();
+                dd_ftp_ui::apply_live_theme(&palette);
+            }
+        }
+        ldnddev_theme::PickerOutcome::Error(msg) => {
+            reduce(app, Action::ShowError(msg));
+        }
+        _ => {}
     }
 }
 
@@ -1301,7 +1490,12 @@ fn dispatch_theme_picker(app: &mut AppState, ek: ldnddev_theme::EditorKey) {
             reduce(app, Action::ShowError(msg));
         }
         ldnddev_theme::PickerOutcome::Closed { .. } => dismiss_theme(app),
-        ldnddev_theme::PickerOutcome::None => {}
+        ldnddev_theme::PickerOutcome::None => {
+            if theme_motion(ek) {
+                preview_theme_row(app);
+                app.settings_follow = true;
+            }
+        }
     }
 }
 
@@ -1355,15 +1549,20 @@ fn dispatch_theme_editor(app: &mut AppState, ek: ldnddev_theme::EditorKey, shift
         ldnddev_theme::EditorOutcome::HexError(msg) => {
             reduce(app, Action::ShowError(msg));
         }
-        ldnddev_theme::EditorOutcome::None => {}
+        ldnddev_theme::EditorOutcome::None => {
+            let editing = app
+                .theme_editor
+                .as_ref()
+                .is_some_and(|editor| editor.editing_hex);
+            if theme_motion(ek) && !editing {
+                app.settings_follow = true;
+            }
+        }
     }
 }
 
 fn dismiss_theme(app: &mut AppState) {
-    dd_ftp_ui::close_theme(app, true);
-    if app.show_theme_debug {
-        reduce(app, Action::ToggleThemeDebug);
-    }
+    close_settings_sheet(app);
 }
 
 fn theme_fields(app: &AppState) -> Vec<ldnddev_theme::ColorField> {
@@ -1403,9 +1602,10 @@ fn save_theme_palette(
             app.follow_stamp = ldnddev_theme::follow_stamp(&app.omarchy_paths);
             app.theme_editor = None;
             app.theme_picker = None;
-            if app.show_theme_debug {
-                reduce(app, Action::ToggleThemeDebug);
-            }
+            app.show_settings = false;
+            app.settings_page = SETTINGS_THEMES;
+            app.help_scroll = 0;
+            app.settings_follow = false;
             reduce(
                 app,
                 Action::SetStatus(format!("Theme saved to {}", path.display())),
@@ -1416,6 +1616,53 @@ fn save_theme_palette(
                 app,
                 Action::ShowError(format!("Could not save theme: {err}")),
             );
+        }
+    }
+}
+
+/// One bracketed paste into the field that would receive typed characters.
+/// Newlines and other controls are dropped. A selection is replaced once,
+/// then the rest of the paste appends.
+pub(crate) fn paste_text(app: &mut AppState, raw: &str) {
+    let chars: Vec<char> = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_graphic() || *ch == ' ')
+        .collect();
+    if chars.is_empty() {
+        return;
+    }
+    if app.is_text_prompt() {
+        for ch in chars {
+            reduce(app, Action::PromptInput(ch));
+        }
+        return;
+    }
+    if app.show_settings && !app.show_prompt {
+        if app.settings_page == SETTINGS_THEMES
+            && app
+                .theme_editor
+                .as_ref()
+                .is_some_and(|editor| editor.editing_hex)
+        {
+            for ch in chars {
+                dispatch_theme_editor(app, ldnddev_theme::EditorKey::Char(ch), false);
+            }
+        } else if app.settings_page == SETTINGS_SESSION && app.settings_field.is_text() {
+            for ch in chars {
+                reduce(app, Action::SettingsInput(ch));
+            }
+        }
+        return;
+    }
+    if app.show_filter {
+        for ch in chars {
+            reduce(app, Action::FilterInput(ch));
+        }
+        return;
+    }
+    if app.show_quick_connect {
+        for ch in chars {
+            reduce(app, Action::QuickConnectInput(ch));
         }
     }
 }
@@ -1439,6 +1686,28 @@ fn map_editor_key(key: KeyEvent) -> Option<ldnddev_theme::EditorKey> {
 mod connect_info_tests {
     use super::*;
     use dd_ftp_core::Protocol;
+
+    #[test]
+    fn bracketed_paste_is_one_insert_in_the_filter() {
+        let mut app = AppState::default();
+        app.show_filter = true;
+        paste_text(&mut app, "ab\r\ncd\u{1b}e");
+        assert_eq!(app.filter_pattern, "abcde");
+    }
+
+    #[test]
+    fn bracketed_paste_replaces_a_prompt_selection_once() {
+        let mut app = AppState::default();
+        app.show_prompt = true;
+        app.prompt_kind = Some(PromptKind::Text(TextPromptKind::Rename));
+        app.prompt_value = dd_ftp_app::TextField {
+            value: "hello".into(),
+            cursor: 4,
+            anchor: Some(1),
+        };
+        paste_text(&mut app, "XY");
+        assert_eq!(app.prompt_value.value, "hXYo");
+    }
 
     #[test]
     fn selected_or_quick_connect_uses_form_not_bookmark() {
@@ -1710,20 +1979,6 @@ enum Jump {
     End,
 }
 
-fn jump_help(app: &mut AppState, layout: &LayoutMap, jump: Jump) {
-    let rows = page_rows_for(layout.help.unwrap_or_default());
-    let last = layout.help_line_count.saturating_sub(rows);
-    let target = match jump {
-        Jump::Home => 0,
-        Jump::End => last,
-        Jump::Page(dir) => offset_index(app.help_scroll, last, dir.saturating_mul(rows as i32)),
-    };
-    reduce(
-        app,
-        Action::HelpScroll(target as i32 - app.help_scroll as i32),
-    );
-}
-
 fn jump_key_picker(app: &mut AppState, layout: &LayoutMap, jump: Jump) {
     let last = app.visible_key_picker().len().saturating_sub(1);
     let rows = page_rows_for(layout.key_picker_list);
@@ -1861,7 +2116,8 @@ mod theme_overlay_tests {
         let before = body_hex();
 
         press(&mut app, KeyCode::F(2));
-        assert!(app.show_theme_debug);
+        assert!(app.show_settings);
+        assert_eq!(app.settings_page, dd_ftp_app::SETTINGS_THEMES);
         assert!(app.theme_picker.is_some());
         assert!(app.theme_editor.is_none());
         let picker = app.theme_picker.as_ref().expect("picker");
@@ -1869,27 +2125,135 @@ mod theme_overlay_tests {
             picker.rows.get(picker.selected),
             Some(PickerRow::Custom)
         ));
+        assert_eq!(
+            picker.save_target,
+            ldnddev_theme::ThemeSaveTarget::Global
+        );
 
         press(&mut app, KeyCode::Enter);
         assert_eq!(body_hex(), before);
 
         press(&mut app, KeyCode::Char('g'));
-        press(&mut app, KeyCode::Enter);
         assert_eq!(body_hex(), "#1A1B26");
+        let selected_before_page = app.theme_picker.as_ref().expect("picker").selected;
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(
+            app.theme_picker.as_ref().expect("picker").selected,
+            selected_before_page
+        );
 
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(
+            app.theme_picker.as_ref().expect("picker").save_target,
+            ldnddev_theme::ThemeSaveTarget::Local
+        );
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(
+            app.theme_picker.as_ref().expect("picker").save_target,
+            ldnddev_theme::ThemeSaveTarget::Global
+        );
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.settings_page, dd_ftp_app::SETTINGS_SESSION);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.settings_field, dd_ftp_app::SettingsField::Workers);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.settings_page, dd_ftp_app::SETTINGS_HELP);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_settings);
+        assert_eq!(body_hex(), before);
+
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_settings);
+        assert_eq!(app.settings_page, dd_ftp_app::SETTINGS_THEMES);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(body_hex(), "#1A1B26");
         press(&mut app, KeyCode::Char('e'));
         assert!(app.theme_editor.is_some());
         assert!(app.theme_picker.is_some());
-
         press(&mut app, KeyCode::Esc);
-        assert!(app.show_theme_debug);
+        assert!(app.show_settings);
         assert!(app.theme_editor.is_none());
         assert!(app.theme_picker.is_some());
-
-        press(&mut app, KeyCode::Esc);
-        assert!(!app.show_theme_debug);
+        press(&mut app, KeyCode::F(1));
+        assert!(!app.show_settings);
         assert!(app.theme_picker.is_none());
-        assert!(app.theme_editor.is_none());
+        assert_eq!(body_hex(), before);
+
+        press(&mut app, KeyCode::F(2));
+        assert!(app.show_settings);
+        press(&mut app, KeyCode::F(2));
+        assert!(!app.show_settings);
+        assert_eq!(body_hex(), before);
+
+        press(&mut app, KeyCode::F(3));
+        assert!(app.show_settings);
+        assert_eq!(app.settings_page, dd_ftp_app::SETTINGS_SESSION);
+        assert!(app.theme_picker.is_some() || app.theme_editor.is_some());
+        press(&mut app, KeyCode::F(3));
+        assert!(app.show_settings);
+        assert_eq!(app.settings_page, dd_ftp_app::SETTINGS_SESSION);
+        let workers = app.worker_max_concurrency;
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        assert_ne!(app.settings_workers, workers);
+        assert_eq!(app.worker_max_concurrency, workers);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_settings);
+        assert_eq!(app.worker_max_concurrency, workers);
+        assert_eq!(body_hex(), before);
+    }
+
+    #[test]
+    fn ctrl_q_quits_from_the_sheet_and_bare_q_does_not() {
+        let mut app = AppState {
+            omarchy_paths: ldnddev_theme::OmarchyPaths::from_root(std::path::Path::new(
+                "/nonexistent/dd_ftp_sheet",
+            )),
+            ..Default::default()
+        };
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_settings);
+        let (mut runtime, _rx) = crate::session::test_runtime();
+        let layout = LayoutMap::default();
+        let stayed = handle_key(
+            &mut app,
+            &mut runtime,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &layout,
+        )
+        .expect("q");
+        assert_eq!(stayed, LoopControl::Continue);
+        assert!(app.show_settings);
+        let quit = handle_key(
+            &mut app,
+            &mut runtime,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &layout,
+        )
+        .expect("ctrl+q");
+        assert_eq!(quit, LoopControl::Quit);
+    }
+
+    #[test]
+    fn f1_closes_and_reverts_a_nudged_color() {
+        let _restore = RestoreTheme;
+        dd_ftp_ui::apply_live_theme(&ldnddev_theme::Palette::builtin());
+        let mut app = AppState {
+            omarchy_paths: ldnddev_theme::OmarchyPaths::from_root(std::path::Path::new(
+                "/nonexistent/dd_ftp_sheet",
+            )),
+            ..Default::default()
+        };
+        let before = body_hex();
+        press(&mut app, KeyCode::F(1));
+        assert!(app.theme_editor.is_some());
+        assert!(app.theme_picker.is_none());
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('+'));
+        assert_ne!(body_hex(), before);
+        press(&mut app, KeyCode::F(1));
+        assert!(!app.show_settings);
         assert_eq!(body_hex(), before);
     }
 

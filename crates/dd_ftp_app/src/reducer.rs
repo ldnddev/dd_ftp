@@ -572,6 +572,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         },
         Action::HelpScroll(delta) => {
+            state.settings_follow = false;
             if delta < 0 {
                 state.help_scroll = state
                     .help_scroll
@@ -602,41 +603,50 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.set_focus(next);
         }
         Action::ToggleHelp => {
-            state.show_help = !state.show_help;
-            if state.show_help {
-                state.show_theme_debug = false;
+            if state.show_settings && state.settings_page == crate::SETTINGS_HELP {
                 state.show_settings = false;
+            } else {
+                state.show_settings = true;
+                state.settings_page = crate::SETTINGS_HELP;
+                state.help_scroll = 0;
+                state.settings_follow = true;
             }
         }
         Action::ToggleThemeDebug => {
-            state.show_theme_debug = !state.show_theme_debug;
-            if state.show_theme_debug {
-                state.show_help = false;
+            if state.show_settings && state.settings_page == crate::SETTINGS_THEMES {
                 state.show_settings = false;
+            } else {
+                state.show_settings = true;
+                state.settings_page = crate::SETTINGS_THEMES;
+                state.help_scroll = 0;
+                state.settings_follow = true;
             }
         }
         Action::ToggleSettings => {
-            state.show_settings = !state.show_settings;
-            if state.show_settings {
-                state.show_help = false;
-                state.show_theme_debug = false;
+            if state.show_settings && state.settings_page == crate::SETTINGS_SESSION {
+                state.show_settings = false;
+            } else {
+                if !state.show_settings {
+                    state.hydrate_settings_drafts();
+                }
+                state.show_settings = true;
+                state.settings_page = crate::SETTINGS_SESSION;
                 state.settings_field = SettingsField::Editor;
-                state.settings_editor = TextField::from_str(&state.editor);
-                state.settings_workers = clamp_worker_concurrency(state.worker_max_concurrency);
-                state.settings_hide_dotfiles = state.hide_dotfiles;
-                state.settings_overwrite = state.default_overwrite_policy;
-                state.settings_auto_connect = state.auto_connect_default;
-                state.settings_last_local = TextField::from_str(&state.local_cwd);
+                state.help_scroll = 0;
+                state.settings_follow = true;
             }
         }
         Action::SettingsNextField => {
             state.settings_field = state.settings_field.next();
+            state.settings_follow = true;
         }
         Action::SettingsPrevField => {
             state.settings_field = state.settings_field.prev();
+            state.settings_follow = true;
         }
         Action::SettingsSelectField(field) => {
             state.settings_field = field;
+            state.settings_follow = true;
         }
         Action::SettingsCycleValue(dir) => match state.settings_field {
             SettingsField::Workers => {
@@ -1218,30 +1228,31 @@ mod overlay_tests {
     fn toggle_help_twice_closes() {
         let mut s = AppState::default();
         reduce(&mut s, Action::ToggleHelp);
-        assert!(s.show_help);
+        assert!(s.show_settings);
+        assert_eq!(s.settings_page, crate::SETTINGS_HELP);
         reduce(&mut s, Action::ToggleHelp);
-        assert!(!s.show_help);
+        assert!(!s.show_settings);
     }
 
     #[test]
     fn toggle_theme_debug_twice_closes() {
         let mut s = AppState::default();
         reduce(&mut s, Action::ToggleThemeDebug);
-        assert!(s.show_theme_debug);
+        assert!(s.show_settings);
+        assert_eq!(s.settings_page, crate::SETTINGS_THEMES);
         reduce(&mut s, Action::ToggleThemeDebug);
-        assert!(!s.show_theme_debug);
+        assert!(!s.show_settings);
     }
 
     #[test]
     fn toggle_settings_hydrates_editor_and_closes_other_overlays() {
         let mut s = AppState {
             editor: "hx".into(),
-            show_help: true,
             ..Default::default()
         };
         reduce(&mut s, Action::ToggleSettings);
         assert!(s.show_settings);
-        assert!(!s.show_help);
+        assert_eq!(s.settings_page, crate::SETTINGS_SESSION);
         assert_eq!(s.settings_field, SettingsField::Editor);
         assert_eq!(s.settings_editor.value, "hx");
         reduce(&mut s, Action::SettingsInput('x'));
@@ -1336,13 +1347,14 @@ mod overlay_tests {
     }
 
     #[test]
-    fn toggle_help_clears_theme_debug() {
+    fn toggle_help_switches_off_themes() {
         let mut s = AppState::default();
         reduce(&mut s, Action::ToggleThemeDebug);
-        assert!(s.show_theme_debug);
+        assert!(s.show_settings);
+        assert_eq!(s.settings_page, crate::SETTINGS_THEMES);
         reduce(&mut s, Action::ToggleHelp);
-        assert!(s.show_help);
-        assert!(!s.show_theme_debug);
+        assert!(s.show_settings);
+        assert_eq!(s.settings_page, crate::SETTINGS_HELP);
     }
 
     #[test]
@@ -1356,12 +1368,12 @@ mod overlay_tests {
     }
 
     #[test]
-    fn toggle_theme_debug_clears_help() {
+    fn toggle_theme_debug_switches_off_help() {
         let mut s = AppState::default();
         reduce(&mut s, Action::ToggleHelp);
         reduce(&mut s, Action::ToggleThemeDebug);
-        assert!(s.show_theme_debug);
-        assert!(!s.show_help);
+        assert!(s.show_settings);
+        assert_eq!(s.settings_page, crate::SETTINGS_THEMES);
     }
 }
 

@@ -75,6 +75,7 @@ pub struct LayoutMap {
     pub remote_scrollbar: Rect,
     pub queue_scrollbar: Rect,
     pub help_scrollbar: Option<Rect>,
+    pub settings_nav: Option<Rect>,
     pub queue: Rect,
     pub queue_list: Rect,
     pub queue_list_offset: usize,

@@ -3,11 +3,18 @@
 #
 # Quick install (no checkout required):
 #   curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash -s -- --both
 #
 # From a git checkout:
-#   ./install.sh                 # release cargo build (developer default)
-#   ./install.sh --from-release  # prebuilt GitHub package
-#   ./install.sh --uninstall     # binary, Linux launcher, default theme
+#   ./install.sh                 # ask: terminal, window, or both
+#   ./install.sh --tui           # terminal only (cargo -p dd_ftp_cli, not --workspace)
+#   ./install.sh --gui           # window only (cargo -p dd_ftp_gui)
+#   ./install.sh --both
+#   ./install.sh --from-release  # prebuilt GitHub package (terminal archive is GNU)
+#   ./install.sh --uninstall     # ask which binary to remove; leaves dd_ftp_theme.yml
+#
+# INSTALL_GUI=1 with no --tui/--gui/--both selects both.
+# BIN_DIR and PREFIX are aliases for the binary directory. INSTALL_DIR wins.
 set -euo pipefail
 
 if [[ -z "${BASH_VERSION:-}" ]]; then
@@ -21,8 +28,19 @@ REPO_URL="${REPO_URL:-https://github.com/${REPO}.git}"
 APP_NAME="dd_ftp"
 THEME_FILE="dd_ftp_theme.yml"
 BIN_DST_NAME="${BIN_NAME:-dd_ftp}"
+GUI_BIN_NAME="dd_ftp-gui"
+GUI_APP_ID="dev.ldnddev.dd_ftp"
 VERSION="${VERSION:-latest}"
-INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
+# INSTALL_DIR wins. Otherwise BIN_DIR, then PREFIX/bin, then ~/.local/bin.
+if [[ -z "${INSTALL_DIR+x}" ]]; then
+  if [[ -n "${BIN_DIR:-}" ]]; then
+    INSTALL_DIR="$BIN_DIR"
+  elif [[ -n "${PREFIX:-}" ]]; then
+    INSTALL_DIR="${PREFIX%/}/bin"
+  else
+    INSTALL_DIR="${HOME}/.local/bin"
+  fi
+fi
 CONFIG_DIR="${CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ldnddev}"
 
 FROM_RELEASE=0
@@ -31,6 +49,7 @@ UNINSTALL=0
 DRY_RUN=0
 PRINT_TARGET=0
 BRANCH=""
+TARGET_CHOICE=""
 
 usage() {
   cat <<USAGE
@@ -38,15 +57,32 @@ Install ${APP_NAME} for this machine.
 
 Usage:
   curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
-  ./install.sh [options]
+  ./install.sh [--tui | --gui | --both] [options]
+
+  ./install.sh
+      ask: terminal app, desktop window, or both
+  ./install.sh --tui
+      install the terminal (dd_ftp)
+  ./install.sh --gui
+      install the window (dd_ftp-gui)
+  ./install.sh --both
+      install both
+  ./install.sh --uninstall
+      ask which of those to remove
+
+With no terminal to answer, install selects the terminal app and uninstall
+removes both. INSTALL_GUI=1 is the same as --both.
 
 Options:
+  --tui               Terminal app only
+  --gui               Desktop window only
+  --both              Terminal and window
   --from-release      Download a prebuilt GitHub release package
   --from-source       Build from source with cargo
   --version TAG       Release tag to install (default: latest)
   --branch NAME       Git branch to clone when building from source
-  --prefix DIR        Install the binary into DIR (same as INSTALL_DIR)
-  --uninstall         Remove the binary, Linux desktop launcher, and default theme
+  --prefix DIR        Install binaries into DIR (same as INSTALL_DIR)
+  --uninstall         Remove the chosen binary and its launcher
   --print-target      Print the detected package target and exit
   --dry-run           Show what would be installed, then exit
   --self-test         Check archive, checksum, and launcher handling, then exit
@@ -54,14 +90,18 @@ Options:
 
 Environment:
   INSTALL_DIR         Binary directory (default: ~/.local/bin)
-  BIN_NAME            Installed binary name (default: dd_ftp)
+  BIN_DIR             Alias for INSTALL_DIR when INSTALL_DIR is unset
+  PREFIX              Alias: \$PREFIX/bin when INSTALL_DIR and BIN_DIR are unset
+  BIN_NAME            Installed terminal name (default: dd_ftp)
+  INSTALL_GUI         Set to 1 to select both when no --tui/--gui/--both
   VERSION             Release tag or "latest"
   REPO                GitHub owner/name (default: ldnddev/dd_ftp)
   CONFIG_DIR          Theme directory (default: ~/.config/ldnddev)
   XDG_DATA_HOME       Linux launcher parent when the binary stays under \$HOME
 
-Uninstall uses the same INSTALL_DIR, BIN_NAME, CONFIG_DIR, and XDG_DATA_HOME
-as the install. Bookmarks and keyring secrets are left in place.
+Uninstall removes only the chosen binary and its .desktop file.
+dd_ftp_theme.yml, app config, bookmarks, and keyring secrets stay.
+The window needs Vulkan (libvulkan1 and a driver) and Wayland or X11.
 
 Examples:
   INSTALL_DIR=/usr/local/bin ./install.sh
@@ -96,6 +136,99 @@ warn() {
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+# ldnddev wordmark. Printed only on a terminal so a captured log stays plain text.
+print_mark() {
+  [[ -t 1 ]] || return 0
+  printf '\033[40;97m'
+  cat <<'EOF'
+
+█▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀█
+█  ██                ██                         ██  █
+█  ██                ██                         ██  █
+█  ██         ▄▄▄▄▄▄ ██     ▄▄▄▄▄▄       ▄▄▄▄▄▄ ██  █
+█  ██       ▄██▀▀▀▀▀███  ▄██████████▄  ▄██▀▀▀▀▀███  █
+█  ██      ██▀       ██  ██        ██ ██▀       ██  █
+█  ██      ██        ██  ██        ██ ██        ██  █
+█  ██      ▀█▄       ██  ██        ██ ▀█▄       ██  █
+█  ▀█▄▄▄▄▄  ▀██▄▄▄▄██▀   ██        ██  ▀██▄▄▄▄██▀   █
+█   ▀▀▀▀▀▀    ▀▀▀▀▀▀     ▀▀        ▀▀    ▀▀▀▀▀▀     █
+█                                                   █
+█                     ██                            █
+█                     ██                            █
+█              ▄▄▄▄▄▄ ██     ▄▄▄▄▄▄    ▄▄      ▄▄▄  █
+█            ▄██▀▀▀▀▀███   ██▀▀▀▀███   ██     ▄██   █
+█           ██▀       ██  ██    ██▀ ▄▄ ██    ▄██    █
+█           ██        ██  ██  ▄██   ██ ██    ██     █
+█           ▀█▄       ██  ██▄██▀   ▄█▀ ██  ▄██      █
+█  ▄▄▄▄▄▄▄▄  ▀██▄▄▄▄██▀    ▀███▄▄▄██▀  ██▄██▀       █
+█  ▀▀▀▀▀▀▀▀    ▀▀▀▀▀▀        ▀▀▀▀▀▀    ▀▀▀▀         █
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+EOF
+  printf '\033[0m\n'
+}
+
+# The device node is mode rw-rw-rw, so -r/-w stay true with no controlling
+# terminal. Opening it is the check that matters.
+have_tty() {
+  { : <>/dev/tty; } 2>/dev/null
+}
+
+# Read 1, 2, or 3 from the terminal. stdout is tui, gui, or both.
+# $1 is the verb. $2 is the default number.
+# Returns 1 when the terminal cannot be used. main captures stdout, and a
+# failed redirect in that capture does not abort under set -e, so every
+# /dev/tty failure has to be an explicit status.
+ask_choice() {
+  local verb=$1 default=$2 answer choice
+  while true; do
+    {
+      printf '%s which program?\n' "$verb"
+      printf '%s\n' "  1) terminal (dd_ftp)"
+      printf '%s\n' "  2) desktop window (dd_ftp-gui)"
+      printf '%s\n' "  3) both"
+      printf 'Choice [%s]: ' "$default"
+    } >/dev/tty 2>/dev/null || return 1
+    if ! IFS= read -r answer </dev/tty 2>/dev/null; then
+      printf '\n' >/dev/tty 2>/dev/null || true
+      answer=$default
+    fi
+    choice=$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$choice" in
+      '' ) choice=$default ;;
+    esac
+    case "$choice" in
+      1 | tui | terminal) printf '%s\n' tui; return 0 ;;
+      2 | gui | window) printf '%s\n' gui; return 0 ;;
+      3 | both) printf '%s\n' both; return 0 ;;
+      *) printf '%s\n' "Enter 1, 2, or 3." >/dev/tty 2>/dev/null || return 1 ;;
+    esac
+  done
+}
+
+# $1 is install or uninstall. $2 is an explicit tui/gui/both, or empty.
+# stdout is only the choice. Notices go to stderr so a capture stays one word.
+choose_target() {
+  local action=$1 explicit=$2
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if have_tty; then
+    if [[ "$action" == uninstall ]]; then
+      ask_choice "Remove" 3 && return 0
+    else
+      ask_choice "Install" 1 && return 0
+    fi
+  fi
+  if [[ "$action" == uninstall ]]; then
+    printf '%s\n' "No terminal for a prompt. Removing both programs." >&2
+    printf '%s\n' both
+  else
+    printf '%s\n' "No terminal for a prompt. Installing the terminal app." >&2
+    printf '%s\n' tui
+  fi
 }
 
 script_dir() {
@@ -162,6 +295,18 @@ package_url() {
     printf '%s/latest/download/dd_ftp-%s.tar.gz' "$base" "$target"
   else
     printf '%s/download/%s/dd_ftp-%s.tar.gz' "$base" "$version" "$target"
+  fi
+}
+
+# Separate GNU archive. It does not replace the terminal package above.
+gui_package_url() {
+  local target="$1"
+  local version="$2"
+  local base="https://github.com/${REPO}/releases"
+  if [[ "$version" == "latest" ]]; then
+    printf '%s/latest/download/dd_ftp-gui-%s.tar.gz' "$base" "$target"
+  else
+    printf '%s/download/%s/dd_ftp-gui-%s.tar.gz' "$base" "$version" "$target"
   fi
 }
 
@@ -309,6 +454,20 @@ installed_bin_path() {
   fi
 }
 
+installed_gui_path() {
+  local os
+  os="$(detect_os)"
+  if [[ "$os" == "windows" ]]; then
+    printf '%s/%s.exe' "$INSTALL_DIR" "$GUI_BIN_NAME"
+  else
+    printf '%s/%s' "$INSTALL_DIR" "$GUI_BIN_NAME"
+  fi
+}
+
+gui_desktop_path() {
+  printf '%s/%s.desktop\n' "$(apps_dir)" "$GUI_BIN_NAME"
+}
+
 # Menus look in $XDG_DATA_HOME/applications, then the system data dirs.
 # A binary under $HOME is published where the session looks. A binary
 # outside $HOME (for example /usr/local/bin) is published under that
@@ -388,6 +547,30 @@ write_desktop() {
   chmod 644 "$dest"
 }
 
+write_gui_desktop() {
+  local dest=$1
+  local bin=$2
+  local exec_q
+  exec_q="$(desktop_quote "$bin")" || fail "desktop path contains a newline: ${bin}"
+  {
+    printf '%s\n' "[Desktop Entry]"
+    printf '%s\n' "Type=Application"
+    printf '%s\n' "Version=1.0"
+    printf '%s\n' "Name=dd_ftp"
+    printf '%s\n' "GenericName=FTP client"
+    printf '%s\n' "Comment=FTP, SFTP, and FTPS in a window"
+    printf '%s\n' "Exec=${exec_q}"
+    printf '%s\n' "TryExec=${bin}"
+    printf '%s\n' "Terminal=false"
+    printf '%s\n' "Categories=Network;FileTransfer;"
+    printf '%s\n' "Keywords=ftp;sftp;ftps;file;transfer;"
+    printf '%s\n' "StartupNotify=true"
+    printf '%s\n' "StartupWMClass=${GUI_APP_ID}"
+    printf '%s\n' "Icon=utilities-terminal"
+  } >"$dest"
+  chmod 644 "$dest"
+}
+
 refresh_desktop_database() {
   local dir=$1
   if have update-desktop-database; then
@@ -411,6 +594,51 @@ install_desktop_launcher() {
   refresh_desktop_database "$dir"
 }
 
+install_gui_launcher() {
+  local bin dest dir
+  if [[ "$(detect_os)" != "linux" ]]; then
+    return 0
+  fi
+  bin="$(installed_gui_path)"
+  [[ -e "$bin" || -L "$bin" ]] || return 0
+  dest="$(gui_desktop_path)"
+  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  write_gui_desktop "$dest" "$bin"
+  info "installed launcher ${dest}"
+  refresh_desktop_database "$dir"
+}
+
+# Rewrite a launcher only for a binary that is still in INSTALL_DIR.
+refresh_launchers() {
+  if [[ "$(detect_os)" != "linux" ]]; then
+    return 0
+  fi
+  local bin dest dir wrote=0
+  bin="$(installed_bin_path)"
+  if [[ -e "$bin" || -L "$bin" ]]; then
+    if dest="$(desktop_path)"; then
+      dir="$(dirname "$dest")"
+      mkdir -p "$dir"
+      write_desktop "$dest" "$bin"
+      refresh_desktop_database "$dir"
+      wrote=1
+    fi
+  fi
+  bin="$(installed_gui_path)"
+  if [[ -e "$bin" || -L "$bin" ]]; then
+    dest="$(gui_desktop_path)"
+    dir="$(dirname "$dest")"
+    mkdir -p "$dir"
+    write_gui_desktop "$dest" "$bin"
+    refresh_desktop_database "$dir"
+    wrote=1
+  fi
+  if [[ "$wrote" -eq 0 ]]; then
+    refresh_desktop_database "$(apps_dir)"
+  fi
+}
+
 remove_if_present() {
   local path=$1
   local label=$2
@@ -422,24 +650,50 @@ remove_if_present() {
   fi
 }
 
-do_uninstall() {
-  local bin theme desktop desktop_dir
+remove_tui_files() {
+  local bin desktop desktop_dir
   bin="$(installed_bin_path)"
-  theme="${CONFIG_DIR}/${THEME_FILE}"
-
   remove_if_present "$bin" "binary"
-
-  if [[ "$(detect_os)" == "linux" ]]; then
-    if desktop="$(desktop_path)"; then
-      desktop_dir="$(dirname "$desktop")"
-      remove_if_present "$desktop" "launcher"
-      refresh_desktop_database "$desktop_dir"
-    else
-      warn "skipped launcher removal; pass the same BIN_NAME used at install"
-    fi
+  if [[ "$(detect_os)" != "linux" ]]; then
+    return 0
   fi
+  if desktop="$(desktop_path)"; then
+    desktop_dir="$(dirname "$desktop")"
+    remove_if_present "$desktop" "launcher"
+    refresh_desktop_database "$desktop_dir"
+  else
+    warn "skipped launcher removal; pass the same BIN_NAME used at install"
+  fi
+}
 
-  remove_if_present "$theme" "theme"
+remove_gui_files() {
+  local bin desktop
+  bin="$(installed_gui_path)"
+  remove_if_present "$bin" "window binary"
+  if [[ "$(detect_os)" != "linux" ]]; then
+    return 0
+  fi
+  desktop="$(gui_desktop_path)"
+  remove_if_present "$desktop" "window launcher"
+  refresh_desktop_database "$(dirname "$desktop")"
+}
+
+# $1 is tui, gui, or both. Only that binary and its .desktop file are removed.
+do_uninstall() {
+  local choice=$1
+  local theme="${CONFIG_DIR}/${THEME_FILE}"
+  case "$choice" in
+    tui) remove_tui_files ;;
+    gui) remove_gui_files ;;
+    both)
+      remove_tui_files
+      remove_gui_files
+      ;;
+    *) fail "internal: unknown uninstall target '${choice}'" ;;
+  esac
+
+  refresh_launchers
+  info "left ${theme}, bookmarks, and keyring secrets in place"
 
   if [[ -d "$CONFIG_DIR" ]] && rmdir "$CONFIG_DIR" 2>/dev/null; then
     info "removed empty ${CONFIG_DIR}"
@@ -488,20 +742,48 @@ find_extracted_bin() {
   return 1
 }
 
-install_from_release() {
-  local target version url archive tmp sums_url extracted src_bin dest theme
-  target="$(detect_target)"
+find_extracted_gui() {
+  local dir="$1"
+  local os="$2"
+  local candidate
+  if [[ "$os" == "windows" ]]; then
+    for candidate in \
+      "${dir}/dd_ftp-gui.exe" \
+      "${dir}/bin/dd_ftp-gui.exe"
+    do
+      if [[ -f "$candidate" ]]; then
+        printf '%s' "$candidate"
+        return 0
+      fi
+    done
+  else
+    for candidate in \
+      "${dir}/dd_ftp-gui" \
+      "${dir}/bin/dd_ftp-gui"
+    do
+      if [[ -f "$candidate" ]]; then
+        printf '%s' "$candidate"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+install_tui_from_release() {
+  local triple version url archive tmp sums_url extracted src_bin dest theme
+  triple="$(detect_target)"
   version="$(normalize_version "$VERSION")"
-  url="${DD_FTP_PACKAGE_URL:-$(package_url "$target" "$version")}"
+  url="${DD_FTP_PACKAGE_URL:-$(package_url "$triple" "$version")}"
   dest="$(installed_bin_path)"
 
-  info "detected target ${target}"
+  info "detected target ${triple}"
   info "downloading ${url}"
 
   tmp="$(mktemp -d)"
   CLEANUP_PATHS+=("$tmp")
 
-  archive="${tmp}/dd_ftp-${target}.tar.gz"
+  archive="${tmp}/dd_ftp-${triple}.tar.gz"
   if ! download "$url" "$archive" 2>/dev/null; then
     return 1
   fi
@@ -533,33 +815,82 @@ install_from_release() {
   return 0
 }
 
+# GNU archive, distinct from the terminal package. A missing archive is not
+# the terminal tarball installed under another name.
+install_gui_from_release() {
+  local triple version url archive tmp sums_url extracted src_bin dest
+  triple="$(detect_target)"
+  version="$(normalize_version "$VERSION")"
+  url="${DD_FTP_GUI_PACKAGE_URL:-$(gui_package_url "$triple" "$version")}"
+  dest="$(installed_gui_path)"
+
+  info "downloading ${url}"
+  tmp="$(mktemp -d)"
+  CLEANUP_PATHS+=("$tmp")
+  archive="${tmp}/dd_ftp-gui-${triple}.tar.gz"
+  if ! download "$url" "$archive" 2>/dev/null; then
+    return 1
+  fi
+  sums_url="$(checksums_url "$version")"
+  download_optional "$sums_url" "${tmp}/SHA256SUMS" \
+    || fail "could not download SHA256SUMS from ${sums_url}; refusing to install an unverified package"
+  verify_checksum "$archive" "${tmp}/SHA256SUMS"
+  extracted="${tmp}/pkg"
+  extract_package "$archive" "$extracted" \
+    || fail "refusing to extract $(basename "$archive")"
+  src_bin="$(find_extracted_gui "$extracted" "$(detect_os)")" \
+    || fail "package did not contain a dd_ftp-gui binary"
+  install_file "$src_bin" "$dest" 0755
+  info "installed ${dest}"
+  info "dd_ftp-gui needs Vulkan (libvulkan1 and a driver) and Wayland or X11."
+  return 0
+}
+
 build_and_install_from() {
   local src_dir="$1"
+  local choice="$2"
   local dest src_bin
-  dest="$(installed_bin_path)"
 
   have cargo || fail "cargo is required to build from source. Install Rust from https://rustup.rs/"
 
-  info "building dd_ftp (release) from ${src_dir}"
-  cargo build --release -p dd_ftp_cli --manifest-path "${src_dir}/Cargo.toml"
-
-  if [[ "$(detect_os)" == "windows" ]]; then
-    src_bin="${src_dir}/target/release/dd_ftp_cli.exe"
-  else
-    src_bin="${src_dir}/target/release/dd_ftp_cli"
+  if [[ "$choice" == "tui" || "$choice" == "both" ]]; then
+    dest="$(installed_bin_path)"
+    info "building dd_ftp (release) from ${src_dir}"
+    # Not --workspace: dd_ftp_gui is a member but not a default member.
+    cargo build --release -p dd_ftp_cli --manifest-path "${src_dir}/Cargo.toml"
+    if [[ "$(detect_os)" == "windows" ]]; then
+      src_bin="${src_dir}/target/release/dd_ftp_cli.exe"
+    else
+      src_bin="${src_dir}/target/release/dd_ftp_cli"
+    fi
+    [[ -f "$src_bin" ]] || fail "built binary not found at ${src_bin}"
+    install_file "$src_bin" "$dest" 0755
+    info "installed ${dest}"
+    install_theme_if_present "${src_dir}/${THEME_FILE}"
   fi
-  [[ -f "$src_bin" ]] || fail "built binary not found at ${src_bin}"
 
-  install_file "$src_bin" "$dest" 0755
-  info "installed ${dest}"
-  install_theme_if_present "${src_dir}/${THEME_FILE}"
+  if [[ "$choice" == "gui" || "$choice" == "both" ]]; then
+    dest="$(installed_gui_path)"
+    info "building dd_ftp-gui (release) from ${src_dir}"
+    cargo build --release -p dd_ftp_gui --manifest-path "${src_dir}/Cargo.toml"
+    if [[ "$(detect_os)" == "windows" ]]; then
+      src_bin="${src_dir}/target/release/dd_ftp-gui.exe"
+    else
+      src_bin="${src_dir}/target/release/dd_ftp-gui"
+    fi
+    [[ -f "$src_bin" ]] || fail "built binary not found at ${src_bin}"
+    install_file "$src_bin" "$dest" 0755
+    info "installed ${dest}"
+    info "dd_ftp-gui needs Vulkan (libvulkan1 and a driver) and Wayland or X11."
+  fi
 }
 
 install_from_source() {
+  local choice="$1"
   local src_dir workdir clone_args
   if is_local_checkout; then
     src_dir="$(script_dir)"
-    build_and_install_from "$src_dir"
+    build_and_install_from "$src_dir" "$choice"
     return 0
   fi
 
@@ -573,7 +904,7 @@ install_from_source() {
     clone_args+=(--branch "$BRANCH")
   fi
   GIT_TERMINAL_PROMPT=0 git clone "${clone_args[@]}" "$REPO_URL" "${workdir}/src"
-  build_and_install_from "${workdir}/src"
+  build_and_install_from "${workdir}/src" "$choice"
 }
 
 run_self_test() {
@@ -581,6 +912,10 @@ run_self_test() {
   have python3 || fail "self-test requires python3"
   have tar || fail "self-test requires tar"
   file_sha256 /dev/null >/dev/null || fail "self-test requires sha256sum or shasum"
+
+  [[ "$(choose_target install tui)" == "tui" ]] || fail "self-test: explicit tui choice"
+  [[ "$(choose_target install gui)" == "gui" ]] || fail "self-test: explicit gui choice"
+  [[ "$(choose_target uninstall both)" == "both" ]] || fail "self-test: explicit both choice"
 
   work="$(mktemp -d)"
   CLEANUP_PATHS+=("$work")
@@ -705,11 +1040,39 @@ PY
     desktop-file-validate "$desk" || fail "self-test: desktop-file-validate failed"
   fi
 
-  do_uninstall
+  # A fake window binary is enough. This test does not build GPUI.
+  local gui_path gui_desk
+  gui_path="$(installed_gui_path)"
+  printf '#!/bin/sh\nexit 0\n' >"$gui_path"
+  chmod 755 "$gui_path"
+  install_gui_launcher
+  gui_desk="$(gui_desktop_path)"
+  [[ -f "$gui_desk" ]] || fail "self-test: window launcher was not written"
+  grep -F 'Terminal=false' "$gui_desk" >/dev/null \
+    || fail "self-test: window launcher is a terminal app"
+  grep -F 'StartupNotify=true' "$gui_desk" >/dev/null \
+    || fail "self-test: window launcher StartupNotify"
+  grep -F "StartupWMClass=${GUI_APP_ID}" "$gui_desk" >/dev/null \
+    || fail "self-test: window launcher StartupWMClass"
+  grep -F "Exec=$(desktop_quote "$gui_path")" "$gui_desk" >/dev/null \
+    || fail "self-test: window Exec does not match ${gui_path}"
+  if have desktop-file-validate; then
+    desktop-file-validate "$gui_desk" || fail "self-test: window desktop-file-validate failed"
+  fi
+
+  do_uninstall gui
+  [[ ! -e "$gui_desk" ]] || fail "self-test: window launcher survived uninstall"
+  [[ ! -e "$gui_path" ]] || fail "self-test: window binary survived uninstall"
+  [[ -e "$bin_path" ]] || fail "self-test: terminal binary was removed with the window"
+  [[ -e "$desk" ]] || fail "self-test: terminal launcher was removed with the window"
+  [[ -e "${CONFIG_DIR}/${THEME_FILE}" ]] \
+    || fail "self-test: theme was removed with the window"
+
+  do_uninstall tui
   [[ ! -e "$desk" ]] || fail "self-test: launcher survived uninstall"
   [[ ! -e "$bin_path" ]] || fail "self-test: binary survived uninstall"
-  [[ ! -e "${CONFIG_DIR}/${THEME_FILE}" ]] \
-    || fail "self-test: theme survived uninstall"
+  [[ -e "${CONFIG_DIR}/${THEME_FILE}" ]] \
+    || fail "self-test: theme was removed"
 
   local quoted
   quoted="$(desktop_quote '/tmp/a b%c$"')" || fail "self-test: quote rejected a normal path"
@@ -739,7 +1102,7 @@ PY
   grep -F "Exec=$(desktop_quote "${INSTALL_DIR}/dd ftp")" "$spaced_desk" >/dev/null \
     || fail "self-test: spaced Exec was not quoted"
 
-  do_uninstall
+  do_uninstall tui
   [[ ! -e "$spaced_desk" ]] || fail "self-test: spaced launcher survived uninstall"
   [[ ! -e "${INSTALL_DIR}/dd ftp" ]] \
     || fail "self-test: spaced binary survived uninstall"
@@ -747,104 +1110,171 @@ PY
   info "self-test ok"
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --from-release) FROM_RELEASE=1; shift ;;
-    --from-source) FROM_SOURCE=1; shift ;;
-    --uninstall | -uninstall) UNINSTALL=1; shift ;;
-    --print-target) PRINT_TARGET=1; shift ;;
-    --dry-run) DRY_RUN=1; shift ;;
-    --self-test)
-      run_self_test
-      exit 0
+install_programs() {
+  local choice=$1
+  local prefer_source=0
+  if [[ "$FROM_SOURCE" -eq 1 ]]; then
+    prefer_source=1
+  elif [[ "$FROM_RELEASE" -eq 1 ]]; then
+    prefer_source=0
+  elif is_local_checkout && have cargo; then
+    prefer_source=1
+  fi
+
+  if [[ "$prefer_source" -eq 1 ]]; then
+    install_from_source "$choice"
+    return 0
+  fi
+
+  if [[ "$choice" == "tui" || "$choice" == "both" ]]; then
+    if install_tui_from_release; then
+      :
+    elif [[ "$FROM_RELEASE" -eq 1 ]]; then
+      fail "no prebuilt package for $(detect_target). Check https://github.com/${REPO}/releases"
+    else
+      warn "no prebuilt package for $(detect_target); building from source"
+      install_from_source tui
+    fi
+  fi
+
+  if [[ "$choice" == "gui" || "$choice" == "both" ]]; then
+    if install_gui_from_release; then
+      :
+    elif [[ "$FROM_RELEASE" -eq 1 ]]; then
+      fail "no published dd_ftp-gui archive for $(detect_target). The window is built from source: ./install.sh --from-source --gui"
+    else
+      warn "no published dd_ftp-gui archive for $(detect_target); building the window from source"
+      install_from_source gui
+    fi
+  fi
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tui | --gui | --both)
+        if [[ -n "$TARGET_CHOICE" ]]; then
+          fail "pass only one of --tui, --gui, or --both"
+        fi
+        TARGET_CHOICE="${1#--}"
+        shift
+        ;;
+      --from-release) FROM_RELEASE=1; shift ;;
+      --from-source) FROM_SOURCE=1; shift ;;
+      --uninstall | -uninstall) UNINSTALL=1; shift ;;
+      --print-target) PRINT_TARGET=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --self-test)
+        run_self_test
+        exit 0
+        ;;
+      --version)
+        VERSION="${2:-}"
+        [[ -n "$VERSION" ]] || fail "--version requires a tag"
+        shift 2
+        ;;
+      --version=*)
+        VERSION="${1#*=}"
+        shift
+        ;;
+      --branch)
+        BRANCH="${2:-}"
+        [[ -n "$BRANCH" ]] || fail "--branch requires a name"
+        shift 2
+        ;;
+      --prefix)
+        INSTALL_DIR="${2:-}"
+        [[ -n "$INSTALL_DIR" ]] || fail "--prefix requires a directory"
+        shift 2
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "unknown option: $1 (try --help)"
+        ;;
+    esac
+  done
+
+  if [[ -z "$TARGET_CHOICE" && "${INSTALL_GUI:-}" == "1" ]]; then
+    TARGET_CHOICE=both
+  fi
+
+  if [[ "$PRINT_TARGET" -eq 1 ]]; then
+    detect_target
+    printf '\n'
+    exit 0
+  fi
+
+  if [[ "$FROM_RELEASE" -eq 1 && "$FROM_SOURCE" -eq 1 ]]; then
+    fail "use either --from-release or --from-source, not both"
+  fi
+
+  print_mark
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'programs:    %s\n' "${TARGET_CHOICE:-ask}"
+    printf 'target:      %s\n' "$(detect_target)"
+    printf 'package:     %s\n' "$(package_url "$(detect_target)" "$(normalize_version "$VERSION")")"
+    printf 'window pkg:  %s\n' "$(gui_package_url "$(detect_target)" "$(normalize_version "$VERSION")")"
+    printf 'install to:  %s\n' "$(installed_bin_path)"
+    printf 'window bin:  %s\n' "$(installed_gui_path)"
+    printf 'theme:       %s/%s\n' "$CONFIG_DIR" "$THEME_FILE"
+    if [[ "$(detect_os)" == "linux" ]]; then
+      printf 'launcher:    %s\n' "$(desktop_path)"
+      printf 'window ln:   %s\n' "$(gui_desktop_path)"
+    else
+      printf 'launcher:    desktop files are Linux-only\n'
+    fi
+    if is_local_checkout; then
+      printf 'checkout:    %s\n' "$(script_dir)"
+    else
+      printf 'checkout:    (none; curl/piped install)\n'
+    fi
+    exit 0
+  fi
+
+  local action=install choice
+  if [[ "$UNINSTALL" -eq 1 ]]; then
+    action=uninstall
+  fi
+  choice="$(choose_target "$action" "$TARGET_CHOICE")"
+
+  if [[ "$action" == uninstall ]]; then
+    do_uninstall "$choice"
+    exit 0
+  fi
+
+  install_programs "$choice"
+  refresh_launchers
+  path_note
+  case "$choice" in
+    tui)
+      printf '\nRun: %s\n' "$BIN_DST_NAME"
       ;;
-    --version)
-      VERSION="${2:-}"
-      [[ -n "$VERSION" ]] || fail "--version requires a tag"
-      shift 2
+    gui)
+      printf '\nRun: %s\n' "$GUI_BIN_NAME"
+      printf '%s\n' "dd_ftp-gui needs Vulkan (libvulkan1 and a driver) and Wayland or X11."
       ;;
-    --version=*)
-      VERSION="${1#*=}"
-      shift
-      ;;
-    --branch)
-      BRANCH="${2:-}"
-      [[ -n "$BRANCH" ]] || fail "--branch requires a name"
-      shift 2
-      ;;
-    --prefix)
-      INSTALL_DIR="${2:-}"
-      [[ -n "$INSTALL_DIR" ]] || fail "--prefix requires a directory"
-      shift 2
-      ;;
-    --help | -h)
-      usage
-      exit 0
-      ;;
-    *)
-      fail "unknown option: $1 (try --help)"
+    both)
+      printf '\nRun: %s    or    %s\n' "$BIN_DST_NAME" "$GUI_BIN_NAME"
+      printf '%s\n' "dd_ftp-gui needs Vulkan (libvulkan1 and a driver) and Wayland or X11."
       ;;
   esac
-done
-
-if [[ "$PRINT_TARGET" -eq 1 ]]; then
-  detect_target
-  printf '\n'
-  exit 0
-fi
-
-if [[ "$DRY_RUN" -eq 1 ]]; then
-  printf 'target:      %s\n' "$(detect_target)"
-  printf 'package:     %s\n' "$(package_url "$(detect_target)" "$(normalize_version "$VERSION")")"
-  printf 'install to:  %s\n' "$(installed_bin_path)"
-  printf 'theme:       %s/%s\n' "$CONFIG_DIR" "$THEME_FILE"
   if [[ "$(detect_os)" == "linux" ]]; then
-    printf 'launcher:    %s\n' "$(desktop_path)"
-  else
-    printf 'launcher:    desktop files are Linux-only\n'
+    if [[ "$choice" != "gui" ]]; then
+      printf 'Launcher: %s\n' "$(desktop_path)"
+    fi
+    if [[ "$choice" != "tui" ]]; then
+      printf 'Launcher: %s\n' "$(gui_desktop_path)"
+    fi
   fi
-  if is_local_checkout; then
-    printf 'checkout:    %s\n' "$(script_dir)"
-  else
-    printf 'checkout:    (none; curl/piped install)\n'
-  fi
-  exit 0
-fi
+}
 
-if [[ "$UNINSTALL" -eq 1 ]]; then
-  do_uninstall
-  exit 0
-fi
-
-if [[ "$FROM_RELEASE" -eq 1 && "$FROM_SOURCE" -eq 1 ]]; then
-  fail "use either --from-release or --from-source, not both"
-fi
-
-prefer_source=0
-if [[ "$FROM_SOURCE" -eq 1 ]]; then
-  prefer_source=1
-elif [[ "$FROM_RELEASE" -eq 1 ]]; then
-  prefer_source=0
-elif is_local_checkout && have cargo; then
-  prefer_source=1
-fi
-
-if [[ "$prefer_source" -eq 1 ]]; then
-  install_from_source
-else
-  if install_from_release; then
-    :
-  elif [[ "$FROM_RELEASE" -eq 1 ]]; then
-    fail "no prebuilt package for $(detect_target). Check https://github.com/${REPO}/releases"
-  else
-    warn "no prebuilt package for $(detect_target); building from source"
-    install_from_source
-  fi
-fi
-
-install_desktop_launcher
-path_note
-printf '\nRun: %s\n' "$BIN_DST_NAME"
-if [[ "$(detect_os)" == "linux" ]]; then
-  printf 'Launcher: %s\n' "$(desktop_path)"
+# `curl | bash` reads this file from stdin. BASH_SOURCE is unset then, and
+# `set -u` aborts on a bare ${BASH_SOURCE[0]}. An empty source means the
+# file is being executed, not sourced.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
+  main "$@"
 fi

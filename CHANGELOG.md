@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [1.8.4] - 2026-11-25
+
+### Added
+- `dd_ftp-gui`, a 1280×800 window. Settings is Themes, Window, Session, and Help. `install.sh` asks for the terminal, the window, or both (`--tui`, `--gui`, `--both`). `INSTALL_GUI=1` installs both. A window-only install leaves the theme file alone.
+
+### Changed
+- F1 and F2 toggle one Settings sheet (Themes, Session, Help). F3 opens Session. Uninstall leaves `dd_ftp_theme.yml` in place.
+- Bracketed paste lands in the active text field as one insert.
+
 ## [1.8.3] - 2026-11-09
 
 ### Added

@@ -2,6 +2,7 @@
 
 mod listing;
 mod prefs;
+mod session;
 mod shell;
 mod shortcuts;
 mod theme_load;
@@ -15,7 +16,10 @@ use gpui_component::Root;
 use shell::{Shell, ShellOptions};
 
 fn main() {
-    if std::env::args().skip(1).any(|arg| arg == "--help" || arg == "-h") {
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
         print_help();
         return;
     }
@@ -50,7 +54,9 @@ Open the dd_ftp window (1280×800).
   F1          Settings (Themes, Window, Session, Help)
   F3          Settings, Session page
   Ctrl+Q      Quit (confirms while a transfer is active)
-  Up/Down     Move the local listing
+  1 / 2       Local pane / remote pane
+  c           Connect, or disconnect when a session is open
+  Up/Down     Move the focused listing
   Enter       Open a directory
 
 Wayland or X11, and Vulkan (libvulkan1 and a driver)."

@@ -236,6 +236,56 @@ pub fn clamp_worker_concurrency(n: usize) -> usize {
     n.clamp(1, WORKER_MAX_CONCURRENCY_LIMIT)
 }
 
+/// One ordering for both panes. `.` then `..`, then the sort key.
+/// Name sort keeps directories above files and reverses names only.
+pub fn cmp_file_entries(
+    a: &FileEntry,
+    b: &FileEntry,
+    key: SortKey,
+    asc: bool,
+) -> std::cmp::Ordering {
+    let rank = |name: &str| -> u8 {
+        if name == "." {
+            0
+        } else if name == ".." {
+            1
+        } else {
+            2
+        }
+    };
+    let special = rank(&a.name).cmp(&rank(&b.name));
+    if special != std::cmp::Ordering::Equal {
+        return special;
+    }
+    match key {
+        SortKey::Name => {
+            let dirs = b.is_dir().cmp(&a.is_dir());
+            let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+            dirs.then(if asc { names } else { names.reverse() })
+        }
+        SortKey::Size => {
+            let sizes = a.size.cmp(&b.size);
+            let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+            let ord = sizes.then(names);
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        }
+        SortKey::Date => {
+            let dates = a.modified.cmp(&b.modified);
+            let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+            let ord = dates.then(names);
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        }
+    }
+}
+
 /// One file discovered by a folder scan. Enqueued only after drain + overwrite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingFile {
@@ -537,46 +587,7 @@ impl AppState {
     }
 
     fn cmp_entries(a: &FileEntry, b: &FileEntry, key: SortKey, asc: bool) -> std::cmp::Ordering {
-        let rank = |name: &str| -> u8 {
-            if name == "." {
-                0
-            } else if name == ".." {
-                1
-            } else {
-                2
-            }
-        };
-        let special = rank(&a.name).cmp(&rank(&b.name));
-        if special != std::cmp::Ordering::Equal {
-            return special;
-        }
-        match key {
-            SortKey::Name => {
-                let dirs = b.is_dir().cmp(&a.is_dir());
-                let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                dirs.then(if asc { names } else { names.reverse() })
-            }
-            SortKey::Size => {
-                let sizes = a.size.cmp(&b.size);
-                let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                let ord = sizes.then(names);
-                if asc {
-                    ord
-                } else {
-                    ord.reverse()
-                }
-            }
-            SortKey::Date => {
-                let dates = a.modified.cmp(&b.modified);
-                let names = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                let ord = dates.then(names);
-                if asc {
-                    ord
-                } else {
-                    ord.reverse()
-                }
-            }
-        }
+        cmp_file_entries(a, b, key, asc)
     }
 
     fn visible_indices(

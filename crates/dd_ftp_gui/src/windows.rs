@@ -23,7 +23,7 @@ pub fn main_window_options(bounds: Bounds<Pixels>) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{px, size, TestAppContext};
+    use gpui::{TestAppContext, px, size};
 
     #[gpui::test]
     fn window_is_1280_by_800_with_the_app_id(cx: &mut TestAppContext) {

@@ -13,9 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 dd_ftp_app = { path = "../dd_ftp_app" }
 dd_ftp_core = { path = "../dd_ftp_core" }
+dd_ftp_ftp = { path = "../dd_ftp_ftp" }
+dd_ftp_protocols = { path = "../dd_ftp_protocols" }
 dd_ftp_storage = { path = "../dd_ftp_storage" }
+tokio.workspace = true
 gpui = { package = "gpui-pre", version = "=0.3.12" }
 # Linux windows need a backend. wayland and x11 are off by default.
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = [

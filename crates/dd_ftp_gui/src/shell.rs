@@ -1,24 +1,29 @@
 //! One window: local files, bookmarks, quick connect, and the Settings sheet.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
 use dd_ftp_app::{
-    clamp_worker_concurrency, OverwritePolicy, SettingsField, TextField,
-    WORKER_MAX_CONCURRENCY_LIMIT,
+    OverwritePolicy, SettingsField, SortKey, TextField, WORKER_MAX_CONCURRENCY_LIMIT,
+    clamp_worker_concurrency, cmp_file_entries, is_dot_or_dotdot,
 };
-use dd_ftp_core::{ConnectionInfo, Protocol};
+use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, Protocol};
+
+use crate::session::{self, Backend, SessionClient, SessionEvent};
 use dd_ftp_storage::{AppConfig, SiteManager};
 use gpui::{
-    prelude::*, px, App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, IntoElement,
-    KeyDownEvent, ParentElement, Render, ScrollHandle, Styled, Window, div,
+    App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
+    ParentElement, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
 };
 use ldnddev_theme::{
-    ColorField, EditorKey, EditorOutcome, Palette, PickerOutcome, PickerRow, ThemeEditor,
-    ThemePicker, ThemeSaveTarget, EXTRA_MODAL_HEADER, EXTRA_SELECTION, Rgb,
+    ColorField, EXTRA_MODAL_HEADER, EXTRA_SELECTION, EditorKey, EditorOutcome, Palette,
+    PickerOutcome, PickerRow, Rgb, ThemeEditor, ThemePicker, ThemeSaveTarget,
 };
 
+#[cfg(test)]
+use crate::listing::SegmentAction;
 use crate::listing::{self, LocalEntry};
 use crate::prefs::{self, GuiSettings};
 use crate::shortcuts;
@@ -29,6 +34,13 @@ const PAGE_NAMES: [&str; 4] = ["Themes", "Window", "Session", "Help"];
 const BUSY_BARS: [char; 4] = ['▃', '▅', '█', '▅'];
 const BUSY_FRAME_MS: u128 = 150;
 const CHROME_PX: f32 = 28.0;
+const LOCAL_PAGE: usize = 10;
+
+#[derive(Clone, Copy)]
+enum Reselect {
+    Reset,
+    KeepName,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
@@ -65,22 +77,32 @@ impl Page {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Local,
+    Remote,
     Bookmarks,
+    Name,
     Host,
     Port,
     User,
+    Password,
+    Key,
     Protocol,
+    Path,
 }
 
 impl Pane {
     fn cycle(self, dir: i32) -> Self {
         let order = [
             Self::Local,
+            Self::Remote,
             Self::Bookmarks,
+            Self::Name,
             Self::Host,
             Self::Port,
             Self::User,
+            Self::Password,
+            Self::Key,
             Self::Protocol,
+            Self::Path,
         ];
         let index = order.iter().position(|pane| *pane == self).unwrap_or(0);
         let len = order.len() as i32;
@@ -92,6 +114,26 @@ impl Pane {
 struct Notice {
     message: String,
     at: Instant,
+}
+
+enum InFlight {
+    Connect,
+    List { path: String },
+    HostKey,
+}
+
+struct ConnectView {
+    host: String,
+    username: String,
+    protocol: Protocol,
+}
+
+struct HostKeyPrompt {
+    host: String,
+    port: u16,
+    fingerprint: String,
+    changed: bool,
+    reply: Sender<bool>,
 }
 
 pub struct ShellOptions {
@@ -107,6 +149,8 @@ pub struct ShellOptions {
     pub omarchy: ldnddev_theme::OmarchyPaths,
     pub tick: bool,
     pub quit_runtime: bool,
+    pub apply_env: bool,
+    pub backend: Backend,
 }
 
 impl ShellOptions {
@@ -136,6 +180,8 @@ impl ShellOptions {
             omarchy: ldnddev_theme::OmarchyPaths::system(),
             tick: true,
             quit_runtime: true,
+            apply_env: true,
+            backend: Backend::Live,
         }
     }
 }
@@ -147,20 +193,28 @@ pub struct Shell {
     pub quit: bool,
     confirm_quit: bool,
     pub transfer_active: bool,
-    connect_busy: bool,
     local_cwd: PathBuf,
     entries: Vec<LocalEntry>,
     local_index: usize,
     local_scroll: ScrollHandle,
+    filter_pattern: String,
+    filter_open: bool,
+    sort_key: SortKey,
+    sort_asc: bool,
+    marks: HashSet<String>,
+    mark_anchor: Option<usize>,
     sites: Vec<ConnectionInfo>,
     bookmark_index: usize,
     pane: Pane,
+    name: TextField,
     host: TextField,
     port: TextField,
     user: TextField,
+    password: TextField,
+    private_key: TextField,
     protocol: Protocol,
+    path: TextField,
     toasts: Vec<Notice>,
-    connect_rx: Option<Receiver<String>>,
     busy_armed: bool,
     follow_armed: bool,
     project_root: PathBuf,
@@ -194,12 +248,27 @@ pub struct Shell {
     hide_dotfiles: bool,
     help_scroll: usize,
     test_clipboard: String,
+    generation: u64,
+    connected: bool,
+    remote_cwd: String,
+    remote_entries: Vec<FileEntry>,
+    remote_index: usize,
+    remote_scroll: ScrollHandle,
+    remote_reselect: Reselect,
+    status: String,
+    busy_reason: Option<String>,
+    inflight: Option<InFlight>,
+    connect_view: Option<ConnectView>,
+    host_key: Option<HostKeyPrompt>,
+    session: SessionClient,
 }
 
 impl Shell {
     pub fn open(opts: ShellOptions, cx: &mut Context<Self>) -> Self {
         let gui = prefs::load_from(&opts.gui_path);
-        let loaded = theme_load::load_theme(&opts.project_root, opts.home.as_deref(), &opts.omarchy);
+        let loaded =
+            theme_load::load_theme(&opts.project_root, opts.home.as_deref(), &opts.omarchy);
+        let env_info = opts.apply_env.then(session::connection_from_env);
         let mut shell = Self {
             focus: cx.focus_handle(),
             options_tick: opts.tick,
@@ -207,20 +276,28 @@ impl Shell {
             quit: false,
             confirm_quit: false,
             transfer_active: false,
-            connect_busy: false,
             local_cwd: opts.local_cwd.clone(),
             entries: Vec::new(),
             local_index: 0,
             local_scroll: ScrollHandle::new(),
+            filter_pattern: String::new(),
+            filter_open: false,
+            sort_key: SortKey::Name,
+            sort_asc: true,
+            marks: HashSet::new(),
+            mark_anchor: None,
             sites: opts.sites,
             bookmark_index: 0,
             pane: Pane::Local,
+            name: TextField::from_str(""),
             host: TextField::from_str(""),
             port: TextField::from_str("22"),
             user: TextField::from_str(""),
+            password: TextField::from_str(""),
+            private_key: TextField::from_str(""),
             protocol: Protocol::Sftp,
+            path: TextField::from_str("/"),
             toasts: Vec::new(),
-            connect_rx: None,
             busy_armed: false,
             follow_armed: false,
             project_root: opts.project_root,
@@ -254,6 +331,19 @@ impl Shell {
             hide_dotfiles: false,
             help_scroll: 0,
             test_clipboard: String::new(),
+            generation: 0,
+            connected: false,
+            remote_cwd: "/".to_string(),
+            remote_entries: Vec::new(),
+            remote_index: 0,
+            remote_scroll: ScrollHandle::new(),
+            remote_reselect: Reselect::Reset,
+            status: "Not connected".to_string(),
+            busy_reason: None,
+            inflight: None,
+            connect_view: None,
+            host_key: None,
+            session: SessionClient::spawn(opts.backend.clone()),
         };
         shell.follow_stamp = ldnddev_theme::follow_stamp(&shell.omarchy);
         if opts.load_app_config {
@@ -263,7 +353,10 @@ impl Shell {
             shell.load_sites();
         }
         shell.session_last_local = TextField::from_str(&shell.local_cwd.display().to_string());
-        shell.reload_local();
+        if let Some(info) = env_info {
+            shell.apply_form(&info);
+        }
+        shell.reload_local(Reselect::Reset);
         if opts.tick {
             shell.arm_follow(cx);
         }
@@ -319,11 +412,96 @@ impl Shell {
             .join(",")
     }
 
-    fn reload_local(&mut self) {
-        self.entries = listing::list_dir(&self.local_cwd, self.hide_dotfiles);
-        if self.local_index >= self.entries.len() {
-            self.local_index = self.entries.len().saturating_sub(1);
+    fn reload_local(&mut self, select: Reselect) {
+        let previous = match select {
+            Reselect::Reset => None,
+            Reselect::KeepName => self.selected_name(),
+        };
+        self.entries = listing::list_dir(&self.local_cwd);
+        match select {
+            Reselect::Reset => {
+                self.marks.clear();
+                self.mark_anchor = None;
+            }
+            Reselect::KeepName => {
+                self.marks
+                    .retain(|path| self.entries.iter().any(|entry| &entry.path_key() == path));
+            }
         }
+        self.reselect(previous);
+    }
+
+    fn visible_entries(&self) -> Vec<LocalEntry> {
+        listing::visible(
+            &self.entries,
+            &self.filter_pattern,
+            self.hide_dotfiles,
+            self.sort_key,
+            self.sort_asc,
+        )
+    }
+
+    fn selected_name(&self) -> Option<String> {
+        self.visible_entries()
+            .get(self.local_index)
+            .map(|entry| entry.name.clone())
+    }
+
+    fn selected_entry(&self) -> Option<LocalEntry> {
+        self.visible_entries().get(self.local_index).cloned()
+    }
+
+    fn reselect(&mut self, previous: Option<String>) {
+        let visible = self.visible_entries();
+        if visible.is_empty() {
+            self.local_index = 0;
+            return;
+        }
+        if let Some(name) = previous.as_deref() {
+            if let Some(index) = visible.iter().position(|entry| entry.name == name) {
+                self.local_index = index;
+                return;
+            }
+            if self.local_index >= visible.len() {
+                self.local_index = visible.len() - 1;
+            }
+            return;
+        }
+        self.local_index = 0;
+    }
+
+    fn goto_local(&mut self, path: PathBuf) {
+        if path == self.local_cwd || !path.is_dir() {
+            return;
+        }
+        self.local_cwd = path;
+        self.reload_local(Reselect::Reset);
+    }
+
+    fn parent_local(&mut self) {
+        let Some(parent) = self.local_cwd.parent() else {
+            return;
+        };
+        if parent.as_os_str().is_empty() || !parent.is_dir() {
+            return;
+        }
+        self.local_cwd = parent.to_path_buf();
+        self.reload_local(Reselect::Reset);
+    }
+
+    #[cfg(test)]
+    fn follow_segment(&mut self, index: usize, double: bool) {
+        let segments = listing::split_local_path(&self.local_cwd);
+        match listing::segment_action(&segments, index, double) {
+            Some(SegmentAction::Parent) => self.parent_local(),
+            Some(SegmentAction::Goto(target)) => self.goto_local(PathBuf::from(target)),
+            None => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub fn activate_path_segment(&mut self, index: usize, double: bool) {
+        self.follow_segment(index, double);
     }
 
     fn push_toast(&mut self, message: String) {
@@ -341,24 +519,24 @@ impl Shell {
         let now = Instant::now();
         self.toasts
             .retain(|notice| now.duration_since(notice.at) < Duration::from_secs(5));
-        if let Some(rx) = &self.connect_rx {
-            match rx.try_recv() {
-                Ok(message) => {
-                    self.push_toast(message);
-                    self.connect_rx = None;
-                    self.connect_busy = false;
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    self.connect_rx = None;
-                    self.connect_busy = false;
-                }
-            }
+        while let Ok(event) = self.session.try_recv() {
+            self.apply_event(event);
         }
     }
 
     fn header_busy(&self) -> bool {
-        self.connect_busy || self.transfer_active
+        self.busy_reason.is_some() || self.transfer_active
+    }
+
+    fn header_busy_text(&self) -> Option<String> {
+        if !self.header_busy() {
+            return None;
+        }
+        let mark = Self::busy_label(Self::now_ms());
+        match &self.busy_reason {
+            Some(reason) => Some(format!("{mark} {reason}")),
+            None => Some(mark),
+        }
     }
 
     pub fn busy_label(now_ms: u128) -> String {
@@ -407,18 +585,18 @@ impl Shell {
             return;
         }
         self.follow_armed = true;
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_secs(2))
-                .await;
-            if this
-                .update(cx, |shell, cx| {
-                    shell.refresh_follow();
-                    cx.notify();
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                if this
+                    .update(cx, |shell, cx| {
+                        shell.refresh_follow();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -428,7 +606,10 @@ impl Shell {
         if self.settings_open {
             return;
         }
-        if !matches!(self.palette.omarchy, Some(ldnddev_theme::OmarchyChoice::Follow)) {
+        if !matches!(
+            self.palette.omarchy,
+            Some(ldnddev_theme::OmarchyChoice::Follow)
+        ) {
             return;
         }
         let stamp = ldnddev_theme::follow_stamp(&self.omarchy);
@@ -450,28 +631,346 @@ impl Shell {
     }
 
     pub fn connect(&mut self, cx: &mut Context<Self>) {
-        let host = self.host.value.trim().to_string();
-        if host.is_empty() {
-            self.push_toast("Connect needs a host".to_string());
+        self.start_connect(cx);
+    }
+
+    fn connect_or_disconnect(&mut self, cx: &mut Context<Self>) {
+        if self.host_key.is_some() || self.connected {
+            self.disconnect_session();
             return;
         }
-        let port = self.port.value.trim().to_string();
-        let user = self.user.value.trim().to_string();
-        let protocol = protocol_label(self.protocol);
-        let (tx, rx) = mpsc::channel();
-        self.connect_rx = Some(rx);
-        self.connect_busy = true;
-        std::thread::spawn(move || {
-            // A live FTP/SFTP handshake pulls the protocol crates into this
-            // window. Report the host the button would use and return.
-            let who = if user.is_empty() {
-                host.clone()
-            } else {
-                format!("{user}@{host}")
-            };
-            let _ = tx.send(format!("Connect {who}:{port} ({protocol})"));
+        self.start_connect(cx);
+    }
+
+    fn start_connect(&mut self, cx: &mut Context<Self>) {
+        if self.host_key.is_some() || self.connected {
+            self.disconnect_session();
+        }
+        let name = self.name.value.trim().to_string();
+        if name.is_empty() {
+            self.status = "Connect failed: label/name is required".to_string();
+            return;
+        }
+        let host = self.host.value.trim().to_string();
+        if host.is_empty() {
+            self.status = "Connect failed: host is required".to_string();
+            return;
+        }
+        let username = self.user.value.trim().to_string();
+        if username.is_empty() {
+            self.status = "Connect failed: username is required".to_string();
+            return;
+        }
+        let port = self.port.value.trim().parse::<u16>().unwrap_or(0);
+        if port == 0 {
+            self.status = "Connect failed: port must be > 0".to_string();
+            return;
+        }
+        let path = session::normalize_remote(&self.path.value);
+        let password = {
+            let value = self.password.value.clone();
+            if value.is_empty() { None } else { Some(value) }
+        };
+        let key = self.private_key.value.trim().to_string();
+        let info = ConnectionInfo {
+            name,
+            host: host.clone(),
+            port,
+            protocol: self.protocol,
+            username: username.clone(),
+            password,
+            private_key: if key.is_empty() { None } else { Some(key) },
+            initial_path: path.clone(),
+        };
+        let generation = self.bump_generation();
+        self.connect_view = Some(ConnectView {
+            host,
+            username,
+            protocol: self.protocol,
         });
+        self.remote_cwd = path.clone();
+        self.busy_reason = Some("busy: connecting".to_string());
+        self.inflight = Some(InFlight::Connect);
+        self.session.connect(generation, info, path);
         self.arm_busy(cx);
+    }
+
+    fn disconnect_session(&mut self) {
+        if let Some(prompt) = self.host_key.take() {
+            let _ = prompt.reply.send(false);
+        }
+        let generation = self.bump_generation();
+        self.connected = false;
+        self.remote_entries.clear();
+        self.remote_index = 0;
+        self.inflight = None;
+        self.busy_reason = None;
+        self.connect_view = None;
+        self.status = "Disconnected".to_string();
+        self.session.disconnect(generation);
+    }
+
+    fn bump_generation(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    fn apply_form(&mut self, info: &ConnectionInfo) {
+        self.name = TextField::from_str(&info.name);
+        self.host = TextField::from_str(&info.host);
+        self.port = TextField::from_str(&info.port.to_string());
+        self.user = TextField::from_str(&info.username);
+        self.password = TextField::from_str(info.password.as_deref().unwrap_or(""));
+        self.private_key = TextField::from_str(info.private_key.as_deref().unwrap_or(""));
+        self.protocol = info.protocol;
+        self.path = TextField::from_str(if info.initial_path.is_empty() {
+            "/"
+        } else {
+            &info.initial_path
+        });
+    }
+
+    #[cfg(test)]
+    pub fn fill_quick_connect(&mut self, info: &ConnectionInfo) {
+        self.apply_form(info);
+    }
+
+    #[cfg(test)]
+    pub fn push_stale_listing(&mut self, name: &str) {
+        self.apply_event(SessionEvent::Listed {
+            generation: self.generation.wrapping_sub(1),
+            path: self.remote_cwd.clone(),
+            entries: vec![session::entry(name, false)],
+        });
+    }
+
+    fn password_secret(&self) -> Option<&str> {
+        let value = self.password.value.as_str();
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    fn connected_status_line(&self) -> String {
+        let view = self.connect_view.as_ref();
+        let host = view
+            .map(|view| view.host.as_str())
+            .unwrap_or(self.host.value.as_str());
+        let username = view
+            .map(|view| view.username.as_str())
+            .unwrap_or(self.user.value.as_str());
+        let protocol = view.map(|view| view.protocol).unwrap_or(self.protocol);
+        session::connected_status(protocol, host, username, &self.remote_cwd)
+    }
+
+    fn apply_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::HostKey {
+                generation,
+                host,
+                port,
+                fingerprint,
+                changed,
+                reply,
+            } => {
+                if generation != self.generation {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.busy_reason = Some("busy: waiting for host key".to_string());
+                self.inflight = Some(InFlight::HostKey);
+                self.host_key = Some(HostKeyPrompt {
+                    host,
+                    port,
+                    fingerprint,
+                    changed,
+                    reply,
+                });
+            }
+            SessionEvent::Connected {
+                generation,
+                path,
+                entries,
+            } => {
+                let pending = matches!(self.inflight, Some(InFlight::Connect | InFlight::HostKey));
+                if generation != self.generation || !pending {
+                    return;
+                }
+                self.inflight = None;
+                self.busy_reason = None;
+                self.host_key = None;
+                self.connected = true;
+                self.remote_cwd = path;
+                self.finish_remote_list(entries, Reselect::Reset);
+                self.status = self.connected_status_line();
+            }
+            SessionEvent::Listed {
+                generation,
+                path,
+                entries,
+            } => {
+                let pending = matches!(
+                    &self.inflight,
+                    Some(InFlight::List { path: listed }) if listed == &path
+                );
+                if generation != self.generation || !pending {
+                    return;
+                }
+                self.inflight = None;
+                self.busy_reason = None;
+                let select = self.remote_reselect;
+                self.remote_cwd = path;
+                self.finish_remote_list(entries, select);
+                self.status = format!("Remote cwd: {}", self.remote_cwd);
+            }
+            SessionEvent::Failed {
+                generation,
+                message,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                let message = session::redact(&message, self.password_secret());
+                self.inflight = None;
+                self.busy_reason = None;
+                self.host_key = None;
+                if !self.connected {
+                    self.remote_entries.clear();
+                    self.remote_index = 0;
+                }
+                self.status = message;
+            }
+            SessionEvent::Disconnected { generation } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.inflight = None;
+                self.busy_reason = None;
+            }
+        }
+    }
+
+    fn finish_remote_list(&mut self, entries: Vec<FileEntry>, select: Reselect) {
+        let previous = self
+            .remote_rows()
+            .get(self.remote_index)
+            .map(|entry| entry.name.clone());
+        self.remote_entries = entries;
+        let rows = self.remote_rows();
+        self.remote_index = match select {
+            Reselect::Reset => 0,
+            Reselect::KeepName => previous
+                .as_ref()
+                .and_then(|name| rows.iter().position(|row| &row.name == name))
+                .unwrap_or(0),
+        };
+        if self.remote_index >= rows.len() {
+            self.remote_index = 0;
+        }
+    }
+
+    fn remote_rows(&self) -> Vec<FileEntry> {
+        if !self.connected {
+            return Vec::new();
+        }
+        let mut rows = vec![
+            nav_entry(".", &self.remote_cwd),
+            nav_entry("..", &session::parent_remote(&self.remote_cwd)),
+        ];
+        rows.extend(self.remote_entries.iter().cloned());
+        rows.sort_by(|a, b| cmp_file_entries(a, b, self.sort_key, self.sort_asc));
+        rows
+    }
+
+    fn request_remote_list(&mut self, path: String, select: Reselect, cx: &mut Context<Self>) {
+        if !self.connected || self.inflight.is_some() {
+            return;
+        }
+        self.remote_reselect = select;
+        self.busy_reason = Some("busy: listing remote".to_string());
+        self.inflight = Some(InFlight::List { path: path.clone() });
+        self.session.list(self.generation, path);
+        self.arm_busy(cx);
+    }
+
+    fn enter_remote(&mut self, cx: &mut Context<Self>) {
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return;
+        }
+        if self.inflight.is_some() {
+            return;
+        }
+        let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
+            return;
+        };
+        if entry.name == "." {
+            return;
+        }
+        if entry.name == ".." {
+            self.parent_remote(cx);
+            return;
+        }
+        if !entry.is_dir() {
+            self.status = format!("'{}' is not a directory", entry.name);
+            return;
+        }
+        let next = match session::join_remote(&self.remote_cwd, &entry.name) {
+            Ok(path) => path,
+            Err(_) => {
+                self.status = "path escapes directory".to_string();
+                return;
+            }
+        };
+        self.remote_cwd = next.clone();
+        self.request_remote_list(next, Reselect::Reset, cx);
+    }
+
+    fn parent_remote(&mut self, cx: &mut Context<Self>) {
+        if !self.connected || self.inflight.is_some() {
+            return;
+        }
+        let next = session::parent_remote(&self.remote_cwd);
+        if next == self.remote_cwd {
+            return;
+        }
+        self.remote_cwd = next.clone();
+        self.request_remote_list(next, Reselect::Reset, cx);
+    }
+
+    fn refresh_remote(&mut self, cx: &mut Context<Self>) {
+        if !self.connected || self.inflight.is_some() {
+            return;
+        }
+        let path = self.remote_cwd.clone();
+        self.request_remote_list(path, Reselect::KeepName, cx);
+    }
+
+    fn move_remote(&mut self, dir: i32) {
+        let len = self.remote_rows().len();
+        if len == 0 {
+            return;
+        }
+        if dir < 0 {
+            self.remote_index = self.remote_index.saturating_sub(1);
+        } else {
+            self.remote_index = (self.remote_index + 1).min(len - 1);
+        }
+    }
+
+    fn host_key_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let answer = match key {
+            "y" | "enter" => Some(true),
+            "n" | "escape" => Some(false),
+            _ => None,
+        };
+        let Some(answer) = answer else {
+            return;
+        };
+        if let Some(prompt) = self.host_key.take() {
+            let _ = prompt.reply.send(answer);
+            self.busy_reason = Some("busy: connecting".to_string());
+            self.inflight = Some(InFlight::Connect);
+            self.arm_busy(cx);
+        }
     }
 
     fn request_quit(&mut self) {
@@ -497,7 +996,16 @@ impl Shell {
     }
 
     fn body_text_focused(&self) -> bool {
-        matches!(self.pane, Pane::Host | Pane::Port | Pane::User)
+        matches!(
+            self.pane,
+            Pane::Name
+                | Pane::Host
+                | Pane::Port
+                | Pane::User
+                | Pane::Password
+                | Pane::Key
+                | Pane::Path
+        )
     }
 
     fn settings_text_focused(&self) -> bool {
@@ -520,9 +1028,13 @@ impl Shell {
             };
         }
         match self.pane {
+            Pane::Name => Some(&mut self.name),
             Pane::Host => Some(&mut self.host),
             Pane::Port => Some(&mut self.port),
             Pane::User => Some(&mut self.user),
+            Pane::Password => Some(&mut self.password),
+            Pane::Key => Some(&mut self.private_key),
+            Pane::Path => Some(&mut self.path),
             _ => None,
         }
     }
@@ -606,6 +1118,10 @@ impl Shell {
     }
 
     fn body_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.host_key.is_some() {
+            self.host_key_key(key, cx);
+            return;
+        }
         if key == "tab" {
             self.pane = self.pane.cycle(1);
             return;
@@ -614,53 +1130,223 @@ impl Shell {
             self.pane = self.pane.cycle(-1);
             return;
         }
+        if !self.body_text_focused() && !self.filter_open {
+            match key {
+                "1" => {
+                    self.pane = Pane::Local;
+                    return;
+                }
+                "2" => {
+                    self.pane = Pane::Remote;
+                    return;
+                }
+                "c" => {
+                    self.connect_or_disconnect(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match self.pane {
             Pane::Local => self.local_key(key),
+            Pane::Remote => self.remote_key(key, cx),
             Pane::Bookmarks => self.bookmark_key(key),
-            Pane::Host | Pane::Port | Pane::User => self.form_key(key, cx),
+            Pane::Name
+            | Pane::Host
+            | Pane::Port
+            | Pane::User
+            | Pane::Password
+            | Pane::Key
+            | Pane::Path => self.form_key(key, cx),
             Pane::Protocol => self.protocol_key(key, cx),
         }
     }
 
+    fn remote_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let vim = self.gui.vim_keys;
+        match key {
+            "up" | "k" if key != "k" || vim => self.move_remote(-1),
+            "down" | "j" if key != "j" || vim => self.move_remote(1),
+            "enter" => self.enter_remote(cx),
+            "backspace" | "h" if key != "h" || vim => self.parent_remote(cx),
+            "r" => self.refresh_remote(cx),
+            _ => {}
+        }
+    }
+
     fn local_key(&mut self, key: &str) {
-        let len = self.entries.len();
-        if len == 0 {
+        if key == "/" {
+            self.toggle_filter();
+            return;
+        }
+        if self.filter_open {
+            self.filter_key(key);
             return;
         }
         let vim = self.gui.vim_keys;
         match key {
-            "up" | "k" if key != "k" || vim => {
-                self.local_index = self.local_index.saturating_sub(1);
+            "escape" => {
+                if !self.marks.is_empty() {
+                    self.marks.clear();
+                    self.mark_anchor = None;
+                }
             }
-            "down" | "j" if key != "j" || vim => {
-                self.local_index = (self.local_index + 1).min(len - 1);
+            "ctrl-a" => self.mark_all_visible(),
+            "." => self.toggle_hide(),
+            "s" => self.cycle_sort(),
+            "shift-s" => self.toggle_sort_dir(),
+            "r" => self.reload_local(Reselect::KeepName),
+            "h" if vim => self.parent_local(),
+            "l" if vim => self.enter_local(),
+            "up" | "k" if key != "k" || vim => self.move_selection(-1),
+            "down" | "j" if key != "j" || vim => self.move_selection(1),
+            "shift-up" | "shift-k" => self.extend_mark(-1),
+            "shift-down" | "shift-j" => self.extend_mark(1),
+            "home" | "g" if key != "g" || vim => self.jump_local(0),
+            "end" | "shift-g" if key != "shift-g" || vim => {
+                let last = self.visible_entries().len().saturating_sub(1);
+                self.jump_local(last);
             }
-            "g" if vim => self.local_index = 0,
-            "shift-g" if vim => self.local_index = len - 1,
             "pageup" | "page-up" => {
-                self.local_index = self.local_index.saturating_sub(10);
+                self.jump_local(self.local_index.saturating_sub(LOCAL_PAGE));
             }
             "pagedown" | "page-down" => {
-                self.local_index = (self.local_index + 10).min(len - 1);
+                let last = self.visible_entries().len().saturating_sub(1);
+                self.jump_local((self.local_index + LOCAL_PAGE).min(last));
             }
+            "space" => self.toggle_mark(),
             "enter" => self.enter_local(),
             _ => {}
         }
     }
 
-    fn enter_local(&mut self) {
-        let Some(entry) = self.entries.get(self.local_index) else {
+    fn filter_key(&mut self, key: &str) {
+        match key {
+            "escape" => self.toggle_filter(),
+            "enter" => self.filter_open = false,
+            "backspace" => {
+                let previous = self.selected_name();
+                self.filter_pattern.pop();
+                self.reselect(previous);
+            }
+            _ => {
+                if let Some(ch) = filter_char(key) {
+                    let previous = self.selected_name();
+                    self.filter_pattern.push(ch);
+                    self.reselect(previous);
+                }
+            }
+        }
+    }
+
+    fn toggle_filter(&mut self) {
+        let previous = self.selected_name();
+        self.filter_open = !self.filter_open;
+        if !self.filter_open {
+            self.filter_pattern.clear();
+        }
+        self.reselect(previous);
+    }
+
+    fn toggle_hide(&mut self) {
+        let previous = self.selected_name();
+        self.hide_dotfiles = !self.hide_dotfiles;
+        self.reselect(previous);
+    }
+
+    fn cycle_sort(&mut self) {
+        let previous = self.selected_name();
+        self.sort_key = self.sort_key.next();
+        self.reselect(previous);
+    }
+
+    fn toggle_sort_dir(&mut self) {
+        let previous = self.selected_name();
+        self.sort_asc = !self.sort_asc;
+        self.reselect(previous);
+    }
+
+    fn move_selection(&mut self, dir: i32) {
+        let len = self.visible_entries().len();
+        if len == 0 {
+            return;
+        }
+        if dir < 0 {
+            self.local_index = self.local_index.saturating_sub(1);
+        } else {
+            self.local_index = (self.local_index + 1).min(len - 1);
+        }
+    }
+
+    fn jump_local(&mut self, index: usize) {
+        let len = self.visible_entries().len();
+        if len == 0 {
+            self.local_index = 0;
+            return;
+        }
+        self.local_index = index.min(len - 1);
+    }
+
+    fn toggle_mark(&mut self) {
+        let Some(entry) = self.selected_entry() else {
             return;
         };
-        if !entry.is_dir() {
+        if is_dot_or_dotdot(&entry.name) {
             return;
         }
-        let next = entry.path.clone();
-        if next.is_dir() {
-            self.local_cwd = next;
-            self.local_index = 0;
-            self.reload_local();
+        let path = entry.path_key();
+        if !self.marks.remove(&path) {
+            self.marks.insert(path);
         }
+        self.mark_anchor = Some(self.local_index);
+    }
+
+    fn extend_mark(&mut self, dir: i32) {
+        let len = self.visible_entries().len();
+        if len == 0 {
+            return;
+        }
+        let selected = self.local_index;
+        if dir < 0 && selected == 0 {
+            return;
+        }
+        if dir > 0 && selected + 1 >= len {
+            return;
+        }
+        if self.mark_anchor.is_none() {
+            self.mark_anchor = Some(selected);
+        }
+        self.local_index = if dir < 0 { selected - 1 } else { selected + 1 };
+        let from = self.mark_anchor.unwrap_or(self.local_index);
+        self.mark_range(from, self.local_index);
+    }
+
+    fn mark_range(&mut self, from: usize, to: usize) {
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        for (index, entry) in self.visible_entries().into_iter().enumerate() {
+            if index >= lo && index <= hi && !is_dot_or_dotdot(&entry.name) {
+                self.marks.insert(entry.path_key());
+            }
+        }
+    }
+
+    fn mark_all_visible(&mut self) {
+        for entry in self.visible_entries() {
+            if !is_dot_or_dotdot(&entry.name) {
+                self.marks.insert(entry.path_key());
+            }
+        }
+    }
+
+    fn enter_local(&mut self) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        if !entry.is_dir() || entry.path == self.local_cwd || !entry.path.is_dir() {
+            return;
+        }
+        self.local_cwd = entry.path;
+        self.reload_local(Reselect::Reset);
     }
 
     fn bookmark_key(&mut self, key: &str) {
@@ -682,13 +1368,10 @@ impl Shell {
     }
 
     fn fill_from_bookmark(&mut self) {
-        let Some(site) = self.sites.get(self.bookmark_index) else {
+        let Some(site) = self.sites.get(self.bookmark_index).cloned() else {
             return;
         };
-        self.host = TextField::from_str(&site.host);
-        self.port = TextField::from_str(&site.port.to_string());
-        self.user = TextField::from_str(&site.username);
-        self.protocol = site.protocol;
+        self.apply_form(&site);
         self.push_toast(format!("Bookmark {}", site.host));
     }
 
@@ -1013,7 +1696,14 @@ impl Shell {
     fn picker_key(&mut self, key: &str) {
         let moved = matches!(
             key,
-            "up" | "down" | "j" | "k" | "g" | "shift-g" | "pageup" | "pagedown" | "page-up"
+            "up" | "down"
+                | "j"
+                | "k"
+                | "g"
+                | "shift-g"
+                | "pageup"
+                | "pagedown"
+                | "page-up"
                 | "page-down"
         );
         if (key == "j" || key == "k" || key == "g" || key == "shift-g") && !self.gui.vim_keys {
@@ -1269,14 +1959,19 @@ impl Shell {
             return;
         }
         self.hide_dotfiles = self.session_hide_dotfiles;
+        let mut jumped = false;
         if !last_local.is_empty() {
             let path = PathBuf::from(&last_local);
             if path.is_dir() && path != self.local_cwd {
                 self.local_cwd = path;
-                self.local_index = 0;
+                jumped = true;
             }
         }
-        self.reload_local();
+        self.reload_local(if jumped {
+            Reselect::Reset
+        } else {
+            Reselect::KeepName
+        });
         self.push_toast(format!(
             "Settings saved to {}",
             self.app_config_path.display()
@@ -1315,29 +2010,81 @@ impl Shell {
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         lines.push("dd_ftp".to_string());
-        if self.header_busy() {
-            lines.push(Self::busy_label(Self::now_ms()));
+        if let Some(busy) = self.header_busy_text() {
+            lines.push(busy);
         }
         lines.push(format!("footer:{}", self.footer_text()));
         lines.push(format!("local:{}", self.local_cwd.display()));
-        for (index, entry) in self.entries.iter().enumerate() {
-            let mark = if index == self.local_index && self.pane == Pane::Local {
+        let segments = listing::split_local_path(&self.local_cwd);
+        lines.push(format!(
+            "path-bar:{}",
+            segments
+                .iter()
+                .map(|segment| format!("{}=>{}", segment.label, segment.target))
+                .collect::<Vec<_>>()
+                .join("|")
+        ));
+        lines.push(format!(
+            "sort:{} {}",
+            self.sort_key.label(),
+            if self.sort_asc { "asc" } else { "desc" }
+        ));
+        lines.push(format!(
+            "filter{}:{}",
+            if self.filter_open { "-open" } else { "" },
+            self.filter_pattern
+        ));
+        for (index, entry) in self.visible_entries().iter().enumerate() {
+            let cursor = if index == self.local_index && self.pane == Pane::Local {
                 ">"
             } else {
                 " "
             };
+            let star = if self.marks.contains(&entry.path_key()) {
+                "*"
+            } else {
+                " "
+            };
             lines.push(format!(
-                "{mark} {}  {}  {}",
+                "{cursor}{star} {}  {}  {}",
                 entry.name,
                 entry.size,
                 entry.marker()
+            ));
+        }
+        if self.connected {
+            lines.push(format!("remote:{}", self.remote_cwd));
+        } else {
+            lines.push("remote:disconnected".to_string());
+        }
+        lines.push(format!("status:{}", self.status));
+        if let Some(prompt) = &self.host_key {
+            lines.push(format!(
+                "host-key:{} {}:{} changed:{}",
+                prompt.fingerprint, prompt.host, prompt.port, prompt.changed
+            ));
+        }
+        for (index, entry) in self.remote_rows().iter().enumerate() {
+            let cursor = if index == self.remote_index && self.pane == Pane::Remote {
+                ">"
+            } else {
+                " "
+            };
+            let kind = if entry.is_dir() { "dir" } else { "file" };
+            lines.push(format!(
+                "remote-row:{cursor} {}  {}  {kind}",
+                entry.name, entry.size
             ));
         }
         if self.sites.is_empty() {
             lines.push("No bookmarks".to_string());
         }
         for (index, site) in self.sites.iter().enumerate() {
-            let mark = if index == self.bookmark_index { ">" } else { " " };
+            let mark = if index == self.bookmark_index {
+                ">"
+            } else {
+                " "
+            };
             lines.push(format!(
                 "{mark} {}  {}@{}:{}  {}",
                 site.name,
@@ -1347,10 +2094,14 @@ impl Shell {
                 protocol_label(site.protocol)
             ));
         }
+        lines.push(format!("name:{}", self.name.value));
         lines.push(format!("host:{}", self.host.value));
         lines.push(format!("port:{}", self.port.value));
         lines.push(format!("user:{}", self.user.value));
+        lines.push(format!("pass:{}", mask(&self.password.value)));
+        lines.push(format!("key:{}", self.private_key.value));
         lines.push(format!("protocol:{}", protocol_label(self.protocol)));
+        lines.push(format!("path:{}", self.path.value));
         for notice in &self.toasts {
             lines.push(format!("toast:{}", notice.message));
         }
@@ -1394,7 +2145,11 @@ impl Shell {
                         lines.push(format!("Workers {}", self.session_workers));
                         lines.push(format!(
                             "Hide dotfiles {}",
-                            if self.session_hide_dotfiles { "on" } else { "off" }
+                            if self.session_hide_dotfiles {
+                                "on"
+                            } else {
+                                "off"
+                            }
                         ));
                         lines.push(format!(
                             "Overwrite {}",
@@ -1402,7 +2157,11 @@ impl Shell {
                         ));
                         lines.push(format!(
                             "Auto-connect {}",
-                            if self.session_auto_connect { "on" } else { "off" }
+                            if self.session_auto_connect {
+                                "on"
+                            } else {
+                                "off"
+                            }
                         ));
                         lines.push(format!("Last local path {}", self.session_last_local.value));
                     }
@@ -1470,20 +2229,38 @@ impl Render for Shell {
         let paint = paint_of(&self.palette);
         let row = self.row_h();
         let footer = self.footer_text();
-        let busy = self.header_busy().then(|| Self::busy_label(Self::now_ms()));
+        let busy = self.header_busy_text();
         let entries: Vec<(usize, String, bool, bool)> = self
-            .entries
-            .iter()
+            .visible_entries()
+            .into_iter()
             .enumerate()
             .map(|(index, entry)| {
+                let star = if self.marks.contains(&entry.path_key()) {
+                    "* "
+                } else {
+                    ""
+                };
                 (
                     index,
-                    format!("{}  {}  {}", entry.name, entry.size, entry.marker()),
+                    format!("{star}{}  {}  {}", entry.name, entry.size, entry.marker()),
                     entry.is_dir(),
                     index == self.local_index,
                 )
             })
             .collect();
+        let path_segments = listing::split_local_path(&self.local_cwd);
+        let sort_label = format!(
+            "Local  {} {}",
+            self.sort_key.label(),
+            if self.sort_asc { "asc" } else { "desc" }
+        );
+        let filter_label = if self.filter_open {
+            format!("Filter: {}_", self.filter_pattern)
+        } else if self.filter_pattern.is_empty() {
+            String::new()
+        } else {
+            format!("Filter: {}", self.filter_pattern)
+        };
         let sites: Vec<(usize, String, bool)> = self
             .sites
             .iter()
@@ -1503,12 +2280,53 @@ impl Render for Shell {
                 )
             })
             .collect();
+        let name = self.name.value.clone();
         let host = self.host.value.clone();
         let port = self.port.value.clone();
         let user = self.user.value.clone();
+        let pass = mask(&self.password.value);
+        let key = self.private_key.value.clone();
+        let path_field = self.path.value.clone();
         let protocol = protocol_label(self.protocol).to_string();
         let cwd = self.local_cwd.display().to_string();
-        let toasts: Vec<String> = self.toasts.iter().map(|notice| notice.message.clone()).collect();
+        let remote_title = if self.connected {
+            format!("Remote  {}", self.remote_cwd)
+        } else {
+            "Remote  disconnected".to_string()
+        };
+        let remote_rows: Vec<(usize, String, bool, bool)> = self
+            .remote_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let kind = if entry.is_dir() { "dir" } else { "file" };
+                (
+                    index,
+                    format!("{}  {}  {kind}", entry.name, entry.size),
+                    entry.is_dir(),
+                    index == self.remote_index,
+                )
+            })
+            .collect();
+        let remote_scroll = self.remote_scroll.clone();
+        let host_key = self.host_key.as_ref().map(|prompt| {
+            format!(
+                "Accept host key {} for {}:{}?{}",
+                prompt.fingerprint,
+                prompt.host,
+                prompt.port,
+                if prompt.changed {
+                    " The key changed."
+                } else {
+                    ""
+                }
+            )
+        });
+        let toasts: Vec<String> = self
+            .toasts
+            .iter()
+            .map(|notice| notice.message.clone())
+            .collect();
         let confirm = self.confirm_quit;
         let settings = self.settings_open.then(|| self.settings_view());
         let local_scroll = self.local_scroll.clone();
@@ -1609,11 +2427,33 @@ impl Render for Shell {
                             .flex_1()
                             .min_w(px(0.0))
                             .h_full()
-                            .relative()
+                            .flex()
+                            .flex_col()
                             .border_r_1()
                             .border_color(paint.border)
-                            .child(list),
+                            .child(local_path_bar(cx, &path_segments, &sort_label, row, paint))
+                            .when(!filter_label.is_empty(), |column| {
+                                column.child(
+                                    div()
+                                        .h(px(row))
+                                        .px(px(8.0))
+                                        .flex()
+                                        .items_center()
+                                        .text_color(paint.secondary)
+                                        .child(filter_label.clone()),
+                                )
+                            })
+                            .child(div().flex_1().min_h(px(0.0)).relative().child(list)),
                     )
+                    .child(remote_column(
+                        cx,
+                        &remote_title,
+                        &remote_rows,
+                        row,
+                        paint,
+                        pane,
+                        &remote_scroll,
+                    ))
                     .child(
                         div()
                             .w(px(360.0))
@@ -1632,20 +2472,24 @@ impl Render for Shell {
                                     .child("Bookmarks"),
                             )
                             .child(
-                                    div()
-                                        .id("bookmarks")
-                                        .flex_1()
-                                        .min_h(px(0.0))
-                                        .overflow_y_scroll()
-                                        .child(bookmarks),
-                                )
+                                div()
+                                    .id("bookmarks")
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_y_scroll()
+                                    .child(bookmarks),
+                            )
                             .child(connect_form(
                                 cx,
                                 &ConnectFields {
+                                    name: &name,
                                     host: &host,
                                     port: &port,
                                     user: &user,
+                                    pass: &pass,
+                                    key: &key,
                                     protocol: &protocol,
+                                    path: &path_field,
                                 },
                                 row,
                                 paint,
@@ -1672,8 +2516,17 @@ impl Render for Shell {
         if confirm {
             column = column.child(confirm_box(cx, paint));
         }
+        if let Some(message) = host_key {
+            column = column.child(host_key_box(cx, &message, paint));
+        }
         if let Some(settings) = settings {
-            column = column.child(settings_panel(cx, &settings, row, paint, &self.settings_scroll));
+            column = column.child(settings_panel(
+                cx,
+                &settings,
+                row,
+                paint,
+                &self.settings_scroll,
+            ));
         }
         column.child(
             div()
@@ -1735,11 +2588,7 @@ impl Shell {
             hex = editor.hex_draft.clone();
         } else if let Some(picker) = &self.picker {
             for (index, row) in picker.rows.iter().enumerate() {
-                theme_rows.push((
-                    index,
-                    theme_row_label(row),
-                    index == picker.selected,
-                ));
+                theme_rows.push((index, theme_row_label(row), index == picker.selected));
             }
         }
         let word = match self.save_target() {
@@ -1759,22 +2608,27 @@ impl Shell {
             source: self.theme_label.clone(),
             save_to: format!("Save to {word}"),
             density: format!("Density {}", self.gui.density.label()),
-            vim: format!(
-                "Vim keys {}",
-                if self.gui.vim_keys { "on" } else { "off" }
-            ),
+            vim: format!("Vim keys {}", if self.gui.vim_keys { "on" } else { "off" }),
             window_row: self.window_row,
             session: vec![
                 format!("Editor {}", self.session_editor.value),
                 format!("Workers {}", self.session_workers),
                 format!(
                     "Hide dotfiles {}",
-                    if self.session_hide_dotfiles { "on" } else { "off" }
+                    if self.session_hide_dotfiles {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 ),
                 format!("Overwrite {}", self.session_overwrite.settings_label()),
                 format!(
                     "Auto-connect {}",
-                    if self.session_auto_connect { "on" } else { "off" }
+                    if self.session_auto_connect {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 ),
                 format!("Last local path {}", self.session_last_local.value),
             ],
@@ -1821,6 +2675,56 @@ fn hsla(color: Rgb) -> gpui::Hsla {
     .into()
 }
 
+fn local_path_bar(
+    cx: &mut Context<Shell>,
+    segments: &[listing::PathSegment],
+    sort_label: &str,
+    row: f32,
+    paint: Paint,
+) -> gpui::Div {
+    let mut bar = div()
+        .h(px(row))
+        .px(px(8.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0))
+        .overflow_hidden()
+        .border_b_1()
+        .border_color(paint.border)
+        .child(
+            div()
+                .font_weight(FontWeight::BOLD)
+                .mr(px(8.0))
+                .child(sort_label.to_string()),
+        );
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 && segments[index - 1].label != "/" {
+            bar = bar.child(div().text_color(paint.secondary).child("/"));
+        }
+        let target = segment.target.clone();
+        let label = segment.label.clone();
+        let last = index + 1 == segments.len();
+        bar = bar.child(
+            div()
+                .id(("path-seg", index))
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |shell, event: &ClickEvent, _, cx| {
+                    let double = event.click_count() >= 2 && last;
+                    if double {
+                        shell.parent_local();
+                    } else {
+                        shell.goto_local(PathBuf::from(&target));
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                })),
+        );
+    }
+    bar
+}
+
 fn header_bar(cwd: &str, busy: Option<&str>, paint: Paint) -> gpui::Div {
     let mut bar = div()
         .h(px(CHROME_PX))
@@ -1832,11 +2736,7 @@ fn header_bar(cwd: &str, busy: Option<&str>, paint: Paint) -> gpui::Div {
         .bg(paint.raised)
         .border_b_1()
         .border_color(paint.border)
-        .child(
-            div()
-                .font_weight(FontWeight::BOLD)
-                .child("dd_ftp"),
-        );
+        .child(div().font_weight(FontWeight::BOLD).child("dd_ftp"));
     if let Some(busy) = busy {
         bar = bar.child(busy.to_string());
     }
@@ -1850,10 +2750,14 @@ fn header_bar(cwd: &str, busy: Option<&str>, paint: Paint) -> gpui::Div {
 }
 
 struct ConnectFields<'a> {
+    name: &'a str,
     host: &'a str,
     port: &'a str,
     user: &'a str,
+    pass: &'a str,
+    key: &'a str,
     protocol: &'a str,
+    path: &'a str,
 }
 
 fn connect_form(
@@ -1870,14 +2774,74 @@ fn connect_form(
         .p(px(8.0))
         .border_t_1()
         .border_color(paint.border)
-        .child(field_row(cx, "Host", fields.host, Pane::Host, pane, row, paint))
-        .child(field_row(cx, "Port", fields.port, Pane::Port, pane, row, paint))
-        .child(field_row(cx, "User", fields.user, Pane::User, pane, row, paint))
+        .child(field_row(
+            cx,
+            "Name",
+            fields.name,
+            Pane::Name,
+            pane,
+            row,
+            paint,
+        ))
+        .child(field_row(
+            cx,
+            "Host",
+            fields.host,
+            Pane::Host,
+            pane,
+            row,
+            paint,
+        ))
+        .child(field_row(
+            cx,
+            "Port",
+            fields.port,
+            Pane::Port,
+            pane,
+            row,
+            paint,
+        ))
+        .child(field_row(
+            cx,
+            "User",
+            fields.user,
+            Pane::User,
+            pane,
+            row,
+            paint,
+        ))
+        .child(field_row(
+            cx,
+            "Password",
+            fields.pass,
+            Pane::Password,
+            pane,
+            row,
+            paint,
+        ))
+        .child(field_row(
+            cx,
+            "Private key",
+            fields.key,
+            Pane::Key,
+            pane,
+            row,
+            paint,
+        ))
         .child(field_row(
             cx,
             "Protocol",
             fields.protocol,
             Pane::Protocol,
+            pane,
+            row,
+            paint,
+        ))
+        .child(field_row(
+            cx,
+            "Path",
+            fields.path,
+            Pane::Path,
             pane,
             row,
             paint,
@@ -1928,11 +2892,108 @@ fn field_row(
         }))
         .child(
             div()
-                .w(px(72.0))
+                .w(px(96.0))
                 .text_color(paint.secondary)
                 .child(label.to_string()),
         )
         .child(value.to_string())
+}
+
+fn remote_column(
+    cx: &mut Context<Shell>,
+    title: &str,
+    rows: &[(usize, String, bool, bool)],
+    row: f32,
+    paint: Paint,
+    pane: Pane,
+    scroll: &ScrollHandle,
+) -> gpui::Div {
+    let mut list = div()
+        .id("remote-list")
+        .absolute()
+        .size_full()
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .flex()
+        .flex_col();
+    if rows.is_empty() {
+        list = list.child(
+            div()
+                .h(px(row))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .text_color(paint.secondary)
+                .child("Disconnected"),
+        );
+    }
+    for (index, label, is_dir, on) in rows {
+        let index = *index;
+        let is_dir = *is_dir;
+        list = list.child(
+            div()
+                .id(("remote-row", index))
+                .h(px(row))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .when(*on && pane == Pane::Remote, |row| row.bg(paint.selected))
+                .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
+                    let enter = shell.pane == Pane::Remote && shell.remote_index == index;
+                    shell.pane = Pane::Remote;
+                    shell.remote_index = index;
+                    if enter && is_dir {
+                        shell.enter_remote(cx);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .child(label.clone()),
+        );
+    }
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .h_full()
+        .flex()
+        .flex_col()
+        .border_r_1()
+        .border_color(paint.border)
+        .child(
+            div()
+                .h(px(row))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .font_weight(FontWeight::BOLD)
+                .child(title.to_string()),
+        )
+        .child(div().flex_1().min_h(px(0.0)).relative().child(list))
+}
+
+fn host_key_box(cx: &mut Context<Shell>, message: &str, paint: Paint) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("host-key")
+        .absolute()
+        .top(px(80.0))
+        .left(px(80.0))
+        .w(px(480.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .bg(paint.raised)
+        .border_1()
+        .border_color(paint.border)
+        .occlude()
+        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+        }))
+        .child(message.to_string())
+        .child("y accepts and appends known_hosts. n or Esc rejects.")
 }
 
 fn confirm_box(cx: &mut Context<Shell>, paint: Paint) -> gpui::Stateful<gpui::Div> {
@@ -2046,7 +3107,10 @@ fn settings_panel(
             );
         }
         scroll_el = scroll_el
-            .child(settings_line(format!("Source: {}", settings.source), paint.secondary))
+            .child(settings_line(
+                format!("Source: {}", settings.source),
+                paint.secondary,
+            ))
             .child(settings_line(settings.save_to.clone(), paint.text))
             .child(settings_line("Edit colors…".to_string(), paint.text))
             .child(settings_line("Save".to_string(), paint.text));
@@ -2293,12 +3357,7 @@ fn help_column(settings: &SettingsView, paint: Paint) -> gpui::Div {
         .flex_col()
         .gap(px(12.0))
         .p(px(8.0))
-        .child(
-            div()
-                .border_1()
-                .border_color(paint.border)
-                .child(body),
-        )
+        .child(div().border_1().border_color(paint.border).child(body))
 }
 
 fn settings_line(text: String, color: gpui::Hsla) -> gpui::Div {
@@ -2317,6 +3376,21 @@ fn theme_row_label(row: &PickerRow) -> String {
         PickerRow::Theme(theme) => theme.name.clone(),
         PickerRow::Custom => "Custom".to_string(),
     }
+}
+
+fn nav_entry(name: &str, path: &str) -> FileEntry {
+    FileEntry {
+        name: name.to_string(),
+        path: path.to_string(),
+        kind: EntryKind::Directory,
+        size: 0,
+        modified: None,
+        permissions: None,
+    }
+}
+
+fn mask(value: &str) -> String {
+    "*".repeat(value.chars().count())
 }
 
 fn protocol_label(protocol: Protocol) -> &'static str {
@@ -2362,6 +3436,30 @@ fn editor_key(key: &str) -> Option<EditorKey> {
             }
         }
     }
+}
+
+fn filter_char(key: &str) -> Option<char> {
+    if let Some(rest) = key.strip_prefix("shift-") {
+        let mut chars = rest.chars();
+        let ch = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        return Some(if ch.is_ascii_alphabetic() {
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        });
+    }
+    if key == "space" {
+        return Some(' ');
+    }
+    let mut chars = key.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || ch.is_control() {
+        return None;
+    }
+    Some(ch)
 }
 
 fn typed_char(key: &str) -> Option<char> {

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-26
+
+### Added
+- The window's local pane matches the terminal's local browser: sort, filter, hide-dotfiles, marks, page keys, and a path bar.
+- The window connects over SFTP, FTP, or FTPS, lists the remote pane, and prompts for an unknown SFTP host key. `DD_FTP_PASS` is removed after it fills the form.
+
+### Changed
+- README is the terminal feature spec (protocols, keys, transfers, files, settings). GUI parity is phased in `GUI_PARITY.md`.
+
 ## [1.8.4] - 2026-11-25
 
 ### Added

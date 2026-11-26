@@ -4,9 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ldnddev_theme::{
-    apply_omarchy, load_from_str, Palette, ParseMode, ThemeSource,
-};
+use ldnddev_theme::{Palette, ParseMode, ThemeSource, apply_omarchy, load_from_str};
 
 pub const THEME_FILE: &str = "dd_ftp_theme.yml";
 
@@ -17,11 +15,12 @@ pub struct LoadedTheme {
     pub warning: Option<String>,
 }
 
-pub fn load_theme(project_root: &Path, home: Option<&Path>, omarchy: &ldnddev_theme::OmarchyPaths) -> LoadedTheme {
-    let mut candidates = vec![(
-        ThemeSource::Local,
-        project_root.join(THEME_FILE),
-    )];
+pub fn load_theme(
+    project_root: &Path,
+    home: Option<&Path>,
+    omarchy: &ldnddev_theme::OmarchyPaths,
+) -> LoadedTheme {
+    let mut candidates = vec![(ThemeSource::Local, project_root.join(THEME_FILE))];
     if let Some(home) = home {
         candidates.push((
             ThemeSource::Global,

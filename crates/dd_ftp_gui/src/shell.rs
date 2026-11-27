@@ -7,12 +7,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use dd_ftp_app::{
     OverwritePolicy, SettingsField, SortKey, TextField, WORKER_MAX_CONCURRENCY_LIMIT,
-    clamp_worker_concurrency, cmp_file_entries, is_dot_or_dotdot,
+    clamp_worker_concurrency, cmp_file_entries, is_dot_or_dotdot, is_public_key_name,
 };
 use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, Protocol};
 
 use crate::session::{self, Backend, SessionClient, SessionEvent};
-use dd_ftp_storage::{AppConfig, SiteManager};
+use crate::vault::Vault;
+use dd_ftp_storage::{AppConfig, SecretStore, SiteConfig, SiteManager};
 use gpui::{
     App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
     ParentElement, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
@@ -136,6 +137,18 @@ struct HostKeyPrompt {
     reply: Sender<bool>,
 }
 
+struct KeyPicker {
+    cwd: PathBuf,
+    entries: Vec<FileEntry>,
+    index: usize,
+}
+
+struct KeyRow {
+    index: usize,
+    label: String,
+    selected: bool,
+}
+
 pub struct ShellOptions {
     pub local_cwd: PathBuf,
     pub gui_path: PathBuf,
@@ -151,6 +164,9 @@ pub struct ShellOptions {
     pub quit_runtime: bool,
     pub apply_env: bool,
     pub backend: Backend,
+    pub sites_path: PathBuf,
+    pub default_site: Option<usize>,
+    pub vault: Vault,
 }
 
 impl ShellOptions {
@@ -182,6 +198,9 @@ impl ShellOptions {
             quit_runtime: true,
             apply_env: true,
             backend: Backend::Live,
+            sites_path: SiteManager::default_config_path(),
+            default_site: None,
+            vault: Vault::live(),
         }
     }
 }
@@ -204,7 +223,12 @@ pub struct Shell {
     marks: HashSet<String>,
     mark_anchor: Option<usize>,
     sites: Vec<ConnectionInfo>,
+    sites_path: PathBuf,
+    default_site: Option<usize>,
+    vault: Vault,
     bookmark_index: usize,
+    confirm_delete: Option<String>,
+    key_picker: Option<KeyPicker>,
     pane: Pane,
     name: TextField,
     host: TextField,
@@ -287,7 +311,12 @@ impl Shell {
             marks: HashSet::new(),
             mark_anchor: None,
             sites: opts.sites,
+            sites_path: opts.sites_path,
+            default_site: opts.default_site,
+            vault: opts.vault,
             bookmark_index: 0,
+            confirm_delete: None,
+            key_picker: None,
             pane: Pane::Local,
             name: TextField::from_str(""),
             host: TextField::from_str(""),
@@ -352,13 +381,18 @@ impl Shell {
         if opts.load_user_sites {
             shell.load_sites();
         }
+        shell.absorb_site_passwords();
         shell.session_last_local = TextField::from_str(&shell.local_cwd.display().to_string());
         if let Some(info) = env_info {
             shell.apply_form(&info);
         }
+        shell.apply_startup_bookmark();
         shell.reload_local(Reselect::Reset);
         if opts.tick {
             shell.arm_follow(cx);
+        }
+        if shell.session_auto_connect && !shell.host.value.trim().is_empty() {
+            shell.start_connect(cx);
         }
         shell
     }
@@ -386,9 +420,65 @@ impl Shell {
     }
 
     fn load_sites(&mut self) {
-        match SiteManager::load_or_default() {
-            Ok(cfg) => self.sites = cfg.sites,
+        match SiteManager::load_path(&self.sites_path) {
+            Ok(cfg) => {
+                self.sites = cfg.sites;
+                self.default_site = cfg.default_site;
+            }
             Err(err) => self.push_toast(format!("Bookmarks were not read ({err})")),
+        }
+    }
+
+    fn absorb_site_passwords(&mut self) {
+        for site in &mut self.sites {
+            if let Some(password) = site.password.take() {
+                let _ =
+                    self.vault
+                        .save(&site.name, &site.username, &site.host, site.port, &password);
+            }
+        }
+    }
+
+    fn apply_startup_bookmark(&mut self) {
+        if self.sites.is_empty() {
+            return;
+        }
+        let index = self.default_site.unwrap_or(0).min(self.sites.len() - 1);
+        self.bookmark_index = index;
+        let site = self.sites[index].clone();
+        let site = self.hydrate_password(site, "startup");
+        self.apply_form(&site);
+    }
+
+    fn site_config(&self) -> SiteConfig {
+        SiteConfig {
+            sites: self.sites.clone(),
+            default_site: self.default_site,
+        }
+    }
+
+    fn store_sites(
+        &mut self,
+        config: SiteConfig,
+        index: usize,
+        message: String,
+        err_prefix: &str,
+    ) -> bool {
+        match SiteManager::save_path(&self.sites_path, &config) {
+            Ok(()) => {
+                self.sites = config.sites;
+                self.default_site = config.default_site;
+                self.bookmark_index = index.min(self.sites.len().saturating_sub(1));
+                self.status = message.clone();
+                self.push_toast(message);
+                true
+            }
+            Err(err) => {
+                let message = format!("{err_prefix}: {err}");
+                self.status = message.clone();
+                self.push_toast(message);
+                false
+            }
         }
     }
 
@@ -642,51 +732,55 @@ impl Shell {
         self.start_connect(cx);
     }
 
-    fn start_connect(&mut self, cx: &mut Context<Self>) {
-        if self.host_key.is_some() || self.connected {
-            self.disconnect_session();
-        }
-        let name = self.name.value.trim().to_string();
-        if name.is_empty() {
-            self.status = "Connect failed: label/name is required".to_string();
-            return;
-        }
-        let host = self.host.value.trim().to_string();
-        if host.is_empty() {
-            self.status = "Connect failed: host is required".to_string();
-            return;
-        }
-        let username = self.user.value.trim().to_string();
-        if username.is_empty() {
-            self.status = "Connect failed: username is required".to_string();
-            return;
-        }
-        let port = self.port.value.trim().parse::<u16>().unwrap_or(0);
-        if port == 0 {
-            self.status = "Connect failed: port must be > 0".to_string();
-            return;
-        }
-        let path = session::normalize_remote(&self.path.value);
+    fn form_connection(&self) -> ConnectionInfo {
         let password = {
             let value = self.password.value.clone();
             if value.is_empty() { None } else { Some(value) }
         };
         let key = self.private_key.value.trim().to_string();
-        let info = ConnectionInfo {
-            name,
-            host: host.clone(),
-            port,
+        ConnectionInfo {
+            name: self.name.value.trim().to_string(),
+            host: self.host.value.trim().to_string(),
+            port: self.port.value.trim().parse::<u16>().unwrap_or(0),
             protocol: self.protocol,
-            username: username.clone(),
+            username: self.user.value.trim().to_string(),
             password,
             private_key: if key.is_empty() { None } else { Some(key) },
-            initial_path: path.clone(),
-        };
+            initial_path: session::normalize_remote(&self.path.value),
+        }
+    }
+
+    fn start_connect(&mut self, cx: &mut Context<Self>) {
+        let info = self.form_connection();
+        self.start_connect_info(info, cx);
+    }
+
+    fn start_connect_info(&mut self, info: ConnectionInfo, cx: &mut Context<Self>) {
+        if self.host_key.is_some() || self.connected {
+            self.disconnect_session();
+        }
+        if info.name.trim().is_empty() {
+            self.status = "Connect failed: label/name is required".to_string();
+            return;
+        }
+        if info.host.trim().is_empty() {
+            self.status = "Connect failed: host is required".to_string();
+            return;
+        }
+        if info.username.trim().is_empty() {
+            self.status = "Connect failed: username is required".to_string();
+            return;
+        }
+        if info.port == 0 {
+            self.status = "Connect failed: port must be > 0".to_string();
+            return;
+        }
+        let path = session::normalize_remote(&info.initial_path);
         let generation = self.bump_generation();
         self.connect_view = Some(ConnectView {
-            host,
-            username,
-            protocol: self.protocol,
+            host: info.host.clone(),
+            username: info.username.clone(),
+            protocol: info.protocol,
         });
         self.remote_cwd = path.clone();
         self.busy_reason = Some("busy: connecting".to_string());
@@ -1057,8 +1151,20 @@ impl Shell {
             }
             return;
         }
+        if self.confirm_delete.is_some() {
+            match key.as_str() {
+                "enter" | "y" => self.delete_confirmed_bookmark(),
+                "escape" | "n" => self.confirm_delete = None,
+                _ => {}
+            }
+            return;
+        }
         if key == "ctrl-q" {
             self.request_quit();
+            return;
+        }
+        if key == "ctrl-k" {
+            self.report_keyring();
             return;
         }
         if key == "q" && !self.settings_open && !self.body_text_focused() {
@@ -1074,6 +1180,14 @@ impl Shell {
         }
         if key == "f3" {
             self.open_settings(Page::Session);
+            return;
+        }
+        if self.key_picker.is_some() {
+            self.key_picker_key(&key);
+            return;
+        }
+        if key == "ctrl-p" && self.pane == Pane::Key {
+            self.open_key_picker();
             return;
         }
         self.body_key(&key, cx);
@@ -1141,7 +1255,19 @@ impl Shell {
                     return;
                 }
                 "c" => {
-                    self.connect_or_disconnect(cx);
+                    if self.pane == Pane::Bookmarks {
+                        self.connect_bookmark(cx);
+                    } else {
+                        self.connect_or_disconnect(cx);
+                    }
+                    return;
+                }
+                "b" => {
+                    self.cycle_bookmark();
+                    return;
+                }
+                "shift-b" => {
+                    self.save_bookmark();
                     return;
                 }
                 _ => {}
@@ -1351,28 +1477,348 @@ impl Shell {
 
     fn bookmark_key(&mut self, key: &str) {
         let len = self.sites.len();
-        if len == 0 {
-            return;
-        }
         let vim = self.gui.vim_keys;
         match key {
-            "up" | "k" if key != "k" || vim => {
+            "up" | "k" if len > 0 && (key != "k" || vim) => {
                 self.bookmark_index = self.bookmark_index.saturating_sub(1);
             }
-            "down" | "j" if key != "j" || vim => {
+            "down" | "j" if len > 0 && (key != "j" || vim) => {
                 self.bookmark_index = (self.bookmark_index + 1).min(len - 1);
             }
             "enter" => self.fill_from_bookmark(),
+            "e" => self.load_bookmark_into_form("bookmark-edit"),
+            "d" => self.ask_delete_bookmark(),
+            "shift-d" => self.set_default_bookmark(),
+            "home" if len > 0 => self.bookmark_index = 0,
+            "end" if len > 0 => self.bookmark_index = len - 1,
+            "pageup" | "page-up" if len > 0 => {
+                self.bookmark_index = self.bookmark_index.saturating_sub(LOCAL_PAGE);
+            }
+            "pagedown" | "page-down" if len > 0 => {
+                self.bookmark_index = (self.bookmark_index + LOCAL_PAGE).min(len - 1);
+            }
             _ => {}
         }
     }
 
     fn fill_from_bookmark(&mut self) {
+        self.load_bookmark_into_form("bookmark-load");
+    }
+
+    fn load_bookmark_into_form(&mut self, context: &str) {
         let Some(site) = self.sites.get(self.bookmark_index).cloned() else {
             return;
         };
+        let site = self.hydrate_password(site, context);
+        let host = site.host.clone();
         self.apply_form(&site);
-        self.push_toast(format!("Bookmark {}", site.host));
+        self.status = "Loaded bookmark into quick connect".to_string();
+        self.push_toast(format!("Bookmark {host}"));
+    }
+
+    fn hydrate_password(&mut self, mut info: ConnectionInfo, context: &str) -> ConnectionInfo {
+        if info.password.is_some() {
+            return info;
+        }
+        match self
+            .vault
+            .load(&info.name, &info.username, &info.host, info.port)
+        {
+            Ok(Some(secret)) => info.password = Some(secret),
+            Ok(None) => {
+                self.status = format!(
+                    "No keyring password found ({context}) for {}@{}:{}",
+                    info.username, info.host, info.port
+                );
+            }
+            Err(err) => {
+                let message = session::redact(
+                    &format!(
+                        "Keyring load failed ({context}) for {}@{}:{}: {err}",
+                        info.username, info.host, info.port
+                    ),
+                    None,
+                );
+                self.status = message.clone();
+                self.push_toast(message);
+            }
+        }
+        info
+    }
+
+    fn save_bookmark(&mut self) {
+        let mut info = self.form_connection();
+        if info.name.is_empty()
+            || info.host.is_empty()
+            || info.username.is_empty()
+            || info.port == 0
+        {
+            let message = "Cannot save bookmark: host/user/port required".to_string();
+            self.status = message.clone();
+            self.push_toast(message);
+            return;
+        }
+        let secret_status = if let Some(password) = info.password.clone() {
+            if let Err(err) =
+                self.vault
+                    .save(&info.name, &info.username, &info.host, info.port, &password)
+            {
+                let message =
+                    session::redact(&format!("Save secret failed: {err}"), Some(&password));
+                self.status = message.clone();
+                self.push_toast(message);
+                return;
+            }
+            let key =
+                SecretStore::primary_key_for(&info.name, &info.username, &info.host, info.port);
+            match self
+                .vault
+                .load(&info.name, &info.username, &info.host, info.port)
+            {
+                Ok(Some(_)) => format!("Password saved to keyring (verified key: {key})"),
+                Ok(None) => {
+                    let message = format!(
+                        "Password save reported success, but verification lookup returned no entry (key: {key})"
+                    );
+                    self.push_toast(message.clone());
+                    message
+                }
+                Err(err) => {
+                    let message = session::redact(
+                        &format!("Password save verification failed for key {key}: {err}"),
+                        Some(&password),
+                    );
+                    self.push_toast(message.clone());
+                    message
+                }
+            }
+        } else {
+            "No password provided (bookmark saved without keyring secret)".to_string()
+        };
+        info.password = None;
+        let mut config = self.site_config();
+        let (index, updated) = crate::bookmarks::upsert(&mut config, info);
+        let verb = if updated {
+            "Updated bookmark"
+        } else {
+            "Saved bookmark"
+        };
+        let _ = self.store_sites(
+            config,
+            index,
+            format!("{verb} | {secret_status}"),
+            "Save bookmark failed",
+        );
+    }
+
+    fn cycle_bookmark(&mut self) {
+        if self.sites.is_empty() {
+            self.status = "No bookmarks saved".to_string();
+            return;
+        }
+        self.bookmark_index = (self.bookmark_index + 1) % self.sites.len();
+        let site = &self.sites[self.bookmark_index];
+        self.status = format!("Bookmark: {} ({})", site.name, site.host);
+    }
+
+    fn connect_bookmark(&mut self, cx: &mut Context<Self>) {
+        let Some(mut info) = self.sites.get(self.bookmark_index).cloned() else {
+            self.status = "No bookmarks saved".to_string();
+            return;
+        };
+        if info.password.is_none()
+            && let Ok(Some(secret)) =
+                self.vault
+                    .load(&info.name, &info.username, &info.host, info.port)
+        {
+            info.password = Some(secret);
+        }
+        self.start_connect_info(info, cx);
+    }
+
+    fn ask_delete_bookmark(&mut self) {
+        if self.sites.is_empty() {
+            self.status = "No bookmarks to delete".to_string();
+            return;
+        }
+        let Some(site) = self.sites.get(self.bookmark_index) else {
+            return;
+        };
+        self.confirm_delete = Some(site.name.clone());
+    }
+
+    fn delete_confirmed_bookmark(&mut self) {
+        let Some(name) = self.confirm_delete.take() else {
+            return;
+        };
+        let mut config = self.site_config();
+        let Some(removed) = crate::bookmarks::remove_named(&mut config, &name) else {
+            self.status = format!("Bookmark not found: {name}");
+            return;
+        };
+        let _ = self.vault.delete(
+            &removed.name,
+            &removed.username,
+            &removed.host,
+            removed.port,
+        );
+        let message = format!("Deleted bookmark: {}", removed.name);
+        let _ = self.store_sites(config, 0, message, "Delete bookmark failed");
+    }
+
+    fn set_default_bookmark(&mut self) {
+        if self.sites.is_empty() {
+            self.status = "No bookmarks to set as default".to_string();
+            return;
+        }
+        let mut config = self.site_config();
+        if !crate::bookmarks::make_default(&mut config, self.bookmark_index) {
+            self.status = "Invalid bookmark selection".to_string();
+            return;
+        }
+        let _ = self.store_sites(
+            config,
+            0,
+            "Default bookmark updated".to_string(),
+            "Set default failed",
+        );
+    }
+
+    fn report_keyring(&mut self) {
+        match self.vault.health() {
+            Ok(()) => {
+                self.status = "Keyring backend detected: password persistence enabled".to_string();
+            }
+            Err(err) => {
+                let message = format!(
+                    "Keyring backend unavailable. Password persistence disabled. Details: {err}"
+                );
+                self.status = message.clone();
+                self.push_toast(message);
+            }
+        }
+    }
+
+    fn open_key_picker(&mut self) {
+        let cwd = crate::keys::start_dir(self.home.as_deref(), &self.private_key.value);
+        self.load_key_picker(cwd, None);
+    }
+
+    fn load_key_picker(&mut self, cwd: PathBuf, prefer: Option<String>) {
+        let prefer = prefer.or_else(|| crate::keys::prefer_name(&self.private_key.value, &cwd));
+        let entries = crate::keys::list_dir(&cwd);
+        let index = prefer
+            .as_ref()
+            .and_then(|name| entries.iter().position(|entry| entry.name == *name))
+            .unwrap_or(0);
+        self.key_picker = Some(KeyPicker {
+            cwd,
+            entries,
+            index,
+        });
+    }
+
+    fn key_picker_key(&mut self, key: &str) {
+        let vim = self.gui.vim_keys;
+        match key {
+            "escape" => self.key_picker = None,
+            "enter" => self.activate_key_picker(),
+            "backspace" | "h" if key != "h" || vim => self.key_picker_parent(),
+            "l" if vim => self.activate_key_picker(),
+            "up" | "k" if key != "k" || vim => self.move_key_picker(-1),
+            "down" | "j" if key != "j" || vim => self.move_key_picker(1),
+            "home" => self.set_key_picker_index(0),
+            "end" => {
+                let last = self
+                    .key_picker
+                    .as_ref()
+                    .map(|picker| picker.entries.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.set_key_picker_index(last);
+            }
+            "pageup" | "page-up" => self.move_key_picker(-(LOCAL_PAGE as i32)),
+            "pagedown" | "page-down" => self.move_key_picker(LOCAL_PAGE as i32),
+            _ => {}
+        }
+    }
+
+    fn move_key_picker(&mut self, delta: i32) {
+        let Some(picker) = self.key_picker.as_mut() else {
+            return;
+        };
+        let last = picker.entries.len().saturating_sub(1);
+        let next = if delta < 0 {
+            picker.index.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            picker.index.saturating_add(delta as usize).min(last)
+        };
+        picker.index = next.min(last);
+    }
+
+    fn set_key_picker_index(&mut self, index: usize) {
+        let Some(picker) = self.key_picker.as_mut() else {
+            return;
+        };
+        let last = picker.entries.len().saturating_sub(1);
+        picker.index = index.min(last);
+    }
+
+    fn key_picker_parent(&mut self) {
+        let Some(picker) = self.key_picker.as_ref() else {
+            return;
+        };
+        let Some(parent) = picker.cwd.parent().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        if parent.as_os_str().is_empty() || parent == picker.cwd {
+            return;
+        }
+        let came_from = picker
+            .cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        self.load_key_picker(parent, came_from);
+    }
+
+    fn activate_key_picker(&mut self) {
+        let Some((cwd, entry)) = self.key_picker.as_ref().and_then(|picker| {
+            picker
+                .entries
+                .get(picker.index)
+                .cloned()
+                .map(|entry| (picker.cwd.clone(), entry))
+        }) else {
+            return;
+        };
+        if entry.is_dir() {
+            if entry.name == "." {
+                self.load_key_picker(cwd, Some(".".to_string()));
+                return;
+            }
+            if entry.name == ".." {
+                self.key_picker_parent();
+                return;
+            }
+            self.load_key_picker(PathBuf::from(&entry.path), None);
+            return;
+        }
+        let warn = is_public_key_name(&entry.name);
+        self.private_key = TextField::from_str(&entry.path);
+        self.key_picker = None;
+        if warn {
+            self.push_toast(
+                "This looks like a public key; SSH needs the private key (no .pub).".to_string(),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub fn stored_secret(&self) -> Option<String> {
+        let info = self.form_connection();
+        self.vault
+            .load(&info.name, &info.username, &info.host, info.port)
+            .ok()
+            .flatten()
     }
 
     fn form_key(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -2076,6 +2522,12 @@ impl Shell {
                 entry.name, entry.size
             ));
         }
+        lines.push(format!(
+            "default:{}",
+            self.default_site
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
         if self.sites.is_empty() {
             lines.push("No bookmarks".to_string());
         }
@@ -2085,14 +2537,30 @@ impl Shell {
             } else {
                 " "
             };
+            let star = if self.default_site == Some(index) {
+                "*"
+            } else {
+                " "
+            };
             lines.push(format!(
-                "{mark} {}  {}@{}:{}  {}",
+                "bookmark-row:{mark}{star} {}  {}@{}:{}  {}",
                 site.name,
                 site.username,
                 site.host,
                 site.port,
                 protocol_label(site.protocol)
             ));
+        }
+        if let Some(name) = &self.confirm_delete {
+            lines.push(format!("confirm:delete {name}"));
+        }
+        if let Some(picker) = &self.key_picker {
+            lines.push(format!("key-picker:{}", picker.cwd.display()));
+            for (index, entry) in picker.entries.iter().enumerate() {
+                let mark = if index == picker.index { ">" } else { " " };
+                let kind = if entry.is_dir() { "dir" } else { "file" };
+                lines.push(format!("key-row:{mark} {}  {kind}", entry.name));
+            }
         }
         lines.push(format!("name:{}", self.name.value));
         lines.push(format!("host:{}", self.host.value));
@@ -2328,6 +2796,23 @@ impl Render for Shell {
             .map(|notice| notice.message.clone())
             .collect();
         let confirm = self.confirm_quit;
+        let delete_name = self.confirm_delete.clone();
+        let picker_rows = self.key_picker.as_ref().map(|picker| {
+            let rows = picker
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let kind = if entry.is_dir() { "dir" } else { "file" };
+                    KeyRow {
+                        index,
+                        label: format!("{}  {kind}", entry.name),
+                        selected: index == picker.index,
+                    }
+                })
+                .collect::<Vec<_>>();
+            (picker.cwd.display().to_string(), rows)
+        });
         let settings = self.settings_open.then(|| self.settings_view());
         let local_scroll = self.local_scroll.clone();
         let pane = self.pane;
@@ -2518,6 +3003,12 @@ impl Render for Shell {
         }
         if let Some(message) = host_key {
             column = column.child(host_key_box(cx, &message, paint));
+        }
+        if let Some(name) = delete_name {
+            column = column.child(delete_box(cx, &name, paint));
+        }
+        if let Some((cwd, rows)) = picker_rows {
+            column = column.child(key_picker_box(cx, &cwd, &rows, paint));
         }
         if let Some(settings) = settings {
             column = column.child(settings_panel(
@@ -2996,6 +3487,86 @@ fn host_key_box(cx: &mut Context<Shell>, message: &str, paint: Paint) -> gpui::S
         .child("y accepts and appends known_hosts. n or Esc rejects.")
 }
 
+fn delete_box(cx: &mut Context<Shell>, name: &str, paint: Paint) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("confirm-delete")
+        .absolute()
+        .top(px(80.0))
+        .left(px(80.0))
+        .w(px(420.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .bg(paint.raised)
+        .border_1()
+        .border_color(paint.border)
+        .occlude()
+        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+        }))
+        .child(format!("Delete bookmark '{name}'?"))
+        .child("y deletes it. n or Esc cancels.")
+}
+
+fn key_picker_box(
+    cx: &mut Context<Shell>,
+    cwd: &str,
+    rows: &[KeyRow],
+    paint: Paint,
+) -> gpui::Stateful<gpui::Div> {
+    let mut list = div().flex().flex_col();
+    for row in rows {
+        let index = row.index;
+        list = list.child(
+            div()
+                .id(("key-row", index))
+                .h(px(22.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .when(row.selected, |row| row.bg(paint.selected))
+                .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
+                    let activate = shell
+                        .key_picker
+                        .as_ref()
+                        .is_some_and(|picker| picker.index == index);
+                    shell.set_key_picker_index(index);
+                    if activate {
+                        shell.activate_key_picker();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .child(row.label.clone()),
+        );
+    }
+    div()
+        .id("key-picker")
+        .absolute()
+        .top(px(64.0))
+        .left(px(64.0))
+        .w(px(480.0))
+        .max_h(px(360.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .bg(paint.raised)
+        .border_1()
+        .border_color(paint.border)
+        .occlude()
+        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+        }))
+        .child(format!("Private key  {cwd}"))
+        .child(list)
+        .child("Enter selects a file. Esc closes.")
+}
+
 fn confirm_box(cx: &mut Context<Shell>, paint: Paint) -> gpui::Stateful<gpui::Div> {
     div()
         .id("confirm-quit")
@@ -3465,6 +4036,13 @@ fn filter_char(key: &str) -> Option<char> {
 fn typed_char(key: &str) -> Option<char> {
     if key == "space" {
         return Some(' ');
+    }
+    if let Some(rest) = key.strip_prefix("shift-")
+        && rest.len() == 1
+        && let Some(ch) = rest.chars().next()
+        && ch.is_ascii_alphabetic()
+    {
+        return Some(ch.to_ascii_uppercase());
     }
     let mut chars = key.chars();
     let ch = chars.next()?;

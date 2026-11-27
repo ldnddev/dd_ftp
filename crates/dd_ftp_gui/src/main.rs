@@ -1,11 +1,14 @@
 //! dd_ftp window. The terminal app stays `dd_ftp`; this binary is `dd_ftp-gui`.
 
+mod bookmarks;
+mod keys;
 mod listing;
 mod prefs;
 mod session;
 mod shell;
 mod shortcuts;
 mod theme_load;
+mod vault;
 mod windows;
 
 #[cfg(test)]
@@ -56,6 +59,9 @@ Open the dd_ftp window (1280×800).
   Ctrl+Q      Quit (confirms while a transfer is active)
   1 / 2       Local pane / remote pane
   c           Connect, or disconnect when a session is open
+  B           Save the form as a bookmark
+  Ctrl+K      Check the keyring
+  Ctrl+P      Choose a private key while the key field is focused
   Up/Down     Move the focused listing
   Enter       Open a directory
 

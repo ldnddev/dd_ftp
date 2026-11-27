@@ -13,7 +13,7 @@ The terminal in [`README.md`](README.md) is the feature contract. `dd_ftp-gui` i
 
 ## What the window does today
 
-Shell from 1.8.4. Local browser and session from 1.9.0:
+Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks and secrets are unreleased:
 
 - 1280×800 window, app id `dev.ldnddev.dd_ftp`, title `dd_ftp`.
 - Settings: Themes, Window, Session, Help. F1 and F2 open Themes and the second press reverts the palette. F3 opens Session. Esc steps back from the color editor, then closes.
@@ -22,7 +22,7 @@ Shell from 1.8.4. Local browser and session from 1.9.0:
 - Local pane (phase 1): `.` and `..`, sort, filter, hide-dotfiles, marks, page keys, refresh, parent, and a path bar.
 - Remote pane (phase 2): list, enter, parent, and refresh on a worker thread. `SftpSession` or `UnifiedFtpSession` lists `initial_path`. A refused SFTP host key leaves the pane disconnected. An accepted key is appended to `known_hosts`. Plain FTP status says unencrypted.
 - Quick connect fields match the terminal: name, host, port, username, password, private key, protocol, path. `DD_FTP_*` fills them and removes `DD_FTP_PASS`.
-- Bookmarks are shown without the password. Enter on a bookmark fills the form. The password stays masked.
+- Bookmarks (phase 3): load and save `sites.toml` with no password. The live vault is `SecretStore`. Enter and `e` fill the form with a masked password. `c` on a bookmark connects. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and `default_site`. Ctrl+P opens the key picker. Ctrl+K reports keyring health.
 - Ctrl+Q confirms while `transfer_active` is set. Nothing sets that flag from a real transfer.
 - The Help sheet has seven rows. It is not `KEYMAP`.
 
@@ -69,6 +69,8 @@ Match Protocols and the connect half of Connection and bookmarks. Still no trans
 Done when a headless test connects, lists, changes directory, and disconnects, and a refused host key leaves the pane disconnected.
 
 ### Phase 3 — Bookmarks and secrets
+
+**Done.** Headless coverage is `bookmark_round_trip_keeps_the_password_out_of_sites_toml`, `bookmark_sets_the_default_connects_and_edits`, `key_picker_selects_a_private_key_and_ctrl_k_reports_the_vault`, and `auto_connect_uses_the_default_site`, plus the vault, bookmark, and key-picker unit tests. A live window was not driven. The live path calls `SecretStore` and `SiteManager::save_path` (production uses `SiteManager::default_config_path`). Tests use a memory vault and a temp `sites.toml`.
 
 Match the rest of Connection and bookmarks.
 

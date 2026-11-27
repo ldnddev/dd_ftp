@@ -1,4 +1,5 @@
-use std::{fs, path::PathBuf};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use dd_ftp_core::ConnectionInfo;
@@ -27,36 +28,42 @@ impl SiteManager {
     }
 
     pub fn load_or_default() -> Result<SiteConfig> {
-        let path = Self::default_config_path();
+        Self::load_path(&Self::default_config_path())
+    }
+
+    /// Load `path`, or an empty config when the file is missing. Passwords in
+    /// the file are dropped. `sites.toml` is not a secret store.
+    pub fn load_path(path: &Path) -> Result<SiteConfig> {
         if !path.exists() {
             return Ok(SiteConfig::default());
         }
 
-        let content = fs::read_to_string(&path)?;
+        let content = fs::read_to_string(path)?;
         let mut cfg = Self::load_from_toml(&content)?;
-
-        // Strip plaintext passwords from config load path.
         for site in cfg.sites.iter_mut() {
             site.password = None;
         }
-
         Ok(cfg)
     }
 
     pub fn save_to_default_path(config: &SiteConfig) -> Result<()> {
-        let path = Self::default_config_path();
+        Self::save_path(&Self::default_config_path(), config)
+    }
+
+    /// Write `config` to `path` as mode `0600`. The password field is cleared
+    /// before the write.
+    pub fn save_path(path: &Path, config: &SiteConfig) -> Result<()> {
         if let Some(parent) = path.parent() {
             crate::persist::ensure_private_dir(parent)?;
         }
 
-        // Never persist plaintext passwords in sites.toml.
         let mut sanitized = config.clone();
         for site in sanitized.sites.iter_mut() {
             site.password = None;
         }
 
         let content = Self::save_to_toml(&sanitized)?;
-        crate::persist::write_private(&path, &content)?;
+        crate::persist::write_private(path, &content)?;
         Ok(())
     }
 }

@@ -24,6 +24,9 @@ fn opts(dir: &Path) -> ShellOptions {
         quit_runtime: false,
         apply_env: false,
         backend: crate::session::Backend::Fake(crate::session::FakeTree::empty()),
+        sites_path: dir.join("sites.toml"),
+        default_site: None,
+        vault: crate::vault::Vault::memory(),
     }
 }
 
@@ -689,6 +692,202 @@ fn launch_env_fills_the_form_and_drops_the_password(cx: &mut TestAppContext) {
             None => crate::session::remove_test_var(&key),
         }
     }
+}
+
+#[gpui::test]
+fn bookmark_round_trip_keeps_the_password_out_of_sites_toml(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let shell = mount(cx, opts(dir.path()));
+    shell.update(cx, |shell, cx| {
+        shell.fill_quick_connect(&secret_form(Protocol::Sftp));
+        shell.handle_key("shift-b", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("Saved bookmark"), "{text}");
+        assert!(text.contains("pass:************"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert_eq!(shell.stored_secret().as_deref(), Some("s3cret-value"));
+        let _ = cx;
+    });
+    let file = std::fs::read_to_string(dir.path().join("sites.toml")).unwrap();
+    assert!(file.contains("files.example"), "{file}");
+    assert!(!file.contains("s3cret-value"), "{file}");
+    assert!(!file.contains("password"), "{file}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("sites.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let mut vault = crate::vault::Vault::memory();
+    vault
+        .save("Desk", "ada", "files.example", 22, "s3cret-value")
+        .unwrap();
+    let shell = mount(
+        cx,
+        ShellOptions {
+            load_user_sites: true,
+            vault,
+            ..opts(dir.path())
+        },
+    );
+    shell.update(cx, |shell, cx| {
+        let text = shell.visible_text();
+        assert!(text.contains("host:files.example"), "{text}");
+        assert!(text.contains("pass:************"), "{text}");
+        assert!(text.contains("bookmark-row:"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+        shell.handle_key("tab", cx);
+        shell.handle_key("tab", cx);
+        shell.handle_key("d", cx);
+        assert!(shell.visible_text().contains("confirm:delete Desk"));
+        shell.handle_key("n", cx);
+        assert!(!shell.visible_text().contains("confirm:delete"));
+        shell.handle_key("d", cx);
+        shell.handle_key("y", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("Deleted bookmark: Desk"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(shell.stored_secret().is_none());
+        let _ = cx;
+    });
+    let file = std::fs::read_to_string(dir.path().join("sites.toml")).unwrap();
+    assert!(!file.contains("files.example"), "{file}");
+    assert!(!file.contains("s3cret-value"), "{file}");
+}
+
+#[gpui::test]
+fn bookmark_sets_the_default_connects_and_edits(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = opts(dir.path());
+    options.backend =
+        crate::session::Backend::Fake(sample_tree(crate::session::FakeHostKey::Trusted));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        shell.fill_quick_connect(&secret_form(Protocol::Sftp));
+        shell.handle_key("shift-b", cx);
+        shell.fill_quick_connect(&ConnectionInfo {
+            name: "Other".into(),
+            host: "other.example".into(),
+            username: "ada".into(),
+            password: Some("s3cret-value".into()),
+            ..secret_form(Protocol::Sftp)
+        });
+        shell.handle_key("shift-b", cx);
+        shell.handle_key("tab", cx);
+        shell.handle_key("tab", cx);
+        shell.handle_key("shift-d", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("Default bookmark updated"), "{text}");
+        assert!(text.contains("default:0"), "{text}");
+        assert!(text.contains("bookmark-row:>* Other"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        shell.handle_key("c", cx);
+        let text = until(shell, "Connected via SFTP");
+        assert!(text.contains("readme.txt"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        shell.handle_key("e", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("host:other.example"), "{text}");
+        assert!(text.contains("pass:************"), "{text}");
+        assert!(text.contains("toast:Bookmark other.example"), "{text}");
+        let file = std::fs::read_to_string(dir.path().join("sites.toml")).unwrap();
+        assert!(!file.contains("s3cret-value"), "{file}");
+        assert!(!file.contains("password"), "{file}");
+        let _ = cx;
+    });
+}
+
+#[gpui::test]
+fn key_picker_selects_a_private_key_and_ctrl_k_reports_the_vault(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("id_ed25519"), b"priv").unwrap();
+    std::fs::write(home.join("id_ed25519.pub"), b"pub").unwrap();
+    let shell = mount(cx, opts(dir.path()));
+    shell.update(cx, |shell, cx| {
+        for _ in 0..8 {
+            shell.handle_key("tab", cx);
+        }
+        shell.handle_key("ctrl-p", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("key-picker:"), "{text}");
+        assert!(text.contains("key-row:"), "{text}");
+        assert!(text.contains("id_ed25519"), "{text}");
+        shell.handle_key("down", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("enter", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("key:"), "{text}");
+        assert!(text.contains("id_ed25519"), "{text}");
+        assert!(!text.contains("key-picker:"), "{text}");
+        shell.handle_key("ctrl-p", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("enter", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("public key"), "{text}");
+        assert!(text.contains(".pub"), "{text}");
+        shell.handle_key("ctrl-k", cx);
+        let text = shell.visible_text();
+        assert!(
+            text.contains("Keyring backend detected: password persistence enabled"),
+            "{text}"
+        );
+        let _ = cx;
+    });
+}
+
+#[gpui::test]
+fn auto_connect_uses_the_default_site(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let site = ConnectionInfo {
+        password: None,
+        ..secret_form(Protocol::Sftp)
+    };
+    dd_ftp_storage::SiteManager::save_path(
+        &dir.path().join("sites.toml"),
+        &dd_ftp_storage::SiteConfig {
+            sites: vec![site],
+            default_site: Some(0),
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dd_ftp.toml"),
+        "auto_connect_default = true\n",
+    )
+    .unwrap();
+    let mut vault = crate::vault::Vault::memory();
+    vault
+        .save("Desk", "ada", "files.example", 22, "s3cret-value")
+        .unwrap();
+    let shell = mount(
+        cx,
+        ShellOptions {
+            load_app_config: true,
+            load_user_sites: true,
+            vault,
+            backend: crate::session::Backend::Fake(sample_tree(
+                crate::session::FakeHostKey::Trusted,
+            )),
+            ..opts(dir.path())
+        },
+    );
+    shell.update(cx, |shell, _cx| {
+        let text = until(shell, "Connected via SFTP");
+        assert!(text.contains("readme.txt"), "{text}");
+        assert!(text.contains("pass:************"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        let file = std::fs::read_to_string(dir.path().join("sites.toml")).unwrap();
+        assert!(!file.contains("s3cret-value"), "{file}");
+        assert!(!file.contains("password"), "{file}");
+    });
 }
 
 #[test]

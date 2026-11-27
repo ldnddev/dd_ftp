@@ -4,12 +4,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
 use dd_ftp_app::{
     OverwritePolicy, PendingFile, SettingsField, SortKey, TextField, WORKER_MAX_CONCURRENCY_LIMIT,
     clamp_worker_concurrency, cmp_file_entries, is_dot_or_dotdot, is_public_key_name,
+    parse_octal_mode,
 };
 use dd_ftp_core::{
     ConnectionInfo, EntryKind, FileEntry, Protocol, TransferDirection, TransferJob, TransferStatus,
@@ -17,7 +18,8 @@ use dd_ftp_core::{
 use dd_ftp_transfer::TransferQueue;
 use uuid::Uuid;
 
-use crate::session::{self, Backend, SessionClient, SessionEvent};
+use crate::files;
+use crate::session::{self, Backend, FsOp, SessionClient, SessionEvent};
 use crate::vault::Vault;
 use crate::xfer::{self, DrainStep, XferEvent};
 use dd_ftp_storage::{AppConfig, SecretStore, SiteConfig, SiteManager};
@@ -130,6 +132,7 @@ enum InFlight {
     Connect,
     List { path: String },
     HostKey,
+    Fs,
 }
 
 struct ConnectView {
@@ -144,6 +147,45 @@ struct HostKeyPrompt {
     fingerprint: String,
     changed: bool,
     reply: Sender<bool>,
+}
+
+enum FilePrompt {
+    Create { folder: bool, field: TextField },
+    Rename { field: TextField },
+    Chmod { path: String, field: TextField },
+    Delete { jobs: VecDeque<PendingDelete> },
+    EditLarge,
+    EditBinary,
+    EditConflict,
+    EditSave { field: TextField },
+}
+
+#[derive(Clone)]
+struct PendingDelete {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+struct EditSession {
+    local_path: PathBuf,
+    remote_path: String,
+    remote_modified: Option<chrono::DateTime<chrono::Utc>>,
+    fingerprint: Option<files::FileFingerprint>,
+    size_bytes: Option<u64>,
+    phase: EditPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditPhase {
+    Ready,
+    Uploading,
+}
+
+enum EditorDone {
+    Ok,
+    Exit(i32),
+    Failed(String),
 }
 
 struct KeyPicker {
@@ -176,6 +218,7 @@ pub struct ShellOptions {
     pub sites_path: PathBuf,
     pub default_site: Option<usize>,
     pub vault: Vault,
+    pub edit_cache: Option<PathBuf>,
 }
 
 impl ShellOptions {
@@ -210,6 +253,7 @@ impl ShellOptions {
             sites_path: SiteManager::default_config_path(),
             default_site: None,
             vault: Vault::live(),
+            edit_cache: None,
         }
     }
 }
@@ -309,6 +353,18 @@ pub struct Shell {
     queue_index: usize,
     remote_marks: HashSet<String>,
     active_connection: Option<ConnectionInfo>,
+    fs_ok: Option<String>,
+    fs_delete: bool,
+    pending_delete: VecDeque<PendingDelete>,
+    file_prompt: Option<FilePrompt>,
+    edit: Option<EditSession>,
+    edit_relist: bool,
+    editor_rx: Option<Receiver<EditorDone>>,
+    edit_cache: Option<PathBuf>,
+    list_ok_status: Option<String>,
+    prefer_remote: Option<String>,
+    #[cfg(test)]
+    test_editor: Option<files::TestEditor>,
 }
 
 impl Shell {
@@ -413,6 +469,18 @@ impl Shell {
             queue_index: 0,
             remote_marks: HashSet::new(),
             active_connection: None,
+            fs_ok: None,
+            fs_delete: false,
+            pending_delete: VecDeque::new(),
+            file_prompt: None,
+            edit: None,
+            edit_relist: false,
+            editor_rx: None,
+            edit_cache: opts.edit_cache.clone(),
+            list_ok_status: None,
+            prefer_remote: None,
+            #[cfg(test)]
+            test_editor: None,
         };
         shell.follow_stamp = ldnddev_theme::follow_stamp(&shell.omarchy);
         if opts.load_app_config {
@@ -656,6 +724,7 @@ impl Shell {
         while let Ok(event) = self.engine.try_recv() {
             self.apply_xfer(event);
         }
+        self.poll_editor();
     }
 
     fn header_busy(&self) -> bool {
@@ -847,6 +916,15 @@ impl Shell {
         self.busy_reason = None;
         self.connect_view = None;
         self.active_connection = None;
+        self.file_prompt = None;
+        self.pending_delete.clear();
+        self.fs_delete = false;
+        self.fs_ok = None;
+        self.list_ok_status = None;
+        self.prefer_remote = None;
+        self.edit_relist = false;
+        self.edit = None;
+        self.editor_rx = None;
         self.stop_transfers();
         self.engine.drop_pool();
         self.status = "Disconnected".to_string();
@@ -960,9 +1038,18 @@ impl Shell {
                 self.inflight = None;
                 self.busy_reason = None;
                 let select = self.remote_reselect;
+                let edit_relist = self.edit_relist;
+                self.edit_relist = false;
                 self.remote_cwd = path;
-                self.finish_remote_list(entries, select);
-                self.status = format!("Remote cwd: {}", self.remote_cwd);
+                self.finish_remote_list(entries.clone(), select);
+                if edit_relist {
+                    self.list_ok_status = None;
+                    self.finish_edit_after_relist(&entries);
+                } else if let Some(status) = self.list_ok_status.take() {
+                    self.status = status;
+                } else {
+                    self.status = format!("Remote cwd: {}", self.remote_cwd);
+                }
             }
             SessionEvent::Failed {
                 generation,
@@ -975,12 +1062,54 @@ impl Shell {
                 self.inflight = None;
                 self.busy_reason = None;
                 self.host_key = None;
+                self.list_ok_status = None;
                 if !self.connected {
                     self.remote_entries.clear();
                     self.remote_index = 0;
                     self.active_connection = None;
                 }
-                self.status = message;
+                self.status = message.clone();
+                if self.edit_relist {
+                    self.edit_relist = false;
+                    let detail = message
+                        .strip_prefix("Remote list failed: ")
+                        .unwrap_or(message.as_str());
+                    let notice = format!("Could not recheck remote before upload: {detail}");
+                    self.status = notice.clone();
+                    self.push_toast(notice);
+                    if let Some(path) = self.edit.as_ref().map(|edit| edit.remote_path.clone()) {
+                        self.enqueue_edit_upload(path);
+                    }
+                }
+            }
+            SessionEvent::Operated { generation, error } => {
+                if generation != self.generation || !matches!(self.inflight, Some(InFlight::Fs)) {
+                    return;
+                }
+                self.inflight = None;
+                self.busy_reason = None;
+                if let Some(err) = error {
+                    let message = session::redact(&err, self.password_secret());
+                    self.pending_delete.clear();
+                    self.fs_delete = false;
+                    self.status = message.clone();
+                    self.push_toast(message);
+                    return;
+                }
+                if let Some(status) = self.fs_ok.take() {
+                    self.status = status.clone();
+                    self.list_ok_status = Some(status);
+                }
+                if self.fs_delete {
+                    self.pending_delete.pop_front();
+                    if let Some(next) = self.pending_delete.front().cloned() {
+                        self.list_ok_status = None;
+                        self.dispatch_delete(next);
+                        return;
+                    }
+                    self.fs_delete = false;
+                }
+                self.relist_remote();
             }
             SessionEvent::Disconnected { generation } => {
                 if generation != self.generation {
@@ -999,9 +1128,11 @@ impl Shell {
             .map(|entry| entry.name.clone());
         self.remote_entries = entries;
         let rows = self.remote_rows();
+        let prefer = self.prefer_remote.take();
         self.remote_index = match select {
             Reselect::Reset => 0,
-            Reselect::KeepName => previous
+            Reselect::KeepName => prefer
+                .or(previous)
                 .as_ref()
                 .and_then(|name| rows.iter().position(|row| &row.name == name))
                 .unwrap_or(0),
@@ -1028,6 +1159,7 @@ impl Shell {
         if !self.connected || self.inflight.is_some() {
             return;
         }
+        self.list_ok_status = None;
         self.remote_reselect = select;
         self.busy_reason = Some("busy: listing remote".to_string());
         self.inflight = Some(InFlight::List { path: path.clone() });
@@ -1643,20 +1775,37 @@ impl Shell {
                     self.status = message.clone();
                     self.push_toast(message);
                 } else {
-                    let name = match job.direction {
-                        TransferDirection::Upload => "upload",
-                        TransferDirection::Download => "download",
-                    };
+                    let edit_download =
+                        job.edit_after && job.direction == TransferDirection::Download;
+                    let edit_upload = self.edit.as_ref().is_some_and(|edit| {
+                        edit.phase == EditPhase::Uploading
+                            && job.direction == TransferDirection::Upload
+                            && edit.local_path == Path::new(&job.local_path)
+                    });
+                    let direction = job.direction;
+                    let local_path = job.local_path.clone();
                     self.queue.mark_completed(job);
-                    self.status = format!("{name} complete");
-                    self.push_toast(self.status.clone());
-                    self.reload_local(Reselect::KeepName);
-                    if self.connected && self.inflight.is_none() {
-                        let path = self.remote_cwd.clone();
-                        self.remote_reselect = Reselect::KeepName;
-                        self.busy_reason = Some("busy: listing remote".to_string());
-                        self.inflight = Some(InFlight::List { path: path.clone() });
-                        self.session.list(self.generation, path);
+                    if edit_download {
+                        self.after_edit_download();
+                    } else {
+                        if edit_upload {
+                            let _ = std::fs::remove_file(local_path);
+                            self.edit = None;
+                        }
+                        let name = match direction {
+                            TransferDirection::Upload => "upload",
+                            TransferDirection::Download => "download",
+                        };
+                        self.status = format!("{name} complete");
+                        self.push_toast(self.status.clone());
+                        self.reload_local(Reselect::KeepName);
+                        if self.connected && self.inflight.is_none() {
+                            let path = self.remote_cwd.clone();
+                            self.remote_reselect = Reselect::KeepName;
+                            self.busy_reason = Some("busy: listing remote".to_string());
+                            self.inflight = Some(InFlight::List { path: path.clone() });
+                            self.session.list(self.generation, path);
+                        }
                     }
                 }
                 self.pump_workers();
@@ -1971,6 +2120,10 @@ impl Shell {
             }
             return;
         }
+        if self.file_prompt.is_some() {
+            self.file_prompt_key(&key);
+            return;
+        }
         if key == "ctrl-q" {
             self.request_quit();
             return;
@@ -2037,6 +2190,14 @@ impl Shell {
     }
 
     fn paste_text(&mut self, text: &str) {
+        if let Some(field) = self.file_prompt_field_mut() {
+            for ch in text.chars() {
+                if ch != '\n' && ch != '\r' {
+                    field.insert_char(ch);
+                }
+            }
+            return;
+        }
         if self.editing_hex() {
             if let Some(editor) = self.editor.as_mut() {
                 for ch in text.chars() {
@@ -2153,6 +2314,11 @@ impl Shell {
             "backspace" | "h" if key != "h" || vim => self.parent_remote(cx),
             "r" => self.refresh_remote(cx),
             "space" => self.toggle_remote_mark(),
+            "n" | "ctrl-n" => self.open_create(),
+            "e" | "ctrl-alt-e" => self.open_item_rename(),
+            "shift-e" => self.start_remote_edit(),
+            "p" => self.open_chmod(),
+            "delete" | "ctrl-delete" => self.open_remote_delete(),
             _ => {}
         }
     }
@@ -3462,6 +3628,9 @@ impl Shell {
         if let Some(field) = &self.rename_field {
             lines.push(format!("rename:{}", field.value));
         }
+        if let Some(line) = self.file_prompt_line() {
+            lines.push(line);
+        }
         if let Some(picker) = &self.key_picker {
             lines.push(format!("key-picker:{}", picker.cwd.display()));
             for (index, entry) in picker.entries.iter().enumerate() {
@@ -3587,6 +3756,744 @@ impl Shell {
 
     fn row_h(&self) -> f32 {
         self.gui.density.row()
+    }
+
+    fn remote_busy(&self) -> bool {
+        self.inflight.is_some() || self.awaiting_list || !self.pending_scan.is_empty()
+    }
+
+    fn open_create(&mut self) {
+        if self.pane != Pane::Remote {
+            return;
+        }
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return;
+        }
+        if self.remote_busy() {
+            self.status = self
+                .busy_reason
+                .clone()
+                .unwrap_or_else(|| "busy: file op".to_string());
+            return;
+        }
+        self.file_prompt = Some(FilePrompt::Create {
+            folder: false,
+            field: TextField::from_str(""),
+        });
+    }
+
+    fn open_item_rename(&mut self) {
+        if self.pane != Pane::Remote {
+            return;
+        }
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return;
+        }
+        let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
+            self.status = "No item selected".to_string();
+            return;
+        };
+        if is_dot_or_dotdot(&entry.name) {
+            self.status = "No item selected".to_string();
+            return;
+        }
+        self.file_prompt = Some(FilePrompt::Rename {
+            field: TextField::from_str(&entry.name),
+        });
+    }
+
+    fn open_chmod(&mut self) {
+        if self.pane != Pane::Remote {
+            return;
+        }
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return;
+        }
+        let protocol = self
+            .active_connection
+            .as_ref()
+            .map(|info| info.protocol)
+            .unwrap_or(self.protocol);
+        if protocol != Protocol::Sftp {
+            self.status = "chmod is SFTP-only".to_string();
+            self.push_toast(self.status.clone());
+            return;
+        }
+        let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
+            self.status = "Nothing selected".to_string();
+            return;
+        };
+        if is_dot_or_dotdot(&entry.name) {
+            return;
+        }
+        self.file_prompt = Some(FilePrompt::Chmod {
+            path: entry.path,
+            field: TextField::from_str(entry.permissions.as_deref().unwrap_or("")),
+        });
+    }
+
+    fn open_remote_delete(&mut self) {
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return;
+        }
+        let mut jobs = VecDeque::new();
+        for entry in self.remote_action_entries() {
+            if is_dot_or_dotdot(&entry.name) {
+                continue;
+            }
+            match session::join_remote(&self.remote_cwd, &entry.name) {
+                Ok(path) => {
+                    let is_dir = entry.is_dir();
+                    jobs.push_back(PendingDelete {
+                        name: entry.name,
+                        path,
+                        is_dir,
+                    });
+                }
+                Err(_) => {
+                    self.status = "path escapes directory".to_string();
+                    self.push_toast(self.status.clone());
+                }
+            }
+        }
+        if jobs.is_empty() {
+            self.status = "Nothing selected to delete".to_string();
+            return;
+        }
+        self.file_prompt = Some(FilePrompt::Delete { jobs });
+    }
+
+    fn file_prompt_key(&mut self, key: &str) {
+        if key == "ctrl-c" {
+            return;
+        }
+        let Some(prompt) = self.file_prompt.take() else {
+            return;
+        };
+        match prompt {
+            FilePrompt::Create {
+                mut folder,
+                mut field,
+            } => {
+                if key == "tab" {
+                    folder = !folder;
+                    self.file_prompt = Some(FilePrompt::Create { folder, field });
+                    return;
+                }
+                if key == "escape" {
+                    return;
+                }
+                if key == "enter" {
+                    self.confirm_create(folder, field.value);
+                    return;
+                }
+                type_prompt_field(key, &mut field);
+                self.file_prompt = Some(FilePrompt::Create { folder, field });
+            }
+            FilePrompt::Rename { mut field } => {
+                if key == "escape" {
+                    return;
+                }
+                if key == "enter" {
+                    self.confirm_rename(field.value);
+                    return;
+                }
+                type_prompt_field(key, &mut field);
+                self.file_prompt = Some(FilePrompt::Rename { field });
+            }
+            FilePrompt::Chmod { path, mut field } => {
+                if key == "escape" {
+                    return;
+                }
+                if key == "enter" {
+                    self.confirm_chmod(path, field.value);
+                    return;
+                }
+                type_prompt_field(key, &mut field);
+                self.file_prompt = Some(FilePrompt::Chmod { path, field });
+            }
+            FilePrompt::Delete { jobs } => match key {
+                "y" | "enter" => {
+                    self.pending_delete = jobs;
+                    self.fs_delete = true;
+                    if let Some(next) = self.pending_delete.front().cloned() {
+                        self.dispatch_delete(next);
+                    }
+                }
+                "n" | "escape" => {}
+                _ => self.file_prompt = Some(FilePrompt::Delete { jobs }),
+            },
+            FilePrompt::EditLarge => match key {
+                "y" | "enter" => self.begin_edit_download(),
+                "n" | "escape" => self.cancel_edit(false),
+                _ => self.file_prompt = Some(FilePrompt::EditLarge),
+            },
+            FilePrompt::EditBinary => match key {
+                "y" | "enter" => self.launch_editor(),
+                "n" | "escape" => self.cancel_edit(true),
+                _ => self.file_prompt = Some(FilePrompt::EditBinary),
+            },
+            FilePrompt::EditConflict => match key {
+                "o" | "y" => {
+                    if let Some(path) = self.edit.as_ref().map(|edit| edit.remote_path.clone()) {
+                        self.enqueue_edit_upload(path);
+                    }
+                }
+                "s" | "n" | "escape" => self.cancel_edit(true),
+                "r" => {
+                    self.file_prompt = Some(FilePrompt::EditSave {
+                        field: TextField::from_str(""),
+                    });
+                }
+                _ => self.file_prompt = Some(FilePrompt::EditConflict),
+            },
+            FilePrompt::EditSave { mut field } => {
+                if key == "escape" {
+                    self.cancel_edit(true);
+                    return;
+                }
+                if key == "enter" {
+                    self.confirm_edit_save(field.value);
+                    return;
+                }
+                type_prompt_field(key, &mut field);
+                self.file_prompt = Some(FilePrompt::EditSave { field });
+            }
+        }
+    }
+
+    fn confirm_create(&mut self, folder: bool, name: String) {
+        let path = match session::join_remote(&self.remote_cwd, &name) {
+            Ok(path) => path,
+            Err(_) => {
+                self.note_error("path escapes directory");
+                return;
+            }
+        };
+        let ok = if folder {
+            format!("Created folder: {name}")
+        } else {
+            format!("Created file: {name}")
+        };
+        let op = if folder {
+            FsOp::CreateDir { path }
+        } else {
+            FsOp::CreateFile { path }
+        };
+        if !self.begin_fs(op, ok, "Creating…") {
+            self.file_prompt = Some(FilePrompt::Create {
+                folder,
+                field: TextField::from_str(&name),
+            });
+        }
+    }
+
+    fn confirm_rename(&mut self, name: String) {
+        let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
+            self.status = "No item selected".to_string();
+            return;
+        };
+        if is_dot_or_dotdot(&entry.name) {
+            self.status = "No item selected".to_string();
+            return;
+        }
+        let from = match session::join_remote(&self.remote_cwd, &entry.name) {
+            Ok(path) => path,
+            Err(_) => {
+                self.note_error("path escapes directory");
+                return;
+            }
+        };
+        let to = match session::join_remote(&self.remote_cwd, &name) {
+            Ok(path) => path,
+            Err(_) => {
+                self.note_error("path escapes directory");
+                return;
+            }
+        };
+        self.prefer_remote = Some(name.clone());
+        if !self.begin_fs(
+            FsOp::Rename { from, to },
+            format!("Renamed to: {name}"),
+            "Renaming…",
+        ) {
+            self.prefer_remote = None;
+            self.file_prompt = Some(FilePrompt::Rename {
+                field: TextField::from_str(&name),
+            });
+        }
+    }
+
+    fn confirm_chmod(&mut self, path: String, value: String) {
+        match parse_octal_mode(&value) {
+            Ok(mode) => {
+                if !self.begin_fs(
+                    FsOp::Chmod {
+                        path: path.clone(),
+                        mode,
+                    },
+                    format!("chmod {:o} {path}", mode),
+                    "Setting permissions…",
+                ) {
+                    self.file_prompt = Some(FilePrompt::Chmod {
+                        path,
+                        field: TextField::from_str(&value),
+                    });
+                }
+            }
+            Err(err) => self.note_error(&err),
+        }
+    }
+
+    fn confirm_edit_save(&mut self, name: String) {
+        let path = match session::join_remote(&self.remote_cwd, &name) {
+            Ok(path) => path,
+            Err(_) => {
+                self.cancel_edit(true);
+                self.note_error("path escapes directory");
+                return;
+            }
+        };
+        if let Some(edit) = self.edit.as_mut() {
+            edit.remote_path = path.clone();
+        }
+        self.enqueue_edit_upload(path);
+    }
+
+    fn begin_fs(&mut self, op: FsOp, ok: String, working: &str) -> bool {
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return false;
+        }
+        if self.remote_busy() {
+            self.status = self
+                .busy_reason
+                .clone()
+                .unwrap_or_else(|| "busy: file op".to_string());
+            return false;
+        }
+        self.fs_ok = Some(ok);
+        self.fs_delete = false;
+        self.busy_reason = Some("busy: file op".to_string());
+        self.inflight = Some(InFlight::Fs);
+        self.status = working.to_string();
+        self.session.operate(self.generation, op);
+        true
+    }
+
+    fn dispatch_delete(&mut self, job: PendingDelete) {
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            self.pending_delete.clear();
+            self.fs_delete = false;
+            return;
+        }
+        let op = if job.is_dir {
+            FsOp::RemoveDir {
+                path: job.path.clone(),
+            }
+        } else {
+            FsOp::RemoveFile {
+                path: job.path.clone(),
+            }
+        };
+        self.fs_ok = Some(format!("Deleted: {}", job.path));
+        self.fs_delete = true;
+        self.busy_reason = Some("busy: file op".to_string());
+        self.inflight = Some(InFlight::Fs);
+        self.status = "Deleting…".to_string();
+        self.session.operate(self.generation, op);
+    }
+
+    fn relist_remote(&mut self) {
+        if !self.connected || self.inflight.is_some() {
+            return;
+        }
+        let path = self.remote_cwd.clone();
+        self.remote_reselect = Reselect::KeepName;
+        self.busy_reason = Some("busy: listing remote".to_string());
+        self.inflight = Some(InFlight::List { path: path.clone() });
+        self.session.list(self.generation, path);
+    }
+
+    fn note_error(&mut self, message: &str) {
+        self.status = message.to_string();
+        self.push_toast(self.status.clone());
+    }
+
+    fn start_remote_edit(&mut self) {
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return;
+        }
+        if self.pane != Pane::Remote {
+            self.status = "Focus a remote file to edit".to_string();
+            return;
+        }
+        if self.edit.is_some() {
+            self.status = "Already preparing an edit".to_string();
+            return;
+        }
+        if self.remote_busy() {
+            self.status = self
+                .busy_reason
+                .clone()
+                .unwrap_or_else(|| "busy: file op".to_string());
+            return;
+        }
+        if self.remote_marks.len() > 1 {
+            self.status = "Edit one file at a time".to_string();
+            return;
+        }
+        let Some(entry) = self.remote_action_entries().into_iter().next() else {
+            self.status = "Nothing selected to edit".to_string();
+            return;
+        };
+        if entry.is_dir() || is_dot_or_dotdot(&entry.name) {
+            self.status = "Cannot edit a directory".to_string();
+            return;
+        }
+        let remote_path = match session::join_remote(&self.remote_cwd, &entry.name) {
+            Ok(path) => path,
+            Err(_) => {
+                self.note_error("path escapes directory");
+                return;
+            }
+        };
+        let host = self
+            .active_connection
+            .as_ref()
+            .map(|info| info.host.clone())
+            .unwrap_or_else(|| "remote".to_string());
+        let port = self
+            .active_connection
+            .as_ref()
+            .map(|info| info.port)
+            .unwrap_or(0);
+        let root = files::cache_root(self.edit_cache.as_deref());
+        let local_path = files::edit_cache_path(&root, &host, port, &remote_path);
+        self.edit = Some(EditSession {
+            local_path,
+            remote_path,
+            remote_modified: entry.modified,
+            fingerprint: None,
+            size_bytes: Some(entry.size),
+            phase: EditPhase::Ready,
+        });
+        if entry.size > files::EDIT_SIZE_WARN_BYTES {
+            self.file_prompt = Some(FilePrompt::EditLarge);
+            return;
+        }
+        self.begin_edit_download();
+    }
+
+    fn begin_edit_download(&mut self) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let local = edit.local_path.clone();
+        let remote = edit.remote_path.clone();
+        let size = edit.size_bytes;
+        let root = files::cache_root(self.edit_cache.as_deref());
+        if let Err(err) = files::prepare_edit_cache(&local, &root) {
+            self.edit = None;
+            self.note_error(&format!("Cannot create edit cache: {err}"));
+            return;
+        }
+        let mut job = TransferJob::new(
+            local.to_string_lossy().to_string(),
+            remote.clone(),
+            TransferDirection::Download,
+        );
+        job.size_bytes = size;
+        job.edit_after = true;
+        self.cancel_all = false;
+        self.queue.enqueue(job);
+        self.pump_workers();
+        self.status = format!("Downloading for edit: {remote}");
+    }
+
+    fn after_edit_download(&mut self) {
+        let Some(local) = self.edit.as_ref().map(|edit| edit.local_path.clone()) else {
+            return;
+        };
+        if let Err(err) = files::tighten_edit_file(&local) {
+            self.note_error(&format!("Cannot protect edit cache: {err}"));
+            return;
+        }
+        if let Some(edit) = self.edit.as_mut() {
+            edit.fingerprint = files::fingerprint(&local);
+            edit.phase = EditPhase::Ready;
+        }
+        if files::looks_binary(&local) {
+            self.file_prompt = Some(FilePrompt::EditBinary);
+            return;
+        }
+        self.launch_editor();
+    }
+
+    fn launch_editor(&mut self) {
+        #[cfg(test)]
+        if let Some(editor) = self.test_editor.take() {
+            self.apply_test_editor(editor);
+            self.finish_editor();
+            return;
+        }
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let path = edit.local_path.clone();
+        let spec = files::resolve_editor(&self.session_editor.value);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.editor_rx = Some(rx);
+        std::thread::spawn(move || {
+            let done = match files::run_editor(&path, &spec) {
+                Ok(status) if status.success() => EditorDone::Ok,
+                Ok(status) => EditorDone::Exit(status.code().unwrap_or(-1)),
+                Err(err) => EditorDone::Failed(err.to_string()),
+            };
+            let _ = tx.send(done);
+        });
+    }
+
+    fn poll_editor(&mut self) {
+        let ready = self.editor_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if ready.is_some() {
+            self.editor_rx = None;
+        }
+        let Some(done) = ready else {
+            return;
+        };
+        match done {
+            EditorDone::Ok => self.finish_editor(),
+            EditorDone::Exit(code) => {
+                self.keep_edit_error(&format!("Editor exited {code}"));
+            }
+            EditorDone::Failed(err) => {
+                self.keep_edit_error(&format!("Could not run editor ({err})"));
+            }
+        }
+    }
+
+    fn keep_edit_error(&mut self, reason: &str) {
+        let Some(path) = self.edit.as_ref().map(|edit| edit.local_path.clone()) else {
+            return;
+        };
+        let message = format!("{reason}; file kept at {}", path.display());
+        self.status = message.clone();
+        self.push_toast(message);
+    }
+
+    fn finish_editor(&mut self) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let local = edit.local_path.clone();
+        let remote = edit.remote_path.clone();
+        let changed = files::fingerprint(&local) != edit.fingerprint;
+        if !changed {
+            self.status = "No edits to upload".to_string();
+            self.cancel_edit(false);
+            return;
+        }
+        if !self.connected {
+            let message = format!("Disconnected; edit kept at {}", local.display());
+            self.status = message.clone();
+            self.push_toast(message);
+            return;
+        }
+        if self.inflight.is_some() {
+            self.enqueue_edit_upload(remote);
+            return;
+        }
+        let parent = session::parent_remote(&remote);
+        self.list_ok_status = None;
+        self.edit_relist = true;
+        self.remote_reselect = Reselect::KeepName;
+        self.busy_reason = Some("busy: listing remote".to_string());
+        self.inflight = Some(InFlight::List {
+            path: parent.clone(),
+        });
+        self.session.list(self.generation, parent);
+    }
+
+    fn finish_edit_after_relist(&mut self, entries: &[FileEntry]) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let name = edit
+            .remote_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(edit.remote_path.as_str())
+            .to_string();
+        let remote_now = entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.modified);
+        let previous = edit.remote_modified;
+        let remote_path = edit.remote_path.clone();
+        if xfer::dest_is_newer(previous, remote_now) {
+            self.file_prompt = Some(FilePrompt::EditConflict);
+            return;
+        }
+        self.enqueue_edit_upload(remote_path);
+    }
+
+    fn enqueue_edit_upload(&mut self, remote_path: String) {
+        let Some(edit) = self.edit.as_mut() else {
+            return;
+        };
+        edit.phase = EditPhase::Uploading;
+        let local = edit.local_path.clone();
+        let size = std::fs::metadata(&local).ok().map(|meta| meta.len());
+        let mut job = TransferJob::new(
+            local.to_string_lossy().to_string(),
+            remote_path,
+            TransferDirection::Upload,
+        );
+        job.size_bytes = size;
+        self.cancel_all = false;
+        self.queue.enqueue(job);
+        self.pump_workers();
+        self.status = "Uploading edit...".to_string();
+    }
+
+    fn cancel_edit(&mut self, keep: bool) {
+        self.editor_rx = None;
+        self.edit_relist = false;
+        let Some(edit) = self.edit.take() else {
+            return;
+        };
+        if keep {
+            self.status = format!("Edit cancelled; file kept at {}", edit.local_path.display());
+        } else {
+            let _ = std::fs::remove_file(&edit.local_path);
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_test_editor(&mut self, editor: files::TestEditor) {
+        let Some(local) = self.edit.as_ref().map(|edit| edit.local_path.clone()) else {
+            return;
+        };
+        let remote = self.edit.as_ref().map(|edit| edit.remote_path.clone());
+        match editor {
+            files::TestEditor::Keep => {}
+            files::TestEditor::Write(bytes) => {
+                let _ = std::fs::write(&local, bytes);
+            }
+            files::TestEditor::WriteNewer(bytes) => {
+                let _ = std::fs::write(&local, bytes);
+                if let Some(remote) = remote
+                    && let Some(tree) = self.engine.fake()
+                {
+                    let when = chrono::Utc::now() + chrono::Duration::seconds(60);
+                    tree.lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .touch_modified(&remote, when);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_editor(&mut self, editor: files::TestEditor) {
+        self.test_editor = Some(editor);
+    }
+
+    fn file_prompt_field_mut(&mut self) -> Option<&mut TextField> {
+        match self.file_prompt.as_mut()? {
+            FilePrompt::Create { field, .. }
+            | FilePrompt::Rename { field }
+            | FilePrompt::Chmod { field, .. }
+            | FilePrompt::EditSave { field } => Some(field),
+            FilePrompt::Delete { .. }
+            | FilePrompt::EditLarge
+            | FilePrompt::EditBinary
+            | FilePrompt::EditConflict => None,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn file_prompt_line(&self) -> Option<String> {
+        let prompt = self.file_prompt.as_ref()?;
+        Some(match prompt {
+            FilePrompt::Create { folder, field } => {
+                if *folder {
+                    format!("create:folder:{}", field.value)
+                } else {
+                    format!("create:file:{}", field.value)
+                }
+            }
+            FilePrompt::Rename { field } => format!("fs-rename:{}", field.value),
+            FilePrompt::Chmod { field, .. } => format!("chmod:{}", field.value),
+            FilePrompt::Delete { jobs } => {
+                let names: Vec<String> = jobs.iter().map(|job| job.name.clone()).collect();
+                let dirs = jobs.iter().filter(|job| job.is_dir).count();
+                format!("confirm:remove {}", files::delete_summary(&names, dirs))
+            }
+            FilePrompt::EditLarge => {
+                let size = self
+                    .edit
+                    .as_ref()
+                    .and_then(|edit| edit.size_bytes)
+                    .unwrap_or(0);
+                format!("edit-large:{}", files::large_edit_label(size))
+            }
+            FilePrompt::EditBinary => "edit-binary".to_string(),
+            FilePrompt::EditConflict => "edit-conflict".to_string(),
+            FilePrompt::EditSave { field } => format!("edit-save:{}", field.value),
+        })
+    }
+
+    fn file_prompt_message(&self) -> Option<String> {
+        let prompt = self.file_prompt.as_ref()?;
+        Some(match prompt {
+            FilePrompt::Create { folder, field } => {
+                let kind = if *folder { "folder" } else { "file" };
+                format!(
+                    "Create {kind}: {}. Tab switches file and folder. Enter creates it. Esc cancels.",
+                    field.value
+                )
+            }
+            FilePrompt::Rename { field } => format!(
+                "Rename to {}. Enter renames it. Esc cancels.",
+                field.value
+            ),
+            FilePrompt::Chmod { path, field } => {
+                format!("chmod {path} mode {}. Enter applies it. Esc cancels.", field.value)
+            }
+            FilePrompt::Delete { jobs } => {
+                let names: Vec<String> = jobs.iter().map(|job| job.name.clone()).collect();
+                let dirs = jobs.iter().filter(|job| job.is_dir).count();
+                format!(
+                    "Delete '{}'? (y/n)",
+                    files::delete_summary(&names, dirs)
+                )
+            }
+            FilePrompt::EditLarge => {
+                let size = self.edit.as_ref().and_then(|edit| edit.size_bytes).unwrap_or(0);
+                format!(
+                    "File is {}. Download and edit anyway? (y/n)",
+                    files::large_edit_label(size)
+                )
+            }
+            FilePrompt::EditBinary => {
+                "This file looks binary. Open it in $EDITOR anyway? (y/n)".to_string()
+            }
+            FilePrompt::EditConflict => {
+                "The remote file changed while you were editing. o overwrite, s skip, r save as, Esc cancel.".to_string()
+            }
+            FilePrompt::EditSave { field } => format!(
+                "Save edit as {}. Enter uploads it. Esc keeps the local copy.",
+                field.value
+            ),
+        })
     }
 }
 
@@ -3744,6 +4651,7 @@ impl Render for Shell {
             )
         });
         let rename_label = self.rename_field.as_ref().map(|field| field.value.clone());
+        let file_prompt = self.file_prompt_message();
         let picker_rows = self.key_picker.as_ref().map(|picker| {
             let rows = picker
                 .entries
@@ -3959,6 +4867,9 @@ impl Render for Shell {
         }
         if let Some(name) = rename_label {
             column = column.child(rename_box(cx, &name, paint));
+        }
+        if let Some(message) = file_prompt {
+            column = column.child(file_prompt_box(cx, &message, paint));
         }
         if let Some((cwd, rows)) = picker_rows {
             column = column.child(key_picker_box(cx, &cwd, &rows, paint));
@@ -4490,6 +5401,43 @@ fn queue_strip(
                 .child(title.to_string()),
         )
         .child(list)
+}
+
+fn type_prompt_field(key: &str, field: &mut TextField) {
+    match key {
+        "backspace" => field.backspace(),
+        "delete" => field.delete(),
+        _ => {
+            if let Some(ch) = typed_char(key) {
+                field.insert_char(ch);
+            }
+        }
+    }
+}
+
+fn file_prompt_box(
+    cx: &mut Context<Shell>,
+    message: &str,
+    paint: Paint,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("file-prompt")
+        .absolute()
+        .top(px(80.0))
+        .left(px(80.0))
+        .w(px(560.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .bg(paint.raised)
+        .border_1()
+        .border_color(paint.border)
+        .occlude()
+        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+        }))
+        .child(message.to_string())
 }
 
 fn overwrite_box(

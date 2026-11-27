@@ -1,6 +1,7 @@
 //! dd_ftp window. The terminal app stays `dd_ftp`; this binary is `dd_ftp-gui`.
 
 mod bookmarks;
+mod files;
 mod keys;
 mod listing;
 mod prefs;
@@ -66,6 +67,10 @@ Open the dd_ftp window (1280×800).
   Ctrl+K      Check the keyring
   Ctrl+P      Choose a private key while the key field is focused
   Ctrl+C      Cancel in-flight transfers
+  n           Create a remote file or folder
+  e / E       Rename a remote item, or edit a remote file
+  Delete      Delete the remote selection after confirm
+  p           SFTP chmod on the remote pane
   Up/Down     Move the focused listing
   Enter       Open a directory, or queue a file
 

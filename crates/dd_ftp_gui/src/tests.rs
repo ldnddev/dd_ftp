@@ -27,6 +27,7 @@ fn opts(dir: &Path) -> ShellOptions {
         sites_path: dir.join("sites.toml"),
         default_site: None,
         vault: crate::vault::Vault::memory(),
+        edit_cache: None,
     }
 }
 
@@ -493,6 +494,21 @@ fn until(shell: &mut Shell, needle: &str) -> String {
         shell.poll_jobs();
         last = shell.visible_text();
         if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    last
+}
+
+/// Wait until `needle` is showing and the remote worker is idle. A success
+/// line can appear before the follow-up listing finishes.
+fn until_settled(shell: &mut Shell, needle: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..50 {
+        shell.poll_jobs();
+        last = shell.visible_text();
+        if last.contains(needle) && !last.contains("busy:") {
             return last;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1026,6 +1042,302 @@ fn move_uploads_then_deletes_the_local_file(cx: &mut TestAppContext) {
         );
         assert!(!dir.path().join("payload.txt").exists(), "{text}");
         assert!(!text.contains("s3cret-value"), "{text}");
+    });
+}
+
+fn type_text(shell: &mut Shell, cx: &mut gpui::Context<Shell>, text: &str) {
+    for ch in text.chars() {
+        shell.handle_key(&ch.to_string(), cx);
+    }
+}
+
+fn backspaces(shell: &mut Shell, cx: &mut gpui::Context<Shell>, count: usize) {
+    for _ in 0..count {
+        shell.handle_key("backspace", cx);
+    }
+}
+
+fn focus_first_remote_file(shell: &mut Shell, cx: &mut gpui::Context<Shell>) {
+    shell.handle_key("2", cx);
+    shell.handle_key("down", cx);
+    shell.handle_key("down", cx);
+}
+
+fn edit_options(
+    dir: &std::path::Path,
+    tree: std::sync::Arc<std::sync::Mutex<crate::session::FakeTree>>,
+) -> ShellOptions {
+    ShellOptions {
+        backend: crate::session::Backend::Fake(tree),
+        edit_cache: Some(dir.join("edit-cache")),
+        ..opts(dir)
+    }
+}
+
+fn cache_file(dir: &std::path::Path, remote: &str) -> std::path::PathBuf {
+    crate::files::edit_cache_path(
+        dir.join("edit-cache").as_path(),
+        "files.example",
+        22,
+        remote,
+    )
+}
+
+#[cfg(unix)]
+fn mode_bits(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[gpui::test]
+fn remote_create_rename_chmod_and_delete_round_trip(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("2", cx);
+        shell.handle_key("n", cx);
+        type_text(shell, cx, "notes.txt");
+        shell.handle_key("enter", cx);
+        let text = until_settled(shell, "Created file: notes.txt");
+        assert!(text.contains("remote-row:"), "{text}");
+        assert_eq!(tree.lock().unwrap().bytes("/notes.txt"), Some(&[][..]));
+        focus_first_remote_file(shell, cx);
+        shell.handle_key("e", cx);
+        backspaces(shell, cx, "notes.txt".len());
+        type_text(shell, cx, "renamed.txt");
+        shell.handle_key("enter", cx);
+        let text = until_settled(shell, "Renamed to: renamed.txt");
+        assert!(text.contains("renamed.txt"), "{text}");
+        shell.handle_key("p", cx);
+        type_text(shell, cx, "755");
+        shell.handle_key("enter", cx);
+        let text = until_settled(shell, "chmod 755");
+        assert_eq!(
+            tree.lock()
+                .unwrap()
+                .dir_entry("/", "renamed.txt")
+                .and_then(|entry| entry.permissions.clone())
+                .as_deref(),
+            Some("755"),
+            "{text}"
+        );
+        shell.handle_key("delete", cx);
+        let text = until(shell, "confirm:remove 'renamed.txt'");
+        assert!(!text.contains("password"), "{text}");
+        shell.handle_key("y", cx);
+        let text = until_settled(shell, "Deleted:");
+        assert_eq!(tree.lock().unwrap().bytes("/renamed.txt"), None, "{text}");
+        shell.handle_key("n", cx);
+        shell.handle_key("tab", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("create:folder:"), "{text}");
+        type_text(shell, cx, "docs");
+        shell.handle_key("enter", cx);
+        let text = until_settled(shell, "Created folder: docs");
+        assert!(
+            tree.lock()
+                .unwrap()
+                .dir_entry("/", "docs")
+                .is_some_and(|entry| entry.is_dir()),
+            "{text}"
+        );
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn path_escape_rejects_a_remote_name(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("2", cx);
+        shell.handle_key("n", cx);
+        type_text(shell, cx, "../passwd");
+        shell.handle_key("enter", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("status:path escapes directory"), "{text}");
+        assert!(tree.lock().unwrap().files.is_empty(), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn ftp_chmod_is_refused(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    tree.lock().unwrap().put_bytes("/notes.txt", b"hi");
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        let mut info = secret_form(Protocol::Ftp);
+        info.port = 21;
+        shell.fill_quick_connect(&info);
+        shell.handle_key("c", cx);
+        let text = until(shell, "Connected via FTP");
+        assert!(text.contains("unencrypted"), "{text}");
+        focus_first_remote_file(shell, cx);
+        shell.handle_key("p", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("chmod is SFTP-only"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn remote_edit_uploads_when_the_file_changes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    tree.lock().unwrap().put_bytes("/notes.txt", b"hello");
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        focus_first_remote_file(shell, cx);
+        shell.set_test_editor(crate::files::TestEditor::Write(b"hello!".to_vec()));
+        shell.handle_key("shift-e", cx);
+        let text = until(shell, "upload complete");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/notes.txt"),
+            Some(b"hello!".as_slice()),
+            "{text}"
+        );
+        let cache = cache_file(dir.path(), "/notes.txt");
+        assert!(!cache.exists(), "{text}");
+        #[cfg(unix)]
+        assert_eq!(mode_bits(&dir.path().join("edit-cache")), 0o700, "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn remote_edit_skips_upload_when_unchanged(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    tree.lock().unwrap().put_bytes("/notes.txt", b"hello");
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        focus_first_remote_file(shell, cx);
+        shell.set_test_editor(crate::files::TestEditor::Keep);
+        shell.handle_key("shift-e", cx);
+        let text = until(shell, "No edits to upload");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/notes.txt"),
+            Some(b"hello".as_slice()),
+            "{text}"
+        );
+        assert!(!cache_file(dir.path(), "/notes.txt").exists(), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn remote_edit_asks_before_a_binary_file(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    tree.lock().unwrap().put_bytes("/notes.txt", b"a\0b");
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        focus_first_remote_file(shell, cx);
+        shell.handle_key("shift-e", cx);
+        let text = until(shell, "edit-binary");
+        assert!(text.contains("edit-binary"), "{text}");
+        shell.handle_key("n", cx);
+        let text = shell.visible_text();
+        assert!(!text.contains("edit-binary"), "{text}");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/notes.txt"),
+            Some(b"a\0b".as_slice()),
+            "{text}"
+        );
+        let cache = cache_file(dir.path(), "/notes.txt");
+        assert!(cache.exists(), "{text}");
+        #[cfg(unix)]
+        assert_eq!(mode_bits(&cache), 0o600, "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn remote_edit_asks_before_a_large_file(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    {
+        let mut guard = tree.lock().unwrap();
+        guard.put_bytes("/notes.txt", b"small");
+        guard
+            .dirs
+            .get_mut("/")
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry.name == "notes.txt")
+            .unwrap()
+            .size = 11 * 1024 * 1024;
+    }
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        focus_first_remote_file(shell, cx);
+        shell.handle_key("shift-e", cx);
+        let text = until(shell, "edit-large:");
+        assert!(text.contains("edit-large:11.0 MB"), "{text}");
+        shell.handle_key("n", cx);
+        assert!(!cache_file(dir.path(), "/notes.txt").exists());
+        assert_eq!(
+            tree.lock().unwrap().bytes("/notes.txt"),
+            Some(b"small".as_slice())
+        );
+        shell.set_test_editor(crate::files::TestEditor::Write(b"edited".to_vec()));
+        shell.handle_key("shift-e", cx);
+        let text = until(shell, "edit-large:");
+        assert!(text.contains("edit-large:11.0 MB"), "{text}");
+        shell.handle_key("y", cx);
+        let text = until(shell, "upload complete");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/notes.txt"),
+            Some(b"edited".as_slice()),
+            "{text}"
+        );
+        assert!(!cache_file(dir.path(), "/notes.txt").exists(), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn remote_edit_asks_when_the_remote_copy_is_newer(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    tree.lock().unwrap().put_bytes("/notes.txt", b"hello");
+    let shell = mount(cx, edit_options(dir.path(), std::sync::Arc::clone(&tree)));
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        focus_first_remote_file(shell, cx);
+        shell.set_test_editor(crate::files::TestEditor::WriteNewer(b"hello!".to_vec()));
+        shell.handle_key("shift-e", cx);
+        let text = until(shell, "edit-conflict");
+        assert!(text.contains("edit-conflict"), "{text}");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/notes.txt"),
+            Some(b"hello".as_slice()),
+            "{text}"
+        );
+        shell.handle_key("s", cx);
+        let text = shell.visible_text();
+        assert!(!text.contains("edit-conflict"), "{text}");
+        assert!(cache_file(dir.path(), "/notes.txt").exists(), "{text}");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/notes.txt"),
+            Some(b"hello".as_slice()),
+            "{text}"
+        );
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
     });
 }
 

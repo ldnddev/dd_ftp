@@ -91,10 +91,178 @@ impl FakeTree {
 
     pub fn remove_bytes(&mut self, path: &str) {
         self.files.remove(path);
+        self.detach(path);
+    }
+
+    pub fn create_empty(&mut self, path: &str) -> Result<()> {
         let parent = parent_remote(path);
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = base_name(path);
+        if name.is_empty() || !self.dirs.contains_key(&parent) || self.dirs.contains_key(path) {
+            anyhow::bail!("failed to create remote file: {path}");
+        }
+        self.files.insert(path.to_string(), Vec::new());
+        self.upsert_file(path, 0);
+        Ok(())
+    }
+
+    pub fn make_dir(&mut self, path: &str) -> Result<()> {
+        let parent = parent_remote(path);
+        let name = base_name(path);
+        if name.is_empty()
+            || path == "/"
+            || !self.dirs.contains_key(&parent)
+            || self.dirs.contains_key(path)
+            || self.files.contains_key(path)
+        {
+            anyhow::bail!("failed to create remote directory: {path}");
+        }
+        self.dirs.get_mut(&parent).unwrap().push(FileEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            kind: EntryKind::Directory,
+            size: 0,
+            modified: Some(Utc::now()),
+            permissions: Some("755".to_string()),
+        });
+        self.dirs.insert(path.to_string(), Vec::new());
+        Ok(())
+    }
+
+    pub fn rename_entry(&mut self, from: &str, to: &str) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let to_parent = parent_remote(to);
+        if !self.dirs.contains_key(&to_parent)
+            || self.files.contains_key(to)
+            || self.dirs.contains_key(to)
+        {
+            anyhow::bail!("rename failed: {to}");
+        }
+        if self.files.contains_key(from) {
+            let bytes = self.files.remove(from).unwrap_or_default();
+            self.detach(from);
+            self.put_bytes(to, &bytes);
+            return Ok(());
+        }
+        let Some(listing) = self.dirs.remove(from) else {
+            anyhow::bail!("rename failed: {from} is missing");
+        };
+        let prefix = format!("{from}/");
+        let dir_keys: Vec<String> = self
+            .dirs
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in dir_keys {
+            let value = self.dirs.remove(&key).unwrap_or_default();
+            let next = format!("{to}{}", &key[from.len()..]);
+            self.dirs.insert(next, value);
+        }
+        let file_keys: Vec<String> = self
+            .files
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in file_keys {
+            let value = self.files.remove(&key).unwrap_or_default();
+            let next = format!("{to}{}", &key[from.len()..]);
+            self.files.insert(next, value);
+        }
+        self.dirs.insert(to.to_string(), listing);
+        self.rewrite_paths(from, to);
+        self.detach(from);
+        let to_name = base_name(to);
+        self.dirs.get_mut(&to_parent).unwrap().push(FileEntry {
+            name: to_name,
+            path: to.to_string(),
+            kind: EntryKind::Directory,
+            size: 0,
+            modified: Some(Utc::now()),
+            permissions: Some("755".to_string()),
+        });
+        Ok(())
+    }
+
+    pub fn remove_dir(&mut self, path: &str) -> Result<()> {
+        let Some(children) = self.dirs.get(path) else {
+            anyhow::bail!("failed to remove remote directory: {path}");
+        };
+        if !children.is_empty() {
+            anyhow::bail!("Directory not empty");
+        }
+        self.dirs.remove(path);
+        self.detach(path);
+        Ok(())
+    }
+
+    pub fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
+        let parent = parent_remote(path);
+        let name = base_name(path);
+        let rows = self
+            .dirs
+            .get_mut(&parent)
+            .with_context(|| format!("failed to set permissions on {path}"))?;
+        let row = rows
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .with_context(|| format!("failed to set permissions on {path}"))?;
+        row.permissions = Some(format!("{:o}", mode & 0o7777));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn touch_modified(&mut self, path: &str, modified: chrono::DateTime<Utc>) {
+        let parent = parent_remote(path);
+        let name = base_name(path);
+        if let Some(rows) = self.dirs.get_mut(&parent)
+            && let Some(row) = rows.iter_mut().find(|entry| entry.name == name)
+        {
+            row.modified = Some(modified);
+        }
+    }
+
+    fn upsert_file(&mut self, path: &str, size: u64) {
+        let parent = parent_remote(path);
+        let name = base_name(path);
+        let rows = self.dirs.entry(parent).or_default();
+        if let Some(row) = rows.iter_mut().find(|entry| entry.name == name) {
+            row.kind = EntryKind::File;
+            row.size = size;
+            row.path = path.to_string();
+            row.modified = Some(Utc::now());
+        } else {
+            rows.push(FileEntry {
+                name,
+                path: path.to_string(),
+                kind: EntryKind::File,
+                size,
+                modified: Some(Utc::now()),
+                permissions: None,
+            });
+        }
+    }
+
+    fn detach(&mut self, path: &str) {
+        let parent = parent_remote(path);
+        let name = base_name(path);
         if let Some(rows) = self.dirs.get_mut(&parent) {
             rows.retain(|entry| entry.name != name);
+        }
+    }
+
+    fn rewrite_paths(&mut self, from: &str, to: &str) {
+        let prefix = format!("{from}/");
+        for rows in self.dirs.values_mut() {
+            for entry in rows {
+                if entry.path == from {
+                    entry.path = to.to_string();
+                } else if let Some(rest) = entry.path.strip_prefix(&prefix) {
+                    entry.path = format!("{to}/{rest}");
+                }
+            }
         }
     }
 
@@ -200,6 +368,16 @@ impl FakeState {
     }
 }
 
+#[derive(Debug)]
+pub enum FsOp {
+    CreateFile { path: String },
+    CreateDir { path: String },
+    Rename { from: String, to: String },
+    RemoveFile { path: String },
+    RemoveDir { path: String },
+    Chmod { path: String, mode: u32 },
+}
+
 enum Cmd {
     Connect {
         generation: u64,
@@ -209,6 +387,10 @@ enum Cmd {
     List {
         generation: u64,
         path: String,
+    },
+    Operate {
+        generation: u64,
+        op: FsOp,
     },
     Disconnect {
         generation: u64,
@@ -242,6 +424,10 @@ pub enum SessionEvent {
     Disconnected {
         generation: u64,
     },
+    Operated {
+        generation: u64,
+        error: Option<String>,
+    },
 }
 
 pub struct SessionClient {
@@ -274,6 +460,10 @@ impl SessionClient {
 
     pub fn disconnect(&self, generation: u64) {
         let _ = self.cmd_tx.send(Cmd::Disconnect { generation });
+    }
+
+    pub fn operate(&self, generation: u64, op: FsOp) {
+        let _ = self.cmd_tx.send(Cmd::Operate { generation, op });
     }
 
     pub fn try_recv(&self) -> Result<SessionEvent, TryRecvError> {
@@ -409,7 +599,68 @@ fn worker(backend: Backend, cmd_rx: Receiver<Cmd>, evt_tx: Sender<SessionEvent>)
                     break;
                 }
             }
+            Cmd::Operate { generation, op } => {
+                let result = if let Some(fake) = fake.as_mut() {
+                    fake_operate(fake, op)
+                } else if let Some(session) = live.as_mut() {
+                    let runtime = runtime.as_ref().expect("live runtime");
+                    runtime.block_on(live_operate(session, op))
+                } else {
+                    Err(anyhow!("not connected"))
+                };
+                let event = SessionEvent::Operated {
+                    generation,
+                    error: result.err().map(|err| err.to_string()),
+                };
+                if evt_tx.send(event).is_err() {
+                    break;
+                }
+            }
         }
+    }
+}
+
+fn fake_operate(fake: &mut FakeState, op: FsOp) -> Result<()> {
+    if !fake.connected {
+        anyhow::bail!("not connected");
+    }
+    let mut tree = fake.tree.lock().unwrap_or_else(|err| err.into_inner());
+    match op {
+        FsOp::CreateFile { path } => tree.create_empty(&path),
+        FsOp::CreateDir { path } => tree.make_dir(&path),
+        FsOp::Rename { from, to } => tree.rename_entry(&from, &to),
+        FsOp::RemoveFile { path } => {
+            if !tree.files.contains_key(&path) {
+                anyhow::bail!("failed to remove remote file: {path}");
+            }
+            tree.remove_bytes(&path);
+            Ok(())
+        }
+        FsOp::RemoveDir { path } => tree.remove_dir(&path),
+        FsOp::Chmod { path, mode } => tree.set_mode(&path, mode),
+    }
+}
+
+async fn live_operate(session: &mut LiveSession, op: FsOp) -> Result<()> {
+    match (session, op) {
+        (LiveSession::Sftp(session), FsOp::CreateFile { path }) => {
+            session.create_empty_file(&path).await
+        }
+        (LiveSession::Ftp(session), FsOp::CreateFile { path }) => {
+            session.create_empty_file(&path).await
+        }
+        (LiveSession::Sftp(session), FsOp::CreateDir { path }) => session.create_dir(&path).await,
+        (LiveSession::Ftp(session), FsOp::CreateDir { path }) => session.create_dir(&path).await,
+        (LiveSession::Sftp(session), FsOp::Rename { from, to }) => session.rename(&from, &to).await,
+        (LiveSession::Ftp(session), FsOp::Rename { from, to }) => session.rename(&from, &to).await,
+        (LiveSession::Sftp(session), FsOp::RemoveFile { path }) => session.remove_file(&path).await,
+        (LiveSession::Ftp(session), FsOp::RemoveFile { path }) => session.remove_file(&path).await,
+        (LiveSession::Sftp(session), FsOp::RemoveDir { path }) => session.remove_dir(&path).await,
+        (LiveSession::Ftp(session), FsOp::RemoveDir { path }) => session.remove_dir(&path).await,
+        (LiveSession::Sftp(session), FsOp::Chmod { path, mode }) => {
+            session.set_permissions(&path, mode).await
+        }
+        (LiveSession::Ftp(_session), FsOp::Chmod { .. }) => anyhow::bail!("chmod is SFTP-only"),
     }
 }
 
@@ -524,6 +775,10 @@ pub fn normalize_remote(path: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn base_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 pub fn parent_remote(path: &str) -> String {

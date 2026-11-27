@@ -24,6 +24,7 @@ Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks, secrets, and 
 - Quick connect fields match the terminal: name, host, port, username, password, private key, protocol, path. `DD_FTP_*` fills them and removes `DD_FTP_PASS`.
 - Bookmarks (phase 3): load and save `sites.toml` with no password. The live vault is `SecretStore`. Enter and `e` fill the form with a masked password. `c` on a bookmark connects. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and `default_site`. Ctrl+P opens the key picker. Ctrl+K reports keyring health.
 - Queue (phase 4): `u`, `d`, and Enter on a file transfer the marked set or the focused row. `M` moves, then deletes the source after success. Directories are walked with the terminal symlink rules. The queue pane shows pending, active, and failed jobs. Retry, cancel, clear pending, and Ctrl+C match the terminal. Workers default to 2 and clamp to 1–8. The overwrite prompt matches the terminal, including the newer-file keys.
+- Remote files (phase 5): `n` creates a file or folder, `e` renames, Delete confirms delete, and `p` chmods on SFTP. `E` edits through a private cache and uploads when the bytes change. A name that leaves the pane root is rejected.
 - Ctrl+Q confirms while a transfer is active, then cancels.
 - The Help sheet has seven rows. It is not `KEYMAP`.
 
@@ -96,6 +97,8 @@ Match Transfers.
 - Tests drive a local server or an in-process pipe and assert byte equality, cancel, and skip.
 
 ### Phase 5 — Remote file operations
+
+**Done.** Headless coverage is `remote_create_rename_chmod_and_delete_round_trip`, `path_escape_rejects_a_remote_name`, `ftp_chmod_is_refused`, `remote_edit_uploads_when_the_file_changes`, `remote_edit_skips_upload_when_unchanged`, `remote_edit_asks_before_a_binary_file`, `remote_edit_asks_before_a_large_file`, and `remote_edit_asks_when_the_remote_copy_is_newer`, plus `editor_order_is_visual_then_editor_then_session_then_vi`, `cache_path_drops_dotdot_and_separators`, `binary_sniff_sees_a_nul_and_delete_summary_quotes_one_name`, and `edit_cache_file_is_owner_readable_only`. A live window was not driven. Tests use a fake tree, a memory vault, and a temp edit cache.
 
 Match Files, except compare (phase 6).
 

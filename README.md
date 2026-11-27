@@ -1,12 +1,12 @@
 # dd_ftp
 
-Terminal FTP/SFTP/FTPS client. Rust, ratatui, and tokio. The terminal binary is the product. A GPUI window, `dd_ftp-gui`, is in the same repo and is not feature-complete. What the terminal does is specified below. How the window catches up is in [`GUI_PARITY.md`](GUI_PARITY.md).
+Terminal FTP/SFTP/FTPS client. Rust, ratatui, and tokio. The terminal is the behavior of record. `dd_ftp-gui` is the desktop window. What the terminal does is specified below. The window is described in [Window](#window). The build record is [`GUI_PARITY.md`](GUI_PARITY.md).
 
 ![Main window](docs/images/01-main.png)
 
 **Illustrated tutorial (install, first run, keys, screenshots):** [ldnddev.github.io/dd_ftp](https://ldnddev.github.io/dd_ftp/)
 
-The in-app key table is `KEYMAP` in `crates/dd_ftp_ui/src/keys.rs`. This file matches that table. Help is a page inside Settings.
+The in-app key table is `KEYMAP` in `crates/dd_ftp_app/src/keys.rs`. The terminal re-exports it. This file matches that table. Help is a page inside Settings.
 
 ## Install
 
@@ -187,9 +187,21 @@ Bracketed paste inserts into the focused text field as one edit. Arrow keys, Hom
 
 ## Window
 
-`dd_ftp-gui` opens at 1280×800. The app id is `dev.ldnddev.dd_ftp`. Settings there is Themes, Window, Session, and Help. Window prefs (density, Vim letters, reduced motion) live in `~/.config/ldnddev/dd_ftp/gui.json` and are not read by the terminal.
+`dd_ftp-gui` is the desktop client. It opens at 1280×800. The app id is `dev.ldnddev.dd_ftp`. `./install.sh --gui` installs that binary. `./install.sh --both` installs it beside `dd_ftp`. `./install.sh --tui` installs the terminal only and does not build the window.
 
-The local pane matches the terminal's local browser: `.` and `..` stay first, name sort keeps directories above files, `/` filters, `.` hides other dotfiles, Space / Shift+move / Ctrl+A mark, and the path bar cds to a prefix (double-click the current segment for the parent). Quick connect matches the terminal fields. `c` opens an SFTP, FTP, or FTPS session on a worker thread and lists the initial path. `c` again disconnects. A refused SFTP host key leaves the remote pane disconnected. Plain FTP says it is unencrypted. Bookmarks load and save `sites.toml` with no password field. Passwords stay in the OS keyring. Enter and `e` fill the form. `c` on a bookmark connects that site. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and the default site. Ctrl+P chooses a private key while the key field is focused. Ctrl+K reports keyring health. Uploads, downloads, and moves use the same queue, worker cap, and overwrite prompt as the terminal. `3` focuses the queue. On the remote pane, `n` creates a file or folder, `e` renames, Delete confirms a delete, and `p` chmods on SFTP. `E` edits a remote file through a private cache and uploads it when the bytes change. Shift+C compares the panes: `[L]` local only, `[R]` remote only, `[=]` same size and modified second, `[≠]` both exist and differ. Esc closes compare, then clears marks. Click a row to select it. Shift+click marks the range. Double-click a directory to enter it, or a file to queue the same transfer as Enter. Click a path-bar segment to cd, and double-click the current segment for the parent. The wheel scrolls lists, the queue, and Help, including over the scrollbar. Drag a scrollbar to jump. Click-drag in a text field places the caret and selects. Help lists every binding as the action, the window chord, and the terminal chord. A letter typed in a field does not run that chord. The terminal crates stay the behavior of record. See [`GUI_PARITY.md`](GUI_PARITY.md).
+Settings is Themes, Window, Session, and Help. F1 and F2 open Themes. A second press closes and reverts an unsaved theme. F3 opens Session. Window prefs (density, Vim letters, reduced motion) live in `~/.config/ldnddev/dd_ftp/gui.json` and are not read by the terminal. Help lists every binding as the action, the window chord, and the terminal chord.
+
+The local pane lists this machine. `.` and `..` stay first. Name sort keeps directories above files. `/` filters. `.` hides other dotfiles. Space, Shift+move, and Ctrl+A mark. Click a path-bar segment to cd there. Double-click the current segment for the parent.
+
+Quick connect uses the same fields as the terminal. `c` opens an SFTP, FTP, or FTPS session and lists the initial path. `c` again disconnects. A refused SFTP host key leaves the remote pane disconnected. Plain FTP says it is unencrypted.
+
+Bookmarks load and save `sites.toml` with no password field. Passwords stay in the OS keyring. Enter and `e` fill the form. `c` on a bookmark connects that site. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and the default site. Ctrl+P chooses a private key while the key field is focused. Ctrl+K reports keyring health.
+
+Uploads, downloads, and moves use the queue, the worker cap, and the overwrite prompt. `3` focuses the queue. On the remote pane, `n` creates a file or folder, `e` renames, Delete confirms a delete, and `p` chmods on SFTP. `E` edits a remote file through a private cache and uploads it when the bytes change.
+
+Shift+C compares the panes: `[L]` local only, `[R]` remote only, `[=]` same size and modified second, `[≠]` both exist and differ. Esc closes compare, then clears marks. Click a row to select it. Shift+click marks the range. Double-click a directory to enter it, or a file to queue the same transfer as Enter. The wheel scrolls lists, the queue, and Help, including over the scrollbar. Drag a scrollbar to jump. Click-drag in a text field places the caret and selects. A letter typed in a field does not run that chord.
+
+The terminal crates stay the behavior of record. The build record is [`GUI_PARITY.md`](GUI_PARITY.md).
 
 ## License
 

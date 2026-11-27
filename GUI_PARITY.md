@@ -120,6 +120,8 @@ Match directory compare, the mouse rows, and toasts.
 
 ### Phase 7 — Install and docs
 
+**Done.** `./install.sh --self-test` passed. `--gui` and `--both` build `dd_ftp-gui` with `cargo build --release -p dd_ftp_gui`. `--tui` builds `dd_ftp_cli` only. `dd_ftp_gui` stays off `default-members`, and `gpui-pre` is not in the `dd_ftp_cli` dependency tree. The README Window section describes the desktop client. Tutorial F1 captions say Settings. `keymap_keys_appear_in_tutorial_controls` passed. A live window was not driven. Tutorial PNGs were not recaptured.
+
 - `./install.sh --gui` and `--both` still install the binary that passes phases 1–6.
 - README “Window” section describes the finished client, not the shell.
 - Tutorial key captions that still say F1 toggles help are updated to Settings. `KEYMAP` strings must remain in `docs/index.html` between `id="keys"` and `id="uninstall"`.

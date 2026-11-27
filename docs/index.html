@@ -270,7 +270,7 @@ BIN_NAME=dd_ftp_cli ./install.sh</code></pre>
         <p>The local pane opens on the current directory. Click a path-bar segment to jump to that prefix; double-click the current segment to go to the parent. <kbd>Ctrl+q</kbd> quits (confirms if transfers are active). <kbd>Esc</kbd> never quits — it closes a modal, then compare, then clears marks.</p>
         <figure>
           <img src="images/02-help.png" alt="Help overlay listing keyboard and mouse bindings, grouped by Global, Navigation, Connection, Transfers, and more.">
-          <figcaption>Press <kbd>F1</kbd> any time for in-app help. Opening help closes the theme editor; opening the theme editor closes help.</figcaption>
+          <figcaption>Press <kbd>F1</kbd> any time for Settings. It opens on Themes. A second press closes and reverts an unsaved theme.</figcaption>
         </figure>
         <p>Optional environment variables pre-fill Quick Connect at launch:</p>
         <pre><code>export DD_FTP_HOST=your.server.com
@@ -395,13 +395,13 @@ export DD_FTP_PATH=/</code></pre>
 
       <section id="keys">
         <h2>Keys and mouse</h2>
-        <p>The in-app help (<kbd>F1</kbd>) is generated from the same table. Mouse works on lists, the queue, help, scrollbars, and text fields.</p>
+        <p>The Settings Help page is generated from the same table. <kbd>F1</kbd> opens Settings on Themes. Mouse works on lists, the queue, help, scrollbars, and text fields.</p>
 
         <h3>Global</h3>
         <table>
           <thead><tr><th>Keys</th><th>Action</th></tr></thead>
           <tbody>
-            <tr><td><kbd>F1</kbd></td><td>Toggle help (opening closes theme debug)</td></tr>
+            <tr><td><kbd>F1</kbd></td><td>Toggle Settings (opens on Themes; again closes and reverts the theme)</td></tr>
             <tr><td><kbd>Esc</kbd></td><td>Close current modal; when compare is on and no modal is open, close compare; otherwise clear marks</td></tr>
             <tr><td><kbd>F2</kbd></td><td>Toggle live theme editor (opening closes help)</td></tr>
             <tr><td><kbd>F3</kbd></td><td>Toggle settings (editor, workers, hide-dotfiles, overwrite, auto-connect, last path; saved to ~/.config/ldnddev/dd_ftp.toml)</td></tr>

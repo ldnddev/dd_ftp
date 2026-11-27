@@ -71,8 +71,14 @@ Open the dd_ftp window (1280×800).
   e / E       Rename a remote item, or edit a remote file
   Delete      Delete the remote selection after confirm
   p           SFTP chmod on the remote pane
+  C           Directory compare. Esc closes it
   Up/Down     Move the focused listing
   Enter       Open a directory, or queue a file
+  Click       Focus a pane and select the row. Shift+click marks a range
+  Double-click  Enter a directory, or queue a file
+  Path bar    Click a segment to cd. Double-click the current segment for the parent
+  Wheel       Scroll lists, the queue, and Help, including over the scrollbar
+  Scrollbar   Drag to scroll
 
 Wayland or X11, and Vulkan (libvulkan1 and a driver)."
     );

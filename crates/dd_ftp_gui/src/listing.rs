@@ -147,7 +147,48 @@ pub fn split_local_path(path: &Path) -> Vec<PathSegment> {
     segs
 }
 
-#[cfg(test)]
+/// Remote path prefixes. `/var/www` is `/`, `/var`, `/var/www`.
+pub fn split_remote_path(path: &str) -> Vec<PathSegment> {
+    if path.is_empty() || path == "/" {
+        return vec![PathSegment {
+            label: "/".into(),
+            target: "/".into(),
+        }];
+    }
+    let mut segs = Vec::new();
+    let mut acc = String::new();
+    if path.starts_with('/') {
+        acc = "/".into();
+        segs.push(PathSegment {
+            label: "/".into(),
+            target: "/".into(),
+        });
+    }
+    for part in path.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        acc = if acc == "/" {
+            format!("/{part}")
+        } else if acc.is_empty() {
+            part.to_string()
+        } else {
+            format!("{acc}/{part}")
+        };
+        segs.push(PathSegment {
+            label: part.to_string(),
+            target: acc.clone(),
+        });
+    }
+    if segs.is_empty() {
+        segs.push(PathSegment {
+            label: path.to_string(),
+            target: path.to_string(),
+        });
+    }
+    segs
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SegmentAction {
     Parent,
@@ -155,7 +196,6 @@ pub enum SegmentAction {
 }
 
 /// A click cds to that prefix. A double-click on the current segment goes up.
-#[cfg(test)]
 pub fn segment_action(
     segments: &[PathSegment],
     index: usize,

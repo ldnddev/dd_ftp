@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- The window compares directories, follows the mouse, and lists every key on Help. Shift+C shows `[L]`, `[R]`, `[=]`, and `[≠]`. Click, shift-click, double-click, the path bar, the wheel, and the scrollbar match the terminal. Help rows are the action, the window chord, and the terminal chord. Toasts cover save, bookmark changes, transfer end, disconnect, and rejected actions.
 - The window creates, renames, and deletes remote files and folders, chmods on SFTP, and edits a remote file through a private cache. Large, binary, and newer-remote prompts match the terminal.
 - The window queues uploads, downloads, and moves. Directories are walked. The queue shows pending, active, and failed jobs, with retry, cancel, a worker cap, and the overwrite prompt.
 - The window loads and saves bookmarks in `sites.toml` with no password field. Passwords stay in the OS keyring. A bookmark can connect, edit, delete, or become the default. `B` saves the form. Auto-connect uses the Session flag. Ctrl+P opens the SSH key picker. Ctrl+K reports keyring health.

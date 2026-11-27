@@ -25,8 +25,8 @@ Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks, secrets, and 
 - Bookmarks (phase 3): load and save `sites.toml` with no password. The live vault is `SecretStore`. Enter and `e` fill the form with a masked password. `c` on a bookmark connects. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and `default_site`. Ctrl+P opens the key picker. Ctrl+K reports keyring health.
 - Queue (phase 4): `u`, `d`, and Enter on a file transfer the marked set or the focused row. `M` moves, then deletes the source after success. Directories are walked with the terminal symlink rules. The queue pane shows pending, active, and failed jobs. Retry, cancel, clear pending, and Ctrl+C match the terminal. Workers default to 2 and clamp to 1–8. The overwrite prompt matches the terminal, including the newer-file keys.
 - Remote files (phase 5): `n` creates a file or folder, `e` renames, Delete confirms delete, and `p` chmods on SFTP. `E` edits through a private cache and uploads when the bytes change. A name that leaves the pane root is rejected.
+- Compare and mouse (phase 6): Shift+C shows `[L]`, `[R]`, `[=]`, and `[≠]`. Click, shift-click, double-click, path segments, the wheel, and the scrollbar match the terminal. Help lists every `KEYMAP` row as `action · gui · tui`. Toasts cover save, bookmark changes, transfer end, disconnect, and rejected actions.
 - Ctrl+Q confirms while a transfer is active, then cancels.
-- The Help sheet has seven rows. It is not `KEYMAP`.
 
 ## Phases
 
@@ -108,6 +108,8 @@ Match Files, except compare (phase 6).
 - Path-escape rejects a name that leaves the pane root.
 
 ### Phase 6 — Compare, mouse, and the key sheet
+
+**Done.** Headless coverage is `compare_badges_escape_and_a_letter_in_a_field`, `pointer_selects_ranges_paths_wheels_and_fields`, `queue_wheel_moves_three_rows`, `help_lists_every_keymap_row`, and `rejected_actions_and_disconnect_toast`, plus the compare unit tests in `dd_ftp_app`. A live window was not driven. Compare and `KEYMAP` live in `dd_ftp_app`. The terminal still calls them through `dd_ftp_ui` re-exports, and terminal help still prints `{keys}  {action}`.
 
 Match directory compare, the mouse rows, and toasts.
 

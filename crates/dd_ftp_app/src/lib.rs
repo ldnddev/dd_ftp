@@ -1,4 +1,6 @@
 pub mod actions;
+pub mod compare;
+pub mod keys;
 pub mod reducer;
 pub mod state;
 pub mod text_field;

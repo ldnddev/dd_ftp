@@ -6,7 +6,7 @@ use dd_ftp_core::{ConnectionInfo, Protocol};
 use gpui::{AppContext, TestAppContext};
 use ldnddev_theme::OmarchyPaths;
 
-use crate::shell::{Shell, ShellOptions};
+use crate::shell::{FieldSlot, PointerList, Shell, ShellOptions};
 
 fn opts(dir: &Path) -> ShellOptions {
     ShellOptions {
@@ -121,8 +121,8 @@ fn settings_sheet_pages_and_second_f1_restores_the_palette(cx: &mut TestAppConte
         shell.handle_key("]", cx);
         let text = shell.visible_text();
         assert!(text.contains("settings-page:Help"), "{text}");
-        assert!(text.contains("Settings · F1 · F1"), "{text}");
-        assert!(text.contains("Session · F3 · F3"), "{text}");
+        assert!(text.contains("· F1 · F1"), "{text}");
+        assert!(text.contains("· F3 · F3"), "{text}");
 
         shell.handle_key("f1", cx);
         assert!(!shell.visible_text().contains("settings-panel:right:70"));
@@ -1341,9 +1341,457 @@ fn remote_edit_asks_when_the_remote_copy_is_newer(cx: &mut TestAppContext) {
     });
 }
 
+fn remote_row_index(text: &str, name: &str) -> usize {
+    let needle = format!(" {name}  ");
+    text.lines()
+        .filter(|line| line.starts_with("remote-row:"))
+        .position(|line| line.contains(&needle))
+        .unwrap_or_else(|| panic!("no remote row {name}\n{text}"))
+}
+
+fn wait_remote(shell: &mut Shell, cwd: &str) -> String {
+    let line = format!("remote:{cwd}");
+    let mut last = String::new();
+    for _ in 0..50 {
+        shell.poll_jobs();
+        last = shell.visible_text();
+        if last.lines().any(|item| item == line) && !last.contains("busy:") {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    last
+}
+
+#[gpui::test]
+fn compare_badges_escape_and_a_letter_in_a_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("files");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    let same = root.join("same.txt");
+    std::fs::write(&same, b"same-bytes").unwrap();
+    std::fs::write(root.join("differ.txt"), b"aa").unwrap();
+    std::fs::write(root.join("only-local.txt"), b"local").unwrap();
+    let tree = trusted_tree();
+    {
+        let mut remote = tree.lock().unwrap();
+        remote.put_bytes("/same.txt", b"same-bytes");
+        remote.put_bytes("/differ.txt", b"b");
+        remote.put_bytes("/only-remote.txt", b"remote");
+        remote.make_dir("/docs").unwrap();
+        let modified = chrono::DateTime::<chrono::Utc>::from(
+            std::fs::metadata(&same).unwrap().modified().unwrap(),
+        );
+        remote.touch_modified("/same.txt", modified);
+    }
+    let mut options = opts(dir.path());
+    options.local_cwd = root;
+    options.backend = crate::session::Backend::Fake(std::sync::Arc::clone(&tree));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        let text = shell.visible_text();
+        assert!(text.contains("compare:off"), "{text}");
+        connect_sftp(shell, cx);
+        shell.handle_key("shift-c", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("compare:on"), "{text}");
+        assert!(text.contains("compare-local:same.txt=[=]"), "{text}");
+        assert!(text.contains("compare-remote:same.txt=[=]"), "{text}");
+        assert!(text.contains("compare-local:differ.txt=[≠]"), "{text}");
+        assert!(text.contains("compare-remote:differ.txt=[≠]"), "{text}");
+        assert!(text.contains("compare-local:only-local.txt=[L]"), "{text}");
+        assert!(
+            text.contains("compare-remote:only-remote.txt=[R]"),
+            "{text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("compare-local:.")
+                    || line.starts_with("compare-remote:.")),
+            "{text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with('>') && line.contains("[L]")),
+            "{text}"
+        );
+
+        let index = row_names(&text)
+            .iter()
+            .position(|name| name == "only-local.txt")
+            .unwrap();
+        shell.pointer_row(PointerList::Local, index, false, false, cx);
+        shell.handle_key("space", cx);
+        assert!(
+            shell.visible_text().contains("* only-local.txt"),
+            "{}",
+            shell.visible_text()
+        );
+        shell.handle_key("escape", cx);
+        let closed = shell.visible_text();
+        assert!(closed.contains("compare:off"), "{closed}");
+        assert!(closed.contains("* only-local.txt"), "{closed}");
+        shell.handle_key("escape", cx);
+        let cleared = shell.visible_text();
+        assert!(
+            !cleared.lines().any(|line| {
+                let rest = line.trim_start_matches(['>', ' ']);
+                rest.starts_with('*') || (line.starts_with("remote-row:") && line.contains("* "))
+            }),
+            "{cleared}"
+        );
+
+        shell.handle_key("/", cx);
+        shell.handle_key("shift-c", cx);
+        let filtering = shell.visible_text();
+        assert!(filtering.contains("filter-open:C"), "{filtering}");
+        assert!(filtering.contains("compare:off"), "{filtering}");
+        shell.handle_key("escape", cx);
+
+        shell.handle_key("1", cx);
+        for _ in 0..3 {
+            shell.handle_key("tab", cx);
+        }
+        shell.handle_key("shift-c", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("name:DeskC"), "{text}");
+        assert!(text.contains("compare:off"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn pointer_selects_ranges_paths_wheels_and_fields(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("files");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    for name in ["alpha.txt", "beta.txt", "delta.txt", "gamma.txt"] {
+        std::fs::write(root.join(name), b"x").unwrap();
+    }
+    for index in 0..15 {
+        std::fs::write(root.join(format!("f{index:02}")), b"x").unwrap();
+    }
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        std::fs::write(home.join(name), b"k").unwrap();
+    }
+    let tree = trusted_tree();
+    {
+        let mut remote = tree.lock().unwrap();
+        remote.make_dir("/docs").unwrap();
+        remote.make_dir("/docs/nested").unwrap();
+        remote.put_bytes("/notes.txt", b"notes");
+        remote.put_bytes("/other.txt", b"other");
+    }
+    let mut options = opts(dir.path());
+    options.local_cwd = root.clone();
+    options.backend = crate::session::Backend::Fake(std::sync::Arc::clone(&tree));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("home", cx);
+        let names = row_names(&shell.visible_text());
+        shell.pointer_wheel(PointerList::Local, false);
+        assert_eq!(
+            selected_name(&shell.visible_text()).as_deref(),
+            names.get(3).map(String::as_str)
+        );
+        shell.drag_scrollbar(PointerList::Local, 1.0);
+        assert_eq!(
+            selected_name(&shell.visible_text()).as_deref(),
+            names.last().map(String::as_str)
+        );
+
+        let alpha = names.iter().position(|name| name == "alpha.txt").unwrap();
+        let gamma = names.iter().position(|name| name == "gamma.txt").unwrap();
+        shell.pointer_row(PointerList::Local, alpha, false, false, cx);
+        assert_eq!(
+            selected_name(&shell.visible_text()).as_deref(),
+            Some("alpha.txt")
+        );
+        shell.pointer_row(PointerList::Local, gamma, true, false, cx);
+        let marked = shell.visible_text();
+        assert!(marked.contains("* alpha.txt"), "{marked}");
+        assert!(marked.contains("* gamma.txt"), "{marked}");
+        assert!(
+            !marked.lines().any(|line| {
+                let rest = line.trim_start_matches(['>', ' ']);
+                rest.starts_with("* . ") || rest.starts_with("* ..")
+            }),
+            "{marked}"
+        );
+        shell.handle_key("escape", cx);
+
+        let nested = names.iter().position(|name| name == "nested").unwrap();
+        shell.pointer_row(PointerList::Local, nested, false, true, cx);
+        let entered = shell.visible_text();
+        assert!(
+            entered
+                .lines()
+                .any(|line| line.starts_with("local:") && line.ends_with("/nested")),
+            "{entered}"
+        );
+        let bar = entered
+            .lines()
+            .find(|line| line.starts_with("path-bar:"))
+            .unwrap();
+        let segments = bar.trim_start_matches("path-bar:").split('|').count();
+        shell.activate_path_segment(segments - 2, false);
+        let prefix = shell.visible_text();
+        assert!(
+            prefix
+                .lines()
+                .any(|line| line.starts_with("local:") && line.ends_with("/files")),
+            "{prefix}"
+        );
+        shell.pointer_row(
+            PointerList::Local,
+            row_names(&prefix)
+                .iter()
+                .position(|name| name == "nested")
+                .unwrap(),
+            false,
+            true,
+            cx,
+        );
+        let again = shell.visible_text();
+        let bar = again
+            .lines()
+            .find(|line| line.starts_with("path-bar:"))
+            .unwrap();
+        let segments = bar.trim_start_matches("path-bar:").split('|').count();
+        shell.activate_path_segment(segments - 1, true);
+        let parent = shell.visible_text();
+        assert!(
+            parent
+                .lines()
+                .any(|line| line.starts_with("local:") && line.ends_with("/files")),
+            "{parent}"
+        );
+
+        let text = shell.visible_text();
+        let docs = remote_row_index(&text, "docs");
+        shell.pointer_row(PointerList::Remote, docs, false, true, cx);
+        let text = wait_remote(shell, "/docs");
+        assert!(text.lines().any(|line| line == "remote:/docs"), "{text}");
+        let nested = remote_row_index(&text, "nested");
+        shell.pointer_row(PointerList::Remote, nested, false, true, cx);
+        let text = wait_remote(shell, "/docs/nested");
+        assert!(
+            text.lines().any(|line| line == "remote:/docs/nested"),
+            "{text}"
+        );
+        shell.activate_remote_segment(1, false, cx);
+        let text = wait_remote(shell, "/docs");
+        assert!(text.lines().any(|line| line == "remote:/docs"), "{text}");
+        let nested = remote_row_index(&text, "nested");
+        shell.pointer_row(PointerList::Remote, nested, false, true, cx);
+        let _text = wait_remote(shell, "/docs/nested");
+        shell.activate_remote_segment(2, true, cx);
+        let text = wait_remote(shell, "/docs");
+        assert!(text.lines().any(|line| line == "remote:/docs"), "{text}");
+        shell.activate_remote_segment(0, false, cx);
+        let text = wait_remote(shell, "/");
+        assert!(text.lines().any(|line| line == "remote:/"), "{text}");
+
+        shell.handle_key("2", cx);
+        let notes = remote_row_index(&shell.visible_text(), "notes.txt");
+        shell.pointer_row(PointerList::Remote, notes, false, true, cx);
+        let text = until(shell, "download complete");
+        assert!(text.contains("toast:download complete"), "{text}");
+        assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(), b"notes");
+
+        let text = wait_remote(shell, "/");
+        let notes = remote_row_index(&text, "notes.txt");
+        let other = remote_row_index(&text, "other.txt");
+        shell.pointer_row(PointerList::Remote, notes, false, false, cx);
+        shell.pointer_row(PointerList::Remote, other, true, false, cx);
+        let marked = shell.visible_text();
+        assert!(marked.contains("remote-row: * notes.txt"), "{marked}");
+        assert!(marked.contains("remote-row:>* other.txt"), "{marked}");
+        assert!(
+            !marked.lines().any(|line| {
+                line.starts_with("remote-row:") && (line.contains("* . ") || line.contains("* .."))
+            }),
+            "{marked}"
+        );
+        shell.handle_key("escape", cx);
+
+        let alpha = row_names(&shell.visible_text())
+            .iter()
+            .position(|name| name == "alpha.txt")
+            .unwrap();
+        shell.pointer_row(PointerList::Local, alpha, false, true, cx);
+        let text = until_settled(shell, "upload complete");
+        assert!(text.contains("toast:upload complete"), "{text}");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/alpha.txt"),
+            Some(b"x".as_slice())
+        );
+
+        shell.handle_key("2", cx);
+        shell.handle_key("n", cx);
+        type_text(shell, cx, "abcd");
+        shell.pointer_field(FieldSlot::Prompt, 1, false);
+        shell.pointer_field(FieldSlot::Prompt, 3, true);
+        assert_eq!(shell.field_marks(FieldSlot::Prompt), Some((3, Some(1))));
+        shell.handle_key("escape", cx);
+        assert!(!shell.visible_text().contains("create:file:"));
+
+        shell.handle_key("1", cx);
+        for _ in 0..3 {
+            shell.handle_key("tab", cx);
+        }
+        shell.pointer_field(FieldSlot::Name, 1, false);
+        shell.pointer_field(FieldSlot::Name, 4, true);
+        assert_eq!(shell.field_marks(FieldSlot::Name), Some((4, Some(1))));
+
+        for _ in 0..5 {
+            shell.handle_key("tab", cx);
+        }
+        shell.handle_key("ctrl-p", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("key-picker:"), "{text}");
+        shell.pointer_wheel(PointerList::KeyPicker, false);
+        let text = shell.visible_text();
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("key-row:>") && line.contains(" b ")),
+            "{text}"
+        );
+        shell.drag_scrollbar(PointerList::KeyPicker, 1.0);
+        let text = shell.visible_text();
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("key-row:>") && line.contains(" f ")),
+            "{text}"
+        );
+        shell.handle_key("escape", cx);
+
+        shell.handle_key("f3", cx);
+        shell.handle_key("tab", cx);
+        shell.handle_key("]", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("settings-page:Help"), "{text}");
+        assert!(text.contains("help-scroll:0"), "{text}");
+        shell.pointer_wheel(PointerList::Help, false);
+        assert!(shell.visible_text().contains("help-scroll:3"));
+        let last = crate::shortcuts::lines().len() - 1;
+        shell.drag_scrollbar(PointerList::Help, 1.0);
+        assert!(
+            shell
+                .visible_text()
+                .contains(&format!("help-scroll:{last}")),
+            "{}",
+            shell.visible_text()
+        );
+        assert!(!shell.visible_text().contains("password"));
+        assert!(!shell.visible_text().contains("s3cret-value"));
+    });
+}
+
+#[gpui::test]
+fn queue_wheel_moves_three_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        std::fs::write(dir.path().join(name), name.as_bytes()).unwrap();
+    }
+    let tree = trusted_tree();
+    tree.lock().unwrap().hold_transfers = true;
+    let mut options = opts(dir.path());
+    options.backend = crate::session::Backend::Fake(std::sync::Arc::clone(&tree));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("ctrl-a", cx);
+        shell.handle_key("u", cx);
+        let text = shell.visible_text();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("queue-row:"))
+            .collect();
+        assert!(rows.len() >= 4, "{text}");
+        shell.pointer_row(PointerList::Queue, 0, false, false, cx);
+        shell.pointer_wheel(PointerList::Queue, false);
+        let text = shell.visible_text();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("queue-row:"))
+            .collect();
+        assert!(rows[3].starts_with("queue-row:>"), "{text}");
+        shell.handle_key("ctrl-c", cx);
+        let text = until(shell, "Cancelled by user");
+        assert!(text.contains("active=0"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn help_lists_every_keymap_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let shell = mount(cx, opts(dir.path()));
+    shell.update(cx, |shell, cx| {
+        shell.handle_key("f3", cx);
+        shell.handle_key("tab", cx);
+        shell.handle_key("]", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("settings-page:Help"), "{text}");
+        for row in dd_ftp_app::keys::KEYMAP {
+            let line = format!("{} · {} · {}", row.action, row.gui, row.keys);
+            assert!(text.contains(&line), "missing {line}\n{text}");
+        }
+        assert!(text.contains("· F1 · F1"), "{text}");
+        assert!(text.contains("· F3 · F3"), "{text}");
+        assert!(!text.contains("Session · F3 · F3"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn rejected_actions_and_disconnect_toast(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = trusted_tree();
+    let mut options = opts(dir.path());
+    options.backend = crate::session::Backend::Fake(tree);
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        shell.handle_key("u", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("toast:Not connected"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+        connect_sftp(shell, cx);
+        shell.handle_key("shift-c", cx);
+        assert!(shell.visible_text().contains("compare:on"));
+        shell.handle_key("c", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("toast:Disconnected"), "{text}");
+        assert!(text.contains("compare:off"), "{text}");
+        assert!(text.contains("remote:disconnected"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
 #[test]
 fn help_flag_text_names_the_window() {
     let help = include_str!("main.rs");
     assert!(help.contains("dd_ftp-gui [--help]"));
     assert!(help.contains("F3"));
+    assert!(help.contains("1 / 2 / 3"));
+    assert!(help.contains("u / d"));
+    assert!(help.contains("Ctrl+C"));
+    assert!(help.contains("Enter       Open a directory, or queue a file"));
+    assert!(help.contains("n           Create a remote file or folder"));
+    assert!(help.contains("e / E"));
+    assert!(help.contains("Delete      Delete the remote selection after confirm"));
+    assert!(help.contains("p           SFTP chmod on the remote pane"));
+    assert!(help.contains("C           Directory compare. Esc closes it"));
+    assert!(help.contains("Shift+click marks a range"));
+    assert!(help.contains("Double-click the current segment for the parent"));
+    assert!(help.contains("Wheel       Scroll lists, the queue, and Help"));
 }

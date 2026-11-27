@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
+use dd_ftp_app::compare::{classify_compare_indexed, index_by_name};
 use dd_ftp_app::{
     OverwritePolicy, PendingFile, SettingsField, SortKey, TextField, WORKER_MAX_CONCURRENCY_LIMIT,
     clamp_worker_concurrency, cmp_file_entries, is_dot_or_dotdot, is_public_key_name,
@@ -25,16 +26,15 @@ use crate::xfer::{self, DrainStep, XferEvent};
 use dd_ftp_storage::{AppConfig, SecretStore, SiteConfig, SiteManager};
 use gpui::{
     App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
-    ParentElement, Render, ScrollHandle, Styled, Window, div, prelude::*, px,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollHandle, Styled,
+    Window, div, point, prelude::*, px,
 };
 use ldnddev_theme::{
     ColorField, EXTRA_MODAL_HEADER, EXTRA_SELECTION, EditorKey, EditorOutcome, Palette,
     PickerOutcome, PickerRow, Rgb, ThemeEditor, ThemePicker, ThemeSaveTarget,
 };
 
-#[cfg(test)]
-use crate::listing::SegmentAction;
-use crate::listing::{self, LocalEntry};
+use crate::listing::{self, LocalEntry, SegmentAction};
 use crate::prefs::{self, GuiSettings};
 use crate::shortcuts;
 use crate::theme_load::{self, LoadedTheme};
@@ -45,6 +45,37 @@ const BUSY_BARS: [char; 4] = ['▃', '▅', '█', '▅'];
 const BUSY_FRAME_MS: u128 = 150;
 const CHROME_PX: f32 = 28.0;
 const LOCAL_PAGE: usize = 10;
+const SCROLL_STEP: usize = 3;
+
+/// A list the pointer can focus. Wheel moves the selection by [`SCROLL_STEP`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerList {
+    Local,
+    Remote,
+    Queue,
+    Help,
+    KeyPicker,
+}
+
+/// A text field the pointer can place a cursor in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldSlot {
+    Name,
+    Host,
+    Port,
+    User,
+    Password,
+    Key,
+    Path,
+    Prompt,
+    Rename,
+}
+
+struct FieldDrag {
+    slot: FieldSlot,
+    origin_x: f32,
+    start: usize,
+}
 
 #[derive(Clone, Copy)]
 enum Reselect {
@@ -269,6 +300,7 @@ pub struct Shell {
     entries: Vec<LocalEntry>,
     local_index: usize,
     local_scroll: ScrollHandle,
+    show_compare: bool,
     filter_pattern: String,
     filter_open: bool,
     sort_key: SortKey,
@@ -351,6 +383,10 @@ pub struct Shell {
     cancel_all: bool,
     active_jobs: usize,
     queue_index: usize,
+    queue_scroll: ScrollHandle,
+    key_scroll: ScrollHandle,
+    scroll_drag: Option<PointerList>,
+    field_drag: Option<FieldDrag>,
     remote_marks: HashSet<String>,
     active_connection: Option<ConnectionInfo>,
     fs_ok: Option<String>,
@@ -385,6 +421,7 @@ impl Shell {
             entries: Vec::new(),
             local_index: 0,
             local_scroll: ScrollHandle::new(),
+            show_compare: false,
             filter_pattern: String::new(),
             filter_open: false,
             sort_key: SortKey::Name,
@@ -467,6 +504,10 @@ impl Shell {
             cancel_all: false,
             active_jobs: 0,
             queue_index: 0,
+            queue_scroll: ScrollHandle::new(),
+            key_scroll: ScrollHandle::new(),
+            scroll_drag: None,
+            field_drag: None,
             remote_marks: HashSet::new(),
             active_connection: None,
             fs_ok: None,
@@ -688,7 +729,6 @@ impl Shell {
         self.reload_local(Reselect::Reset);
     }
 
-    #[cfg(test)]
     fn follow_segment(&mut self, index: usize, double: bool) {
         let segments = listing::split_local_path(&self.local_cwd);
         match listing::segment_action(&segments, index, double) {
@@ -698,9 +738,380 @@ impl Shell {
         }
     }
 
-    #[cfg(test)]
     pub fn activate_path_segment(&mut self, index: usize, double: bool) {
+        self.pane = Pane::Local;
         self.follow_segment(index, double);
+    }
+
+    pub fn activate_remote_segment(&mut self, index: usize, double: bool, cx: &mut Context<Self>) {
+        if !self.connected || self.inflight.is_some() {
+            return;
+        }
+        self.pane = Pane::Remote;
+        let segments = listing::split_remote_path(&self.remote_cwd);
+        match listing::segment_action(&segments, index, double) {
+            Some(SegmentAction::Parent) => self.parent_remote(cx),
+            Some(SegmentAction::Goto(target)) if target != self.remote_cwd => {
+                self.remote_cwd = target.clone();
+                self.request_remote_list(target, Reselect::Reset, cx);
+            }
+            Some(SegmentAction::Goto(_)) | None => {}
+        }
+    }
+
+    fn clear_focused_marks(&mut self) {
+        match self.pane {
+            Pane::Local => {
+                self.marks.clear();
+                self.mark_anchor = None;
+            }
+            Pane::Remote => self.remote_marks.clear(),
+            _ => {}
+        }
+    }
+
+    fn modal_blocks_pointer(&self) -> bool {
+        self.settings_open
+            || self.confirm_quit
+            || self.confirm_delete.is_some()
+            || self.file_prompt.is_some()
+            || self.overwrite.is_some()
+            || self.rename_field.is_some()
+            || self.host_key.is_some()
+            || self.key_picker.is_some()
+    }
+
+    pub fn pointer_row(
+        &mut self,
+        list: PointerList,
+        index: usize,
+        shift: bool,
+        double: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_blocks_pointer() && !matches!(list, PointerList::KeyPicker) {
+            return;
+        }
+        match list {
+            PointerList::Local => self.pointer_local(index, shift, double),
+            PointerList::Remote => self.pointer_remote(index, shift, double, cx),
+            PointerList::Queue => {
+                let len = self.queue_rows().len();
+                if index < len {
+                    self.pane = Pane::Queue;
+                    self.queue_index = index;
+                    self.reveal(PointerList::Queue);
+                }
+            }
+            PointerList::Help => {}
+            PointerList::KeyPicker => {
+                self.set_key_picker_index(index);
+                if double {
+                    self.activate_key_picker();
+                }
+            }
+        }
+    }
+
+    fn pointer_local(&mut self, index: usize, shift: bool, double: bool) {
+        let len = self.visible_entries().len();
+        if index >= len {
+            return;
+        }
+        let prev = self.local_index;
+        self.pane = Pane::Local;
+        self.local_index = index;
+        if shift {
+            self.mark_range(prev, index);
+        }
+        if double {
+            let is_dir = self
+                .visible_entries()
+                .get(index)
+                .is_some_and(|entry| entry.is_dir());
+            if is_dir {
+                self.enter_local();
+            } else {
+                self.queue_upload();
+            }
+        }
+        self.reveal(PointerList::Local);
+    }
+
+    fn pointer_remote(&mut self, index: usize, shift: bool, double: bool, cx: &mut Context<Self>) {
+        let len = self.remote_rows().len();
+        if index >= len {
+            return;
+        }
+        let prev = self.remote_index;
+        self.pane = Pane::Remote;
+        self.remote_index = index;
+        if shift {
+            self.mark_remote_range(prev, index);
+        }
+        if double {
+            self.enter_remote(cx);
+        }
+        self.reveal(PointerList::Remote);
+    }
+
+    fn mark_remote_range(&mut self, from: usize, to: usize) {
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        for (index, entry) in self.remote_rows().into_iter().enumerate() {
+            if index >= lo
+                && index <= hi
+                && let Some(key) = self.remote_mark_key(&entry)
+            {
+                self.remote_marks.insert(key);
+            }
+        }
+    }
+
+    pub fn pointer_wheel(&mut self, list: PointerList, up: bool) {
+        if self.modal_blocks_pointer()
+            && !matches!(list, PointerList::Help | PointerList::KeyPicker)
+        {
+            return;
+        }
+        let dir = if up { -1 } else { 1 };
+        match list {
+            PointerList::Local => {
+                self.pane = Pane::Local;
+                for _ in 0..SCROLL_STEP {
+                    self.move_selection(dir);
+                }
+                self.reveal(PointerList::Local);
+            }
+            PointerList::Remote => {
+                self.pane = Pane::Remote;
+                for _ in 0..SCROLL_STEP {
+                    self.move_remote(dir);
+                }
+                self.reveal(PointerList::Remote);
+            }
+            PointerList::Queue => {
+                self.pane = Pane::Queue;
+                for _ in 0..SCROLL_STEP {
+                    self.move_queue(dir);
+                }
+                self.reveal(PointerList::Queue);
+            }
+            PointerList::Help => {
+                if up {
+                    self.help_scroll = self.help_scroll.saturating_sub(SCROLL_STEP);
+                } else {
+                    self.help_scroll = self.help_scroll.saturating_add(SCROLL_STEP);
+                }
+            }
+            PointerList::KeyPicker => {
+                let delta = if up {
+                    -(SCROLL_STEP as i32)
+                } else {
+                    SCROLL_STEP as i32
+                };
+                self.move_key_picker(delta);
+            }
+        }
+    }
+
+    pub fn drag_scrollbar(&mut self, list: PointerList, fraction: f32) {
+        if self.modal_blocks_pointer()
+            && !matches!(list, PointerList::Help | PointerList::KeyPicker)
+        {
+            return;
+        }
+        let fraction = fraction.clamp(0.0, 1.0);
+        let index_at = |len: usize| -> usize {
+            if len == 0 {
+                return 0;
+            }
+            let last = len - 1;
+            ((fraction * last as f32).round() as usize).min(last)
+        };
+        match list {
+            PointerList::Local => {
+                self.pane = Pane::Local;
+                self.jump_local(index_at(self.visible_entries().len()));
+                self.reveal(PointerList::Local);
+            }
+            PointerList::Remote => {
+                self.pane = Pane::Remote;
+                self.remote_index = index_at(self.remote_rows().len());
+                self.reveal(PointerList::Remote);
+            }
+            PointerList::Queue => {
+                self.pane = Pane::Queue;
+                self.queue_index = index_at(self.queue_rows().len());
+                self.reveal(PointerList::Queue);
+            }
+            PointerList::Help => {
+                self.help_scroll = index_at(shortcuts::lines().len());
+            }
+            PointerList::KeyPicker => {
+                let len = self
+                    .key_picker
+                    .as_ref()
+                    .map(|picker| picker.entries.len())
+                    .unwrap_or(0);
+                self.set_key_picker_index(index_at(len));
+            }
+        }
+    }
+
+    pub fn pointer_field(&mut self, slot: FieldSlot, index: usize, extend: bool) {
+        self.focus_field(slot);
+        let Some(field) = self.field_slot_mut(slot) else {
+            return;
+        };
+        if extend {
+            field.extend_drag(index);
+        } else {
+            field.begin_drag(index);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn field_marks(&self, slot: FieldSlot) -> Option<(usize, Option<usize>)> {
+        let field = self.field_slot(slot)?;
+        Some((field.cursor, field.anchor))
+    }
+
+    fn focus_field(&mut self, slot: FieldSlot) {
+        match slot {
+            FieldSlot::Name => self.pane = Pane::Name,
+            FieldSlot::Host => self.pane = Pane::Host,
+            FieldSlot::Port => self.pane = Pane::Port,
+            FieldSlot::User => self.pane = Pane::User,
+            FieldSlot::Password => self.pane = Pane::Password,
+            FieldSlot::Key => self.pane = Pane::Key,
+            FieldSlot::Path => self.pane = Pane::Path,
+            FieldSlot::Prompt | FieldSlot::Rename => {}
+        }
+    }
+
+    fn field_slot(&self, slot: FieldSlot) -> Option<&TextField> {
+        match slot {
+            FieldSlot::Name => Some(&self.name),
+            FieldSlot::Host => Some(&self.host),
+            FieldSlot::Port => Some(&self.port),
+            FieldSlot::User => Some(&self.user),
+            FieldSlot::Password => Some(&self.password),
+            FieldSlot::Key => Some(&self.private_key),
+            FieldSlot::Path => Some(&self.path),
+            FieldSlot::Prompt => self.file_prompt_field(),
+            FieldSlot::Rename => self.rename_field.as_ref(),
+        }
+    }
+
+    fn field_slot_mut(&mut self, slot: FieldSlot) -> Option<&mut TextField> {
+        match slot {
+            FieldSlot::Name => Some(&mut self.name),
+            FieldSlot::Host => Some(&mut self.host),
+            FieldSlot::Port => Some(&mut self.port),
+            FieldSlot::User => Some(&mut self.user),
+            FieldSlot::Password => Some(&mut self.password),
+            FieldSlot::Key => Some(&mut self.private_key),
+            FieldSlot::Path => Some(&mut self.path),
+            FieldSlot::Prompt => self.file_prompt_field_mut(),
+            FieldSlot::Rename => self.rename_field.as_mut(),
+        }
+    }
+
+    fn file_prompt_field(&self) -> Option<&TextField> {
+        match self.file_prompt.as_ref()? {
+            FilePrompt::Create { field, .. }
+            | FilePrompt::Rename { field }
+            | FilePrompt::Chmod { field, .. }
+            | FilePrompt::EditSave { field } => Some(field),
+            FilePrompt::Delete { .. }
+            | FilePrompt::EditLarge
+            | FilePrompt::EditBinary
+            | FilePrompt::EditConflict => None,
+        }
+    }
+
+    fn move_queue(&mut self, dir: i32) {
+        let len = self.queue_rows().len();
+        if len == 0 {
+            return;
+        }
+        if dir < 0 {
+            self.queue_index = self.queue_index.saturating_sub(1);
+        } else {
+            self.queue_index = (self.queue_index + 1).min(len - 1);
+        }
+    }
+
+    fn compare_badges(&self) -> HashMap<String, &'static str> {
+        let mut badges = HashMap::new();
+        if !self.show_compare {
+            return badges;
+        }
+        let local_files: Vec<FileEntry> = self
+            .entries
+            .iter()
+            .map(|entry| entry.to_file_entry())
+            .collect();
+        let local_index = index_by_name(&local_files);
+        let remote_index = index_by_name(&self.remote_entries);
+        for entry in local_files.iter().chain(self.remote_entries.iter()) {
+            if let Some(badge) = classify_compare_indexed(&entry.name, &local_index, &remote_index)
+            {
+                badges.insert(entry.name.clone(), badge.label());
+            }
+        }
+        badges
+    }
+
+    fn reveal(&self, list: PointerList) {
+        match list {
+            PointerList::Local => self.local_scroll.scroll_to_item(self.local_index),
+            PointerList::Remote => self.remote_scroll.scroll_to_item(self.remote_index),
+            PointerList::Queue => self.queue_scroll.scroll_to_item(self.queue_index),
+            PointerList::Help | PointerList::KeyPicker => {}
+        }
+    }
+
+    fn scroll_bounds(&self, list: PointerList) -> gpui::Bounds<gpui::Pixels> {
+        match list {
+            PointerList::Local => self.local_scroll.bounds(),
+            PointerList::Remote => self.remote_scroll.bounds(),
+            PointerList::Queue => self.queue_scroll.bounds(),
+            PointerList::Help => self.settings_scroll.bounds(),
+            PointerList::KeyPicker => self.key_scroll.bounds(),
+        }
+    }
+
+    fn drag_from_y(&mut self, list: PointerList, y: gpui::Pixels) {
+        let bounds = self.scroll_bounds(list);
+        let height = f32::from(bounds.size.height);
+        let top = f32::from(bounds.origin.y);
+        let fraction = if height <= 0.0 {
+            0.0
+        } else {
+            ((f32::from(y) - top) / height).clamp(0.0, 1.0)
+        };
+        self.drag_scrollbar(list, fraction);
+    }
+
+    fn drag_field_to(&mut self, x: gpui::Pixels) {
+        let Some(drag) = self.field_drag.as_ref() else {
+            return;
+        };
+        let slot = drag.slot;
+        let origin = drag.origin_x;
+        let start = drag.start;
+        let chars = ((f32::from(x) - origin) / 7.0).round() as i32;
+        let index = (start as i32 + chars).max(0) as usize;
+        if let Some(field) = self.field_slot_mut(slot) {
+            field.extend_drag(index);
+        }
+    }
+
+    fn reject(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status = message.clone();
+        self.push_toast(message);
     }
 
     fn push_toast(&mut self, message: String) {
@@ -873,19 +1284,19 @@ impl Shell {
             self.disconnect_session();
         }
         if info.name.trim().is_empty() {
-            self.status = "Connect failed: label/name is required".to_string();
+            self.reject("Connect failed: label/name is required");
             return;
         }
         if info.host.trim().is_empty() {
-            self.status = "Connect failed: host is required".to_string();
+            self.reject("Connect failed: host is required");
             return;
         }
         if info.username.trim().is_empty() {
-            self.status = "Connect failed: username is required".to_string();
+            self.reject("Connect failed: username is required");
             return;
         }
         if info.port == 0 {
-            self.status = "Connect failed: port must be > 0".to_string();
+            self.reject("Connect failed: port must be > 0");
             return;
         }
         let path = session::normalize_remote(&info.initial_path);
@@ -904,6 +1315,7 @@ impl Shell {
     }
 
     fn disconnect_session(&mut self) {
+        let was_connected = self.connected;
         if let Some(prompt) = self.host_key.take() {
             let _ = prompt.reply.send(false);
         }
@@ -912,6 +1324,7 @@ impl Shell {
         self.remote_entries.clear();
         self.remote_index = 0;
         self.remote_marks.clear();
+        self.show_compare = false;
         self.inflight = None;
         self.busy_reason = None;
         self.connect_view = None;
@@ -928,6 +1341,9 @@ impl Shell {
         self.stop_transfers();
         self.engine.drop_pool();
         self.status = "Disconnected".to_string();
+        if was_connected {
+            self.push_toast(self.status.clone());
+        }
         self.session.disconnect(generation);
     }
 
@@ -1080,6 +1496,8 @@ impl Shell {
                     if let Some(path) = self.edit.as_ref().map(|edit| edit.remote_path.clone()) {
                         self.enqueue_edit_upload(path);
                     }
+                } else {
+                    self.push_toast(message);
                 }
             }
             SessionEvent::Operated { generation, error } => {
@@ -1169,7 +1587,7 @@ impl Shell {
 
     fn enter_remote(&mut self, cx: &mut Context<Self>) {
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         }
         if self.inflight.is_some() {
@@ -1267,7 +1685,7 @@ impl Shell {
 
     fn enqueue_direction(&mut self, direction: TransferDirection, delete_source: bool) {
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         }
         if self.inflight.is_some() || self.awaiting_list {
@@ -1376,7 +1794,7 @@ impl Shell {
 
     fn begin_live_walk(&mut self, remote_root: String, local_root: PathBuf, delete_source: bool) {
         let Some(info) = self.active_connection.clone() else {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         };
         self.stat_token = self.stat_token.wrapping_add(1);
@@ -1508,7 +1926,7 @@ impl Shell {
 
     fn request_upload_stat(&mut self, file: &PendingFile) {
         let Some(info) = self.active_connection.clone() else {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         };
         let parent = session::parent_remote(&file.remote_path);
@@ -1767,6 +2185,7 @@ impl Shell {
                     job.last_error = Some("Cancelled by user".to_string());
                     self.queue.mark_cancelled(job);
                     self.status = "Cancelled by user".to_string();
+                    self.push_toast(self.status.clone());
                 } else if let Some(err) = error {
                     let message =
                         session::redact(&format!("Transfer failed: {err}"), self.password_secret());
@@ -2286,8 +2705,24 @@ impl Shell {
                     self.save_bookmark();
                     return;
                 }
+                "shift-c" => {
+                    self.show_compare = !self.show_compare;
+                    return;
+                }
+                "escape" => {
+                    if self.show_compare {
+                        self.show_compare = false;
+                    } else {
+                        self.clear_focused_marks();
+                    }
+                    return;
+                }
                 _ => {}
             }
+        }
+        if key == "escape" && self.filter_open {
+            self.local_key(key);
+            return;
         }
         match self.pane {
             Pane::Local => self.local_key(key),
@@ -2334,12 +2769,6 @@ impl Shell {
         }
         let vim = self.gui.vim_keys;
         match key {
-            "escape" => {
-                if !self.marks.is_empty() {
-                    self.marks.clear();
-                    self.mark_anchor = None;
-                }
-            }
             "ctrl-a" => self.mark_all_visible(),
             "." => self.toggle_hide(),
             "s" => self.cycle_sort(),
@@ -2639,7 +3068,7 @@ impl Shell {
 
     fn cycle_bookmark(&mut self) {
         if self.sites.is_empty() {
-            self.status = "No bookmarks saved".to_string();
+            self.reject("No bookmarks saved");
             return;
         }
         self.bookmark_index = (self.bookmark_index + 1) % self.sites.len();
@@ -2649,7 +3078,7 @@ impl Shell {
 
     fn connect_bookmark(&mut self, cx: &mut Context<Self>) {
         let Some(mut info) = self.sites.get(self.bookmark_index).cloned() else {
-            self.status = "No bookmarks saved".to_string();
+            self.reject("No bookmarks saved");
             return;
         };
         if info.password.is_none()
@@ -2664,7 +3093,7 @@ impl Shell {
 
     fn ask_delete_bookmark(&mut self) {
         if self.sites.is_empty() {
-            self.status = "No bookmarks to delete".to_string();
+            self.reject("No bookmarks to delete");
             return;
         }
         let Some(site) = self.sites.get(self.bookmark_index) else {
@@ -2694,7 +3123,7 @@ impl Shell {
 
     fn set_default_bookmark(&mut self) {
         if self.sites.is_empty() {
-            self.status = "No bookmarks to set as default".to_string();
+            self.reject("No bookmarks to set as default");
             return;
         }
         let mut config = self.site_config();
@@ -3506,6 +3935,11 @@ impl Shell {
             if self.filter_open { "-open" } else { "" },
             self.filter_pattern
         ));
+        lines.push(format!(
+            "compare:{}",
+            if self.show_compare { "on" } else { "off" }
+        ));
+        let badges = self.compare_badges();
         for (index, entry) in self.visible_entries().iter().enumerate() {
             let cursor = if index == self.local_index && self.pane == Pane::Local {
                 ">"
@@ -3523,6 +3957,9 @@ impl Shell {
                 entry.size,
                 entry.marker()
             ));
+            if let Some(badge) = badges.get(&entry.name) {
+                lines.push(format!("compare-local:{}={badge}", entry.name));
+            }
         }
         if self.connected {
             lines.push(format!("remote:{}", self.remote_cwd));
@@ -3543,10 +3980,21 @@ impl Shell {
                 " "
             };
             let kind = if entry.is_dir() { "dir" } else { "file" };
+            let star = if self
+                .remote_mark_key(entry)
+                .is_some_and(|key| self.remote_marks.contains(&key))
+            {
+                "*"
+            } else {
+                " "
+            };
             lines.push(format!(
-                "remote-row:{cursor} {}  {}  {kind}",
+                "remote-row:{cursor}{star} {}  {}  {kind}",
                 entry.name, entry.size
             ));
+            if let Some(badge) = badges.get(&entry.name) {
+                lines.push(format!("compare-remote:{}={badge}", entry.name));
+            }
         }
         lines.push(format!(
             "default:{}",
@@ -3710,7 +4158,10 @@ impl Shell {
                         ));
                         lines.push(format!("Last local path {}", self.session_last_local.value));
                     }
-                    Page::Help => lines.extend(shortcuts::lines()),
+                    Page::Help => {
+                        lines.push(format!("help-scroll:{}", self.help_scroll));
+                        lines.extend(shortcuts::lines());
+                    }
                 }
             }
         }
@@ -3767,7 +4218,7 @@ impl Shell {
             return;
         }
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         }
         if self.remote_busy() {
@@ -3788,15 +4239,15 @@ impl Shell {
             return;
         }
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         }
         let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
-            self.status = "No item selected".to_string();
+            self.reject("No item selected");
             return;
         };
         if is_dot_or_dotdot(&entry.name) {
-            self.status = "No item selected".to_string();
+            self.reject("No item selected");
             return;
         }
         self.file_prompt = Some(FilePrompt::Rename {
@@ -3809,7 +4260,7 @@ impl Shell {
             return;
         }
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         }
         let protocol = self
@@ -3818,12 +4269,11 @@ impl Shell {
             .map(|info| info.protocol)
             .unwrap_or(self.protocol);
         if protocol != Protocol::Sftp {
-            self.status = "chmod is SFTP-only".to_string();
-            self.push_toast(self.status.clone());
+            self.reject("chmod is SFTP-only");
             return;
         }
         let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
-            self.status = "Nothing selected".to_string();
+            self.reject("Nothing selected");
             return;
         };
         if is_dot_or_dotdot(&entry.name) {
@@ -3837,7 +4287,7 @@ impl Shell {
 
     fn open_remote_delete(&mut self) {
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         }
         let mut jobs = VecDeque::new();
@@ -3861,7 +4311,7 @@ impl Shell {
             }
         }
         if jobs.is_empty() {
-            self.status = "Nothing selected to delete".to_string();
+            self.reject("Nothing selected to delete");
             return;
         }
         self.file_prompt = Some(FilePrompt::Delete { jobs });
@@ -3994,11 +4444,11 @@ impl Shell {
 
     fn confirm_rename(&mut self, name: String) {
         let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
-            self.status = "No item selected".to_string();
+            self.reject("No item selected");
             return;
         };
         if is_dot_or_dotdot(&entry.name) {
-            self.status = "No item selected".to_string();
+            self.reject("No item selected");
             return;
         }
         let from = match session::join_remote(&self.remote_cwd, &entry.name) {
@@ -4066,7 +4516,7 @@ impl Shell {
 
     fn begin_fs(&mut self, op: FsOp, ok: String, working: &str) -> bool {
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return false;
         }
         if self.remote_busy() {
@@ -4087,7 +4537,7 @@ impl Shell {
 
     fn dispatch_delete(&mut self, job: PendingDelete) {
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             self.pending_delete.clear();
             self.fs_delete = false;
             return;
@@ -4127,15 +4577,15 @@ impl Shell {
 
     fn start_remote_edit(&mut self) {
         if !self.connected {
-            self.status = "Not connected".to_string();
+            self.reject("Not connected");
             return;
         }
         if self.pane != Pane::Remote {
-            self.status = "Focus a remote file to edit".to_string();
+            self.reject("Focus a remote file to edit");
             return;
         }
         if self.edit.is_some() {
-            self.status = "Already preparing an edit".to_string();
+            self.reject("Already preparing an edit");
             return;
         }
         if self.remote_busy() {
@@ -4146,15 +4596,15 @@ impl Shell {
             return;
         }
         if self.remote_marks.len() > 1 {
-            self.status = "Edit one file at a time".to_string();
+            self.reject("Edit one file at a time");
             return;
         }
         let Some(entry) = self.remote_action_entries().into_iter().next() else {
-            self.status = "Nothing selected to edit".to_string();
+            self.reject("Nothing selected to edit");
             return;
         };
         if entry.is_dir() || is_dot_or_dotdot(&entry.name) {
-            self.status = "Cannot edit a directory".to_string();
+            self.reject("Cannot edit a directory");
             return;
         }
         let remote_path = match session::join_remote(&self.remote_cwd, &entry.name) {
@@ -4296,7 +4746,7 @@ impl Shell {
         let remote = edit.remote_path.clone();
         let changed = files::fingerprint(&local) != edit.fingerprint;
         if !changed {
-            self.status = "No edits to upload".to_string();
+            self.reject("No edits to upload");
             self.cancel_edit(false);
             return;
         }
@@ -4510,10 +4960,15 @@ impl Render for Shell {
             cx.quit();
         }
         let paint = paint_of(&self.palette);
+        if self.settings_open && self.page == Page::Help && self.query.trim().is_empty() {
+            self.settings_scroll
+                .set_offset(point(px(0.0), px(-(self.help_scroll as f32 * 24.0))));
+        }
         let row = self.row_h();
         let footer = self.footer_text();
         let busy = self.header_busy_text();
-        let entries: Vec<(usize, String, bool, bool)> = self
+        let badges = self.compare_badges();
+        let entries: Vec<(usize, String, bool)> = self
             .visible_entries()
             .into_iter()
             .enumerate()
@@ -4523,10 +4978,18 @@ impl Render for Shell {
                 } else {
                     ""
                 };
+                let badge = badges
+                    .get(&entry.name)
+                    .map(|label| format!("{label} "))
+                    .unwrap_or_default();
                 (
                     index,
-                    format!("{star}{}  {}  {}", entry.name, entry.size, entry.marker()),
-                    entry.is_dir(),
+                    format!(
+                        "{badge}{star}{}  {}  {}",
+                        entry.name,
+                        entry.size,
+                        entry.marker()
+                    ),
                     index == self.local_index,
                 )
             })
@@ -4577,16 +5040,28 @@ impl Render for Shell {
         } else {
             "Remote  disconnected".to_string()
         };
-        let remote_rows: Vec<(usize, String, bool, bool)> = self
+        let remote_segments = listing::split_remote_path(&self.remote_cwd);
+        let remote_rows: Vec<(usize, String, bool)> = self
             .remote_rows()
             .into_iter()
             .enumerate()
             .map(|(index, entry)| {
                 let kind = if entry.is_dir() { "dir" } else { "file" };
+                let star = if self
+                    .remote_mark_key(&entry)
+                    .is_some_and(|key| self.remote_marks.contains(&key))
+                {
+                    "* "
+                } else {
+                    ""
+                };
+                let badge = badges
+                    .get(&entry.name)
+                    .map(|label| format!("{label} "))
+                    .unwrap_or_default();
                 (
                     index,
-                    format!("{}  {}  {kind}", entry.name, entry.size),
-                    entry.is_dir(),
+                    format!("{badge}{star}{}  {}  {kind}", entry.name, entry.size),
                     index == self.remote_index,
                 )
             })
@@ -4670,6 +5145,7 @@ impl Render for Shell {
         });
         let settings = self.settings_open.then(|| self.settings_view());
         let local_scroll = self.local_scroll.clone();
+        let queue_scroll = self.queue_scroll.clone();
         let pane = self.pane;
 
         let mut list = div()
@@ -4679,8 +5155,14 @@ impl Render for Shell {
             .overflow_y_scroll()
             .track_scroll(&local_scroll)
             .flex()
-            .flex_col();
-        for (index, label, is_dir, on) in entries {
+            .flex_col()
+            .on_scroll(cx.listener(|shell, event: &gpui::ScrollEvent, _, cx| {
+                let up = event.delta.pixel_delta(px(16.0)).y > px(0.0);
+                shell.pointer_wheel(PointerList::Local, up);
+                cx.stop_propagation();
+                cx.notify();
+            }));
+        for (index, label, on) in entries {
             list = list.child(
                 div()
                     .id(("local-row", index))
@@ -4692,16 +5174,20 @@ impl Render for Shell {
                     .whitespace_nowrap()
                     .cursor_pointer()
                     .when(on && pane == Pane::Local, |row| row.bg(paint.selected))
-                    .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
-                        let enter = shell.pane == Pane::Local && shell.local_index == index;
-                        shell.pane = Pane::Local;
-                        shell.local_index = index;
-                        if enter && is_dir {
-                            shell.enter_local();
-                        }
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                            shell.pointer_row(
+                                PointerList::Local,
+                                index,
+                                event.modifiers.shift,
+                                event.click_count >= 2,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .child(label),
             );
         }
@@ -4730,13 +5216,18 @@ impl Render for Shell {
                     .whitespace_nowrap()
                     .cursor_pointer()
                     .when(on, |row| row.bg(paint.selected))
-                    .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
-                        shell.pane = Pane::Bookmarks;
-                        shell.bookmark_index = index;
-                        shell.fill_from_bookmark();
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                            shell.pane = Pane::Bookmarks;
+                            shell.bookmark_index = index;
+                            if event.click_count >= 2 {
+                                shell.fill_from_bookmark();
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .child(label),
             );
         }
@@ -4747,6 +5238,28 @@ impl Render for Shell {
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, _, cx| {
                 shell.on_key_down(event, cx);
             }))
+            .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, _, cx| {
+                let mut changed = false;
+                if let Some(list) = shell.scroll_drag {
+                    shell.drag_from_y(list, event.position.y);
+                    changed = true;
+                }
+                if shell.field_drag.is_some() && event.dragging() {
+                    shell.drag_field_to(event.position.x);
+                    changed = true;
+                }
+                if changed {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|shell, _: &gpui::MouseUpEvent, _, cx| {
+                    if shell.scroll_drag.take().is_some() || shell.field_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .size_full()
             .relative()
             .flex()
@@ -4783,16 +5296,27 @@ impl Render for Shell {
                                         .child(filter_label.clone()),
                                 )
                             })
-                            .child(div().flex_1().min_h(px(0.0)).relative().child(list)),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .flex()
+                                    .flex_row()
+                                    .child(div().flex_1().relative().child(list))
+                                    .child(scroll_rail(cx, PointerList::Local, paint)),
+                            ),
                     )
                     .child(remote_column(
                         cx,
-                        &remote_title,
-                        &remote_rows,
-                        row,
-                        paint,
-                        pane,
-                        &remote_scroll,
+                        RemoteColumn {
+                            title: &remote_title,
+                            segments: &remote_segments,
+                            rows: &remote_rows,
+                            row_h: row,
+                            paint,
+                            pane,
+                            scroll: &remote_scroll,
+                        },
                     ))
                     .child(
                         div()
@@ -4872,7 +5396,7 @@ impl Render for Shell {
             column = column.child(file_prompt_box(cx, &message, paint));
         }
         if let Some((cwd, rows)) = picker_rows {
-            column = column.child(key_picker_box(cx, &cwd, &rows, paint));
+            column = column.child(key_picker_box(cx, &cwd, &rows, paint, &self.key_scroll));
         }
         if let Some(settings) = settings {
             column = column.child(settings_panel(
@@ -4884,7 +5408,15 @@ impl Render for Shell {
             ));
         }
         column
-            .child(queue_strip(cx, &queue_label, &queue_jobs, row, paint, pane))
+            .child(queue_strip(
+                cx,
+                &queue_label,
+                &queue_jobs,
+                row,
+                paint,
+                pane,
+                &queue_scroll,
+            ))
             .child(
                 div()
                     .h(px(CHROME_PX))
@@ -5059,24 +5591,20 @@ fn local_path_bar(
         if index > 0 && segments[index - 1].label != "/" {
             bar = bar.child(div().text_color(paint.secondary).child("/"));
         }
-        let target = segment.target.clone();
         let label = segment.label.clone();
-        let last = index + 1 == segments.len();
         bar = bar.child(
             div()
                 .id(("path-seg", index))
                 .cursor_pointer()
                 .child(label)
-                .on_click(cx.listener(move |shell, event: &ClickEvent, _, cx| {
-                    let double = event.click_count() >= 2 && last;
-                    if double {
-                        shell.parent_local();
-                    } else {
-                        shell.goto_local(PathBuf::from(&target));
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                })),
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                        shell.activate_path_segment(index, event.click_count >= 2);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ),
         );
     }
     bar
@@ -5242,11 +5770,27 @@ fn field_row(
         .gap(px(8.0))
         .cursor_pointer()
         .when(on, |row| row.bg(paint.selected))
-        .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
-            shell.pane = which;
-            cx.stop_propagation();
-            cx.notify();
-        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                let slot = field_slot_for(which);
+                shell.pane = which;
+                if let Some(slot) = slot {
+                    let start = shell
+                        .field_slot(slot)
+                        .map(|field| field.cursor)
+                        .unwrap_or(0);
+                    shell.field_drag = Some(FieldDrag {
+                        slot,
+                        origin_x: f32::from(event.position.x),
+                        start,
+                    });
+                    shell.pointer_field(slot, start, false);
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
         .child(
             div()
                 .w(px(96.0))
@@ -5256,15 +5800,26 @@ fn field_row(
         .child(value.to_string())
 }
 
-fn remote_column(
-    cx: &mut Context<Shell>,
-    title: &str,
-    rows: &[(usize, String, bool, bool)],
-    row: f32,
+struct RemoteColumn<'a> {
+    title: &'a str,
+    segments: &'a [listing::PathSegment],
+    rows: &'a [(usize, String, bool)],
+    row_h: f32,
     paint: Paint,
     pane: Pane,
-    scroll: &ScrollHandle,
-) -> gpui::Div {
+    scroll: &'a ScrollHandle,
+}
+
+fn remote_column(cx: &mut Context<Shell>, column: RemoteColumn<'_>) -> gpui::Div {
+    let RemoteColumn {
+        title,
+        segments,
+        rows,
+        row_h: row,
+        paint,
+        pane,
+        scroll,
+    } = column;
     let mut list = div()
         .id("remote-list")
         .absolute()
@@ -5272,7 +5827,13 @@ fn remote_column(
         .overflow_y_scroll()
         .track_scroll(scroll)
         .flex()
-        .flex_col();
+        .flex_col()
+        .on_scroll(cx.listener(|shell, event: &gpui::ScrollEvent, _, cx| {
+            let up = event.delta.pixel_delta(px(16.0)).y > px(0.0);
+            shell.pointer_wheel(PointerList::Remote, up);
+            cx.stop_propagation();
+            cx.notify();
+        }));
     if rows.is_empty() {
         list = list.child(
             div()
@@ -5284,9 +5845,8 @@ fn remote_column(
                 .child("Disconnected"),
         );
     }
-    for (index, label, is_dir, on) in rows {
+    for (index, label, on) in rows {
         let index = *index;
-        let is_dir = *is_dir;
         list = list.child(
             div()
                 .id(("remote-row", index))
@@ -5298,16 +5858,20 @@ fn remote_column(
                 .whitespace_nowrap()
                 .cursor_pointer()
                 .when(*on && pane == Pane::Remote, |row| row.bg(paint.selected))
-                .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
-                    let enter = shell.pane == Pane::Remote && shell.remote_index == index;
-                    shell.pane = Pane::Remote;
-                    shell.remote_index = index;
-                    if enter && is_dir {
-                        shell.enter_remote(cx);
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                        shell.pointer_row(
+                            PointerList::Remote,
+                            index,
+                            event.modifiers.shift,
+                            event.click_count >= 2,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
                 .child(label.clone()),
         );
     }
@@ -5319,6 +5883,7 @@ fn remote_column(
         .flex_col()
         .border_r_1()
         .border_color(paint.border)
+        .child(remote_path_bar(cx, segments, row, paint))
         .child(
             div()
                 .h(px(row))
@@ -5328,7 +5893,96 @@ fn remote_column(
                 .font_weight(FontWeight::BOLD)
                 .child(title.to_string()),
         )
-        .child(div().flex_1().min_h(px(0.0)).relative().child(list))
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_row()
+                .child(div().flex_1().relative().child(list))
+                .child(scroll_rail(cx, PointerList::Remote, paint)),
+        )
+}
+
+fn remote_path_bar(
+    cx: &mut Context<Shell>,
+    segments: &[listing::PathSegment],
+    row: f32,
+    paint: Paint,
+) -> gpui::Div {
+    let mut bar = div()
+        .h(px(row))
+        .px(px(8.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0))
+        .overflow_hidden()
+        .border_b_1()
+        .border_color(paint.border);
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 && segments[index - 1].label != "/" {
+            bar = bar.child(div().text_color(paint.secondary).child("/"));
+        }
+        let label = segment.label.clone();
+        bar = bar.child(
+            div()
+                .id(("remote-path", index))
+                .cursor_pointer()
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                        shell.activate_remote_segment(index, event.click_count >= 2, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ),
+        );
+    }
+    bar
+}
+
+fn scroll_rail(
+    cx: &mut Context<Shell>,
+    list: PointerList,
+    paint: Paint,
+) -> gpui::Stateful<gpui::Div> {
+    let id = match list {
+        PointerList::Local => "local-rail",
+        PointerList::Remote => "remote-rail",
+        PointerList::Queue => "queue-rail",
+        PointerList::Help => "help-rail",
+        PointerList::KeyPicker => "key-rail",
+    };
+    div()
+        .id(id)
+        .w(px(10.0))
+        .h_full()
+        .bg(paint.panel)
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                shell.scroll_drag = Some(list);
+                shell.drag_from_y(list, event.position.y);
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+}
+
+fn field_slot_for(pane: Pane) -> Option<FieldSlot> {
+    match pane {
+        Pane::Name => Some(FieldSlot::Name),
+        Pane::Host => Some(FieldSlot::Host),
+        Pane::Port => Some(FieldSlot::Port),
+        Pane::User => Some(FieldSlot::User),
+        Pane::Password => Some(FieldSlot::Password),
+        Pane::Key => Some(FieldSlot::Key),
+        Pane::Path => Some(FieldSlot::Path),
+        _ => None,
+    }
 }
 
 fn host_key_box(cx: &mut Context<Shell>, message: &str, paint: Paint) -> gpui::Stateful<gpui::Div> {
@@ -5360,8 +6014,21 @@ fn queue_strip(
     row_h: f32,
     paint: Paint,
     pane: Pane,
+    scroll: &ScrollHandle,
 ) -> gpui::Stateful<gpui::Div> {
-    let mut list = div().id("queue").flex().flex_col().max_h(px(row_h * 4.0));
+    let mut list = div()
+        .id("queue")
+        .flex()
+        .flex_col()
+        .max_h(px(row_h * 4.0))
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .on_scroll(cx.listener(|shell, event: &gpui::ScrollEvent, _, cx| {
+            let up = event.delta.pixel_delta(px(16.0)).y > px(0.0);
+            shell.pointer_wheel(PointerList::Queue, up);
+            cx.stop_propagation();
+            cx.notify();
+        }));
     for (index, label, on) in rows {
         let index = *index;
         list = list.child(
@@ -5374,10 +6041,16 @@ fn queue_strip(
                 .cursor_pointer()
                 .when(*on && pane == Pane::Queue, |row| row.bg(paint.selected))
                 .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |shell, _: &gpui::MouseDownEvent, _, cx| {
-                        shell.pane = Pane::Queue;
-                        shell.queue_index = index;
+                    MouseButton::Left,
+                    cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                        shell.pointer_row(
+                            PointerList::Queue,
+                            index,
+                            event.modifiers.shift,
+                            false,
+                            cx,
+                        );
+                        cx.stop_propagation();
                         cx.notify();
                     }),
                 )
@@ -5400,7 +6073,11 @@ fn queue_strip(
                 .font_weight(FontWeight::BOLD)
                 .child(title.to_string()),
         )
-        .child(list)
+        .child(div().flex().flex_row().child(list).child(scroll_rail(
+            cx,
+            PointerList::Queue,
+            paint,
+        )))
 }
 
 fn type_prompt_field(key: &str, field: &mut TextField) {
@@ -5434,9 +6111,22 @@ fn file_prompt_box(
         .border_1()
         .border_color(paint.border)
         .occlude()
-        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
-            cx.stop_propagation();
-        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|shell, event: &MouseDownEvent, _, cx| {
+                let start = shell.file_prompt_field().map(|field| field.cursor);
+                if let Some(start) = start {
+                    shell.field_drag = Some(FieldDrag {
+                        slot: FieldSlot::Prompt,
+                        origin_x: f32::from(event.position.x),
+                        start,
+                    });
+                    shell.pointer_field(FieldSlot::Prompt, start, false);
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
         .child(message.to_string())
 }
 
@@ -5480,9 +6170,24 @@ fn rename_box(cx: &mut Context<Shell>, name: &str, paint: Paint) -> gpui::Statef
         .border_1()
         .border_color(paint.border)
         .occlude()
-        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
-            cx.stop_propagation();
-        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|shell, event: &MouseDownEvent, _, cx| {
+                let start = shell
+                    .rename_field
+                    .as_ref()
+                    .map(|field| field.cursor)
+                    .unwrap_or(0);
+                shell.field_drag = Some(FieldDrag {
+                    slot: FieldSlot::Rename,
+                    origin_x: f32::from(event.position.x),
+                    start,
+                });
+                shell.pointer_field(FieldSlot::Rename, start, false);
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
         .child(format!("Rename to {name}"))
         .child("Enter saves the name. Esc returns to the overwrite prompt.")
 }
@@ -5514,8 +6219,21 @@ fn key_picker_box(
     cwd: &str,
     rows: &[KeyRow],
     paint: Paint,
+    scroll: &ScrollHandle,
 ) -> gpui::Stateful<gpui::Div> {
-    let mut list = div().flex().flex_col();
+    let mut list = div()
+        .id("key-list")
+        .flex()
+        .flex_col()
+        .overflow_y_scroll()
+        .max_h(px(240.0))
+        .track_scroll(scroll)
+        .on_scroll(cx.listener(|shell, event: &gpui::ScrollEvent, _, cx| {
+            let up = event.delta.pixel_delta(px(16.0)).y > px(0.0);
+            shell.pointer_wheel(PointerList::KeyPicker, up);
+            cx.stop_propagation();
+            cx.notify();
+        }));
     for row in rows {
         let index = row.index;
         list = list.child(
@@ -5529,18 +6247,20 @@ fn key_picker_box(
                 .whitespace_nowrap()
                 .cursor_pointer()
                 .when(row.selected, |row| row.bg(paint.selected))
-                .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
-                    let activate = shell
-                        .key_picker
-                        .as_ref()
-                        .is_some_and(|picker| picker.index == index);
-                    shell.set_key_picker_index(index);
-                    if activate {
-                        shell.activate_key_picker();
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                        shell.pointer_row(
+                            PointerList::KeyPicker,
+                            index,
+                            false,
+                            event.click_count >= 2,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
                 .child(row.label.clone()),
         );
     }
@@ -5654,7 +6374,15 @@ fn settings_panel(
         .flex_1()
         .min_h(px(0.0))
         .overflow_y_scroll()
-        .track_scroll(scroll);
+        .track_scroll(scroll)
+        .on_scroll(cx.listener(|shell, event: &gpui::ScrollEvent, _, cx| {
+            if shell.page == Page::Help && shell.query.trim().is_empty() {
+                let up = event.delta.pixel_delta(px(16.0)).y > px(0.0);
+                shell.pointer_wheel(PointerList::Help, up);
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }));
     if settings.page_name == "Themes" && !settings.editor {
         for (index, label, on) in &settings.theme_rows {
             let index = *index;

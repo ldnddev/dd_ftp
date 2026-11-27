@@ -37,7 +37,7 @@ cargo run -p dd_ftp_cli
 
 `F1` or `F2` opens Settings on Themes. `F3` opens Settings on Session. `Ctrl+q` quits, and asks first when a transfer is active.
 
-The window is a separate binary. It connects, lists, and stores bookmark passwords in the keyring. Transfers are still ahead.
+The window is a separate binary. It connects, lists, stores bookmark passwords in the keyring, and transfers files. Remote file operations are still ahead.
 
 ```bash
 dd_ftp-gui
@@ -189,7 +189,7 @@ Bracketed paste inserts into the focused text field as one edit. Arrow keys, Hom
 
 `dd_ftp-gui` opens at 1280×800. The app id is `dev.ldnddev.dd_ftp`. Settings there is Themes, Window, Session, and Help. Window prefs (density, Vim letters, reduced motion) live in `~/.config/ldnddev/dd_ftp/gui.json` and are not read by the terminal.
 
-The local pane matches the terminal's local browser: `.` and `..` stay first, name sort keeps directories above files, `/` filters, `.` hides other dotfiles, Space / Shift+move / Ctrl+A mark, and the path bar cds to a prefix (double-click the current segment for the parent). Quick connect matches the terminal fields. `c` opens an SFTP, FTP, or FTPS session on a worker thread and lists the initial path. `c` again disconnects. A refused SFTP host key leaves the remote pane disconnected. Plain FTP says it is unencrypted. Bookmarks load and save `sites.toml` with no password field. Passwords stay in the OS keyring. Enter and `e` fill the form. `c` on a bookmark connects that site. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and the default site. Ctrl+P chooses a private key while the key field is focused. Ctrl+K reports keyring health. Transfers and remote file operations are still ahead in [`GUI_PARITY.md`](GUI_PARITY.md). The terminal crates stay the behavior of record.
+The local pane matches the terminal's local browser: `.` and `..` stay first, name sort keeps directories above files, `/` filters, `.` hides other dotfiles, Space / Shift+move / Ctrl+A mark, and the path bar cds to a prefix (double-click the current segment for the parent). Quick connect matches the terminal fields. `c` opens an SFTP, FTP, or FTPS session on a worker thread and lists the initial path. `c` again disconnects. A refused SFTP host key leaves the remote pane disconnected. Plain FTP says it is unencrypted. Bookmarks load and save `sites.toml` with no password field. Passwords stay in the OS keyring. Enter and `e` fill the form. `c` on a bookmark connects that site. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and the default site. Ctrl+P chooses a private key while the key field is focused. Ctrl+K reports keyring health. Uploads, downloads, and moves use the same queue, worker cap, and overwrite prompt as the terminal. `3` focuses the queue. Remote file operations are still ahead in [`GUI_PARITY.md`](GUI_PARITY.md). The terminal crates stay the behavior of record.
 
 ## License
 

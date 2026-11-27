@@ -23,7 +23,7 @@ fn opts(dir: &Path) -> ShellOptions {
         tick: false,
         quit_runtime: false,
         apply_env: false,
-        backend: crate::session::Backend::Fake(crate::session::FakeTree::empty()),
+        backend: crate::session::Backend::fake(crate::session::FakeTree::empty()),
         sites_path: dir.join("sites.toml"),
         default_site: None,
         vault: crate::vault::Vault::memory(),
@@ -526,11 +526,11 @@ fn sample_tree(host_key: crate::session::FakeHostKey) -> crate::session::FakeTre
         "/docs".into(),
         vec![crate::session::entry("notes.txt", false)],
     );
-    crate::session::FakeTree {
-        dirs,
-        host_key,
-        extra_on_refresh: Some(crate::session::entry("fresh.txt", false)),
-    }
+    let mut tree = crate::session::FakeTree::empty();
+    tree.dirs = dirs;
+    tree.host_key = host_key;
+    tree.extra_on_refresh = Some(crate::session::entry("fresh.txt", false));
+    tree
 }
 
 #[gpui::test]
@@ -538,7 +538,7 @@ fn session_connects_lists_changes_directory_and_disconnects(cx: &mut TestAppCont
     let dir = tempfile::tempdir().unwrap();
     let mut options = opts(dir.path());
     options.backend =
-        crate::session::Backend::Fake(sample_tree(crate::session::FakeHostKey::Ask {
+        crate::session::Backend::fake(sample_tree(crate::session::FakeHostKey::Ask {
             fingerprint: "abc123".into(),
             changed: false,
         }));
@@ -603,7 +603,7 @@ fn refused_host_key_leaves_the_pane_disconnected(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let mut options = opts(dir.path());
     options.backend =
-        crate::session::Backend::Fake(sample_tree(crate::session::FakeHostKey::Ask {
+        crate::session::Backend::fake(sample_tree(crate::session::FakeHostKey::Ask {
             fingerprint: "abc123".into(),
             changed: true,
         }));
@@ -766,7 +766,7 @@ fn bookmark_sets_the_default_connects_and_edits(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let mut options = opts(dir.path());
     options.backend =
-        crate::session::Backend::Fake(sample_tree(crate::session::FakeHostKey::Trusted));
+        crate::session::Backend::fake(sample_tree(crate::session::FakeHostKey::Trusted));
     let shell = mount(cx, options);
     shell.update(cx, |shell, cx| {
         shell.fill_quick_connect(&secret_form(Protocol::Sftp));
@@ -873,7 +873,7 @@ fn auto_connect_uses_the_default_site(cx: &mut TestAppContext) {
             load_app_config: true,
             load_user_sites: true,
             vault,
-            backend: crate::session::Backend::Fake(sample_tree(
+            backend: crate::session::Backend::fake(sample_tree(
                 crate::session::FakeHostKey::Trusted,
             )),
             ..opts(dir.path())
@@ -887,6 +887,145 @@ fn auto_connect_uses_the_default_site(cx: &mut TestAppContext) {
         let file = std::fs::read_to_string(dir.path().join("sites.toml")).unwrap();
         assert!(!file.contains("s3cret-value"), "{file}");
         assert!(!file.contains("password"), "{file}");
+    });
+}
+
+fn trusted_tree() -> std::sync::Arc<std::sync::Mutex<crate::session::FakeTree>> {
+    std::sync::Arc::new(std::sync::Mutex::new(crate::session::FakeTree::empty()))
+}
+
+fn connect_sftp(shell: &mut Shell, cx: &mut gpui::Context<Shell>) {
+    shell.fill_quick_connect(&secret_form(Protocol::Sftp));
+    shell.handle_key("c", cx);
+    let text = until(shell, "Connected via SFTP");
+    assert!(text.contains("Connected via SFTP"), "{text}");
+    assert!(!text.contains("s3cret-value"), "{text}");
+    assert!(!text.contains("password"), "{text}");
+}
+
+#[gpui::test]
+fn upload_and_download_round_trip_keeps_the_bytes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"payload-bytes";
+    std::fs::write(dir.path().join("payload.txt"), payload).unwrap();
+    let tree = trusted_tree();
+    let mut options = opts(dir.path());
+    options.backend = crate::session::Backend::Fake(std::sync::Arc::clone(&tree));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("u", cx);
+        let text = until(shell, "upload complete");
+        assert!(text.contains("queue:pending=0 active=0 failed=0"), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/payload.txt"),
+            Some(payload.as_slice())
+        );
+        let text = until(shell, "Remote cwd:");
+        assert!(text.contains("payload.txt"), "{text}");
+
+        std::fs::remove_file(dir.path().join("payload.txt")).unwrap();
+        shell.handle_key("2", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("d", cx);
+        let text = until(shell, "download complete");
+        assert_eq!(
+            std::fs::read(dir.path().join("payload.txt")).unwrap(),
+            payload
+        );
+        assert!(!text.contains("s3cret-value"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn overwrite_skip_leaves_the_remote_bytes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("payload.txt"), b"local-bytes").unwrap();
+    let tree = trusted_tree();
+    tree.lock()
+        .unwrap()
+        .put_bytes("/payload.txt", b"remote-bytes");
+    let mut options = opts(dir.path());
+    options.backend = crate::session::Backend::Fake(std::sync::Arc::clone(&tree));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("u", cx);
+        let text = until(shell, "overwrite:payload.txt");
+        assert!(text.contains("newer:"), "{text}");
+        shell.handle_key("s", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("Skipped payload.txt"), "{text}");
+        assert!(!text.contains("overwrite:payload.txt"), "{text}");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/payload.txt"),
+            Some(b"remote-bytes".as_slice())
+        );
+        assert!(!text.contains("s3cret-value"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn ctrl_c_cancels_the_active_transfer_and_one_worker_stays_capped(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("box");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"aaa").unwrap();
+    std::fs::write(folder.join("b.txt"), b"bbb").unwrap();
+    std::fs::write(
+        dir.path().join("dd_ftp.toml"),
+        "worker_max_concurrency = 1\n",
+    )
+    .unwrap();
+    let tree = trusted_tree();
+    tree.lock().unwrap().hold_transfers = true;
+    let mut options = opts(dir.path());
+    options.load_app_config = true;
+    options.backend = crate::session::Backend::Fake(std::sync::Arc::clone(&tree));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("u", cx);
+        let text = shell.visible_text();
+        assert!(text.contains("queue:pending=1 active=1"), "{text}");
+        assert!(text.contains("workers=1"), "{text}");
+        shell.handle_key("ctrl-c", cx);
+        let text = until(shell, "Cancelled by user");
+        assert!(text.contains("active=0"), "{text}");
+        assert!(tree.lock().unwrap().files.is_empty(), "{text}");
+        assert!(!text.contains("password"), "{text}");
+    });
+}
+
+#[gpui::test]
+fn move_uploads_then_deletes_the_local_file(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("payload.txt"), b"moved").unwrap();
+    let tree = trusted_tree();
+    let mut options = opts(dir.path());
+    options.backend = crate::session::Backend::Fake(std::sync::Arc::clone(&tree));
+    let shell = mount(cx, options);
+    shell.update(cx, |shell, cx| {
+        connect_sftp(shell, cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("down", cx);
+        shell.handle_key("shift-m", cx);
+        let text = until(shell, "upload complete");
+        assert_eq!(
+            tree.lock().unwrap().bytes("/payload.txt"),
+            Some(b"moved".as_slice())
+        );
+        assert!(!dir.path().join("payload.txt").exists(), "{text}");
+        assert!(!text.contains("s3cret-value"), "{text}");
     });
 }
 

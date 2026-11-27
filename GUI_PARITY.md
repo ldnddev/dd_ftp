@@ -13,7 +13,7 @@ The terminal in [`README.md`](README.md) is the feature contract. `dd_ftp-gui` i
 
 ## What the window does today
 
-Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks and secrets are unreleased:
+Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks, secrets, and the transfer queue are unreleased:
 
 - 1280×800 window, app id `dev.ldnddev.dd_ftp`, title `dd_ftp`.
 - Settings: Themes, Window, Session, Help. F1 and F2 open Themes and the second press reverts the palette. F3 opens Session. Esc steps back from the color editor, then closes.
@@ -23,7 +23,8 @@ Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks and secrets ar
 - Remote pane (phase 2): list, enter, parent, and refresh on a worker thread. `SftpSession` or `UnifiedFtpSession` lists `initial_path`. A refused SFTP host key leaves the pane disconnected. An accepted key is appended to `known_hosts`. Plain FTP status says unencrypted.
 - Quick connect fields match the terminal: name, host, port, username, password, private key, protocol, path. `DD_FTP_*` fills them and removes `DD_FTP_PASS`.
 - Bookmarks (phase 3): load and save `sites.toml` with no password. The live vault is `SecretStore`. Enter and `e` fill the form with a masked password. `c` on a bookmark connects. `d` confirms delete. Shift+D sets the default. `B` saves the form. Auto-connect uses the Session flag and `default_site`. Ctrl+P opens the key picker. Ctrl+K reports keyring health.
-- Ctrl+Q confirms while `transfer_active` is set. Nothing sets that flag from a real transfer.
+- Queue (phase 4): `u`, `d`, and Enter on a file transfer the marked set or the focused row. `M` moves, then deletes the source after success. Directories are walked with the terminal symlink rules. The queue pane shows pending, active, and failed jobs. Retry, cancel, clear pending, and Ctrl+C match the terminal. Workers default to 2 and clamp to 1–8. The overwrite prompt matches the terminal, including the newer-file keys.
+- Ctrl+Q confirms while a transfer is active, then cancels.
 - The Help sheet has seven rows. It is not `KEYMAP`.
 
 ## Phases
@@ -81,6 +82,8 @@ Match the rest of Connection and bookmarks.
 - A test writes a temp `sites.toml`, round-trips a site, and asserts the password string is absent.
 
 ### Phase 4 — Queue and transfers
+
+**Done.** Headless coverage is `upload_and_download_round_trip_keeps_the_bytes`, `overwrite_skip_leaves_the_remote_bytes`, `ctrl_c_cancels_the_active_transfer_and_one_worker_stays_capped`, and `move_uploads_then_deletes_the_local_file`, plus `spawn_gate_matches_the_worker_cap`, `progress_emits_the_first_sample_then_waits`, `conflict_policy_table`, `identity_ignores_password_and_label`, and `folder_upload_skips_a_symlink_that_leaves_the_tree`. A live window was not driven. Tests use a fake tree and a memory vault.
 
 Match Transfers.
 

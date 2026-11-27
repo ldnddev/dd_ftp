@@ -1,18 +1,25 @@
 //! One window: local files, bookmarks, quick connect, and the Settings sheet.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
 use dd_ftp_app::{
-    OverwritePolicy, SettingsField, SortKey, TextField, WORKER_MAX_CONCURRENCY_LIMIT,
+    OverwritePolicy, PendingFile, SettingsField, SortKey, TextField, WORKER_MAX_CONCURRENCY_LIMIT,
     clamp_worker_concurrency, cmp_file_entries, is_dot_or_dotdot, is_public_key_name,
 };
-use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, Protocol};
+use dd_ftp_core::{
+    ConnectionInfo, EntryKind, FileEntry, Protocol, TransferDirection, TransferJob, TransferStatus,
+};
+use dd_ftp_transfer::TransferQueue;
+use uuid::Uuid;
 
 use crate::session::{self, Backend, SessionClient, SessionEvent};
 use crate::vault::Vault;
+use crate::xfer::{self, DrainStep, XferEvent};
 use dd_ftp_storage::{AppConfig, SecretStore, SiteConfig, SiteManager};
 use gpui::{
     App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
@@ -88,6 +95,7 @@ enum Pane {
     Key,
     Protocol,
     Path,
+    Queue,
 }
 
 impl Pane {
@@ -104,6 +112,7 @@ impl Pane {
             Self::Key,
             Self::Protocol,
             Self::Path,
+            Self::Queue,
         ];
         let index = order.iter().position(|pane| *pane == self).unwrap_or(0);
         let len = order.len() as i32;
@@ -285,6 +294,21 @@ pub struct Shell {
     connect_view: Option<ConnectView>,
     host_key: Option<HostKeyPrompt>,
     session: SessionClient,
+    engine: xfer::Engine,
+    queue: TransferQueue,
+    pending_scan: VecDeque<PendingFile>,
+    batch_policy: OverwritePolicy,
+    listed_names: Vec<String>,
+    stat_token: u64,
+    awaiting_list: bool,
+    overwrite: Option<PendingFile>,
+    rename_field: Option<TextField>,
+    cancels: HashMap<Uuid, Arc<AtomicBool>>,
+    cancel_all: bool,
+    active_jobs: usize,
+    queue_index: usize,
+    remote_marks: HashSet<String>,
+    active_connection: Option<ConnectionInfo>,
 }
 
 impl Shell {
@@ -293,6 +317,7 @@ impl Shell {
         let loaded =
             theme_load::load_theme(&opts.project_root, opts.home.as_deref(), &opts.omarchy);
         let env_info = opts.apply_env.then(session::connection_from_env);
+        let backend = opts.backend.clone();
         let mut shell = Self {
             focus: cx.focus_handle(),
             options_tick: opts.tick,
@@ -372,12 +397,28 @@ impl Shell {
             inflight: None,
             connect_view: None,
             host_key: None,
-            session: SessionClient::spawn(opts.backend.clone()),
+            session: SessionClient::spawn(backend.clone()),
+            engine: xfer::Engine::spawn(backend),
+            queue: TransferQueue::default(),
+            pending_scan: VecDeque::new(),
+            batch_policy: OverwritePolicy::Ask,
+            listed_names: Vec::new(),
+            stat_token: 0,
+            awaiting_list: false,
+            overwrite: None,
+            rename_field: None,
+            cancels: HashMap::new(),
+            cancel_all: false,
+            active_jobs: 0,
+            queue_index: 0,
+            remote_marks: HashSet::new(),
+            active_connection: None,
         };
         shell.follow_stamp = ldnddev_theme::follow_stamp(&shell.omarchy);
         if opts.load_app_config {
             shell.load_app_config();
         }
+        shell.batch_policy = shell.session_overwrite;
         if opts.load_user_sites {
             shell.load_sites();
         }
@@ -612,6 +653,9 @@ impl Shell {
         while let Ok(event) = self.session.try_recv() {
             self.apply_event(event);
         }
+        while let Ok(event) = self.engine.try_recv() {
+            self.apply_xfer(event);
+        }
     }
 
     fn header_busy(&self) -> bool {
@@ -777,6 +821,7 @@ impl Shell {
         }
         let path = session::normalize_remote(&info.initial_path);
         let generation = self.bump_generation();
+        self.active_connection = Some(info.clone());
         self.connect_view = Some(ConnectView {
             host: info.host.clone(),
             username: info.username.clone(),
@@ -797,9 +842,13 @@ impl Shell {
         self.connected = false;
         self.remote_entries.clear();
         self.remote_index = 0;
+        self.remote_marks.clear();
         self.inflight = None;
         self.busy_reason = None;
         self.connect_view = None;
+        self.active_connection = None;
+        self.stop_transfers();
+        self.engine.drop_pool();
         self.status = "Disconnected".to_string();
         self.session.disconnect(generation);
     }
@@ -929,6 +978,7 @@ impl Shell {
                 if !self.connected {
                     self.remote_entries.clear();
                     self.remote_index = 0;
+                    self.active_connection = None;
                 }
                 self.status = message;
             }
@@ -1004,7 +1054,7 @@ impl Shell {
             return;
         }
         if !entry.is_dir() {
-            self.status = format!("'{}' is not a directory", entry.name);
+            self.queue_download();
             return;
         }
         let next = match session::join_remote(&self.remote_cwd, &entry.name) {
@@ -1065,6 +1115,765 @@ impl Shell {
             self.inflight = Some(InFlight::Connect);
             self.arm_busy(cx);
         }
+    }
+
+    fn queue_upload(&mut self) {
+        self.enqueue_direction(TransferDirection::Upload, false);
+    }
+
+    fn queue_download(&mut self) {
+        self.enqueue_direction(TransferDirection::Download, false);
+    }
+
+    fn queue_move(&mut self) {
+        match self.pane {
+            Pane::Local => self.enqueue_direction(TransferDirection::Upload, true),
+            Pane::Remote => self.enqueue_direction(TransferDirection::Download, true),
+            _ => {}
+        }
+    }
+
+    fn enqueue_direction(&mut self, direction: TransferDirection, delete_source: bool) {
+        if !self.connected {
+            self.status = "Not connected".to_string();
+            return;
+        }
+        if self.inflight.is_some() || self.awaiting_list {
+            self.status = self
+                .busy_reason
+                .clone()
+                .unwrap_or_else(|| "busy: preparing transfers".to_string());
+            return;
+        }
+        self.cancel_all = false;
+        if self.pending_scan.is_empty() && self.overwrite.is_none() {
+            self.batch_policy = self.session_overwrite;
+        }
+        let built = match direction {
+            TransferDirection::Upload => self.uploads_from_local(delete_source),
+            TransferDirection::Download => self.downloads_from_remote(delete_source),
+        };
+        match built {
+            Ok(files) => {
+                if files.is_empty() {
+                    return;
+                }
+                self.pending_scan.extend(files);
+                self.drain_scan();
+            }
+            Err(err) => {
+                self.status = err.to_string();
+                self.push_toast(self.status.clone());
+            }
+        }
+    }
+
+    fn uploads_from_local(&self, delete_source: bool) -> Result<Vec<PendingFile>, String> {
+        let mut files = Vec::new();
+        for entry in self.local_action_entries() {
+            if is_dot_or_dotdot(&entry.name) {
+                continue;
+            }
+            if entry.is_dir() {
+                let remote_root = session::join_remote(&self.remote_cwd, &entry.name)
+                    .map_err(|err| err.to_string())?;
+                let mut walked = xfer::walk_local_files(&entry.path, &remote_root)
+                    .map_err(|err| err.to_string())?;
+                for file in &mut walked {
+                    file.delete_source = delete_source;
+                }
+                files.append(&mut walked);
+            } else {
+                let remote_path = session::join_remote(&self.remote_cwd, &entry.name)
+                    .map_err(|err| err.to_string())?;
+                let mut file =
+                    PendingFile::new(entry.path_key(), remote_path, TransferDirection::Upload);
+                file.size_bytes = Some(entry.size);
+                file.source_modified = entry.modified;
+                file.delete_source = delete_source;
+                files.push(file);
+            }
+        }
+        Ok(files)
+    }
+
+    fn downloads_from_remote(&mut self, delete_source: bool) -> Result<Vec<PendingFile>, String> {
+        let mut files = Vec::new();
+        let mut live_dirs = Vec::new();
+        for entry in self.remote_action_entries() {
+            if is_dot_or_dotdot(&entry.name) {
+                continue;
+            }
+            let remote_path = session::join_remote(&self.remote_cwd, &entry.name)
+                .map_err(|err| err.to_string())?;
+            if entry.is_dir() {
+                let local_root = xfer::safe_local_child(&self.local_cwd, &entry.name)
+                    .map_err(|err| err.to_string())?;
+                if let Some(tree) = self.engine.fake() {
+                    let tree = tree.lock().unwrap_or_else(|err| err.into_inner());
+                    let mut walked = xfer::walk_remote_tree(&tree, &remote_path, &local_root)
+                        .map_err(|err| err.to_string())?;
+                    for file in &mut walked {
+                        file.delete_source = delete_source;
+                    }
+                    files.append(&mut walked);
+                } else {
+                    live_dirs.push((remote_path, local_root, delete_source));
+                }
+            } else {
+                let local_path = xfer::safe_local_child(&self.local_cwd, &entry.name)
+                    .map_err(|err| err.to_string())?;
+                let mut file = PendingFile::new(
+                    local_path.to_string_lossy().to_string(),
+                    remote_path,
+                    TransferDirection::Download,
+                );
+                file.size_bytes = Some(entry.size);
+                file.source_modified = entry.modified;
+                file.delete_source = delete_source;
+                files.push(file);
+            }
+        }
+        if let Some((remote_root, local_root, delete_source)) = live_dirs.first() {
+            self.pending_scan.extend(files);
+            self.begin_live_walk(remote_root.clone(), local_root.clone(), *delete_source);
+            return Ok(Vec::new());
+        }
+        Ok(files)
+    }
+
+    fn begin_live_walk(&mut self, remote_root: String, local_root: PathBuf, delete_source: bool) {
+        let Some(info) = self.active_connection.clone() else {
+            self.status = "Not connected".to_string();
+            return;
+        };
+        self.stat_token = self.stat_token.wrapping_add(1);
+        self.awaiting_list = true;
+        self.listed_names = vec![local_root.display().to_string()];
+        self.pending_scan.push_front(PendingFile {
+            local_path: local_root.display().to_string(),
+            remote_path: remote_root.clone(),
+            direction: TransferDirection::Download,
+            size_bytes: None,
+            source_modified: None,
+            dest_modified: None,
+            delete_source,
+        });
+        self.engine
+            .list_remote(self.generation, self.stat_token, info, remote_root);
+        self.status = "busy: scanning folder".to_string();
+    }
+
+    fn local_action_entries(&self) -> Vec<LocalEntry> {
+        let visible = self.visible_entries();
+        let marked: Vec<LocalEntry> = visible
+            .iter()
+            .filter(|entry| {
+                self.marks.contains(&entry.path_key()) && !is_dot_or_dotdot(&entry.name)
+            })
+            .cloned()
+            .collect();
+        if !marked.is_empty() {
+            return marked;
+        }
+        visible.get(self.local_index).cloned().into_iter().collect()
+    }
+
+    fn remote_action_entries(&self) -> Vec<FileEntry> {
+        let rows = self.remote_rows();
+        let marked: Vec<FileEntry> = rows
+            .iter()
+            .filter(|entry| {
+                self.remote_mark_key(entry)
+                    .is_some_and(|key| self.remote_marks.contains(&key))
+                    && !is_dot_or_dotdot(&entry.name)
+            })
+            .cloned()
+            .collect();
+        if !marked.is_empty() {
+            return marked;
+        }
+        rows.get(self.remote_index).cloned().into_iter().collect()
+    }
+
+    fn remote_mark_key(&self, entry: &FileEntry) -> Option<String> {
+        if is_dot_or_dotdot(&entry.name) {
+            return None;
+        }
+        session::join_remote(&self.remote_cwd, &entry.name).ok()
+    }
+
+    fn toggle_remote_mark(&mut self) {
+        let Some(entry) = self.remote_rows().get(self.remote_index).cloned() else {
+            return;
+        };
+        let Some(key) = self.remote_mark_key(&entry) else {
+            return;
+        };
+        if !self.remote_marks.insert(key.clone()) {
+            self.remote_marks.remove(&key);
+        }
+    }
+
+    fn drain_scan(&mut self) {
+        if self.cancel_all
+            || self.overwrite.is_some()
+            || self.rename_field.is_some()
+            || self.awaiting_list
+        {
+            return;
+        }
+        while let Some(file) = self.pending_scan.front().cloned() {
+            let stat = match file.direction {
+                TransferDirection::Download => self.stat_local_dest(&file),
+                TransferDirection::Upload => {
+                    if let Some(tree) = self.engine.fake() {
+                        let tree = tree.lock().unwrap_or_else(|err| err.into_inner());
+                        Some(xfer::stat_fake_upload(&tree, &file.remote_path))
+                    } else {
+                        self.request_upload_stat(&file);
+                        return;
+                    }
+                }
+            };
+            let Some(stat) = stat else {
+                return;
+            };
+            if !self.apply_dest_stat(stat) {
+                return;
+            }
+        }
+        self.finish_batch_if_idle();
+        self.pump_workers();
+    }
+
+    fn stat_local_dest(&self, file: &PendingFile) -> Option<xfer::DestStat> {
+        let path = Path::new(&file.local_path);
+        let exists = std::fs::symlink_metadata(path).is_ok();
+        let modified = if exists {
+            std::fs::metadata(path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from)
+        } else {
+            None
+        };
+        let names = path
+            .parent()
+            .and_then(|parent| std::fs::read_dir(parent).ok())
+            .map(|read| {
+                read.flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(xfer::DestStat {
+            exists,
+            modified,
+            names,
+        })
+    }
+
+    fn request_upload_stat(&mut self, file: &PendingFile) {
+        let Some(info) = self.active_connection.clone() else {
+            self.status = "Not connected".to_string();
+            return;
+        };
+        let parent = session::parent_remote(&file.remote_path);
+        self.stat_token = self.stat_token.wrapping_add(1);
+        self.awaiting_list = true;
+        self.engine
+            .list_remote(self.generation, self.stat_token, info, parent);
+        self.status = "busy: preparing transfers".to_string();
+    }
+
+    fn apply_dest_stat(&mut self, stat: xfer::DestStat) -> bool {
+        let Some(mut file) = self.pending_scan.front().cloned() else {
+            return true;
+        };
+        self.listed_names = stat.names;
+        file.dest_modified = stat.modified;
+        if let Some(front) = self.pending_scan.front_mut() {
+            front.dest_modified = stat.modified;
+        }
+        let newer = xfer::dest_is_newer(file.source_modified, stat.modified);
+        match xfer::resolve_conflict(stat.exists, newer, self.batch_policy) {
+            DrainStep::Enqueue => {
+                self.pending_scan.pop_front();
+                self.enqueue_file(file);
+                true
+            }
+            DrainStep::Skip => {
+                self.pending_scan.pop_front();
+                self.status = format!("Skipped {}", xfer::base_name(&file.remote_path));
+                true
+            }
+            DrainStep::Prompt => {
+                self.overwrite = Some(file);
+                self.status = "Destination exists".to_string();
+                false
+            }
+            DrainStep::RenameAuto => {
+                self.pending_scan.pop_front();
+                self.auto_rename(&mut file);
+                self.enqueue_file(file);
+                true
+            }
+        }
+    }
+
+    fn auto_rename(&self, file: &mut PendingFile) {
+        let current = match file.direction {
+            TransferDirection::Upload => xfer::base_name(&file.remote_path),
+            TransferDirection::Download => xfer::base_name(&file.local_path),
+        };
+        let names = self.listed_names.clone();
+        let renamed =
+            xfer::uniquify_filename(current, |name| names.iter().any(|taken| taken == name));
+        match file.direction {
+            TransferDirection::Upload => {
+                file.remote_path = xfer::replace_base(&file.remote_path, &renamed);
+            }
+            TransferDirection::Download => {
+                file.local_path = xfer::replace_base(&file.local_path, &renamed);
+            }
+        }
+    }
+
+    fn enqueue_file(&mut self, file: PendingFile) {
+        let mut job = TransferJob::new(file.local_path, file.remote_path, file.direction);
+        job.size_bytes = file.size_bytes;
+        job.delete_source = file.delete_source;
+        self.queue.enqueue(job);
+        self.status = format!("Queue: {} pending", self.queue.pending.len());
+    }
+
+    fn finish_batch_if_idle(&mut self) {
+        if self.pending_scan.is_empty() && self.overwrite.is_none() && !self.awaiting_list {
+            self.batch_policy = self.session_overwrite;
+        }
+    }
+
+    fn overwrite_key(&mut self, key: &str) {
+        match key {
+            "s" => self.resolve_overwrite(DrainStep::Skip, false),
+            "o" => self.resolve_overwrite(DrainStep::Enqueue, false),
+            "a" => {
+                self.batch_policy = OverwritePolicy::OverwriteAll;
+                self.resolve_overwrite(DrainStep::Enqueue, true);
+            }
+            "n" => {
+                self.batch_policy = OverwritePolicy::SkipAll;
+                self.resolve_overwrite(DrainStep::Skip, true);
+            }
+            "shift-a" => {
+                self.batch_policy = OverwritePolicy::OverwriteNewer;
+                self.resolve_overwrite(DrainStep::Enqueue, true);
+            }
+            "shift-n" => {
+                self.batch_policy = OverwritePolicy::SkipNewer;
+                self.resolve_overwrite(DrainStep::Skip, true);
+            }
+            "t" => {
+                self.batch_policy = OverwritePolicy::RenameNewer;
+                self.resolve_overwrite(DrainStep::RenameAuto, true);
+            }
+            "r" => self.open_rename(),
+            "escape" => {
+                self.overwrite = None;
+                self.pending_scan.clear();
+                self.batch_policy = self.session_overwrite;
+                self.status = "Transfer batch aborted".to_string();
+                self.pump_workers();
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_overwrite(&mut self, step: DrainStep, clear_prompt: bool) {
+        if clear_prompt {
+            self.overwrite = None;
+        }
+        let Some(mut file) = self.pending_scan.pop_front() else {
+            self.overwrite = None;
+            self.drain_scan();
+            return;
+        };
+        self.overwrite = None;
+        match step {
+            DrainStep::Enqueue => self.enqueue_file(file),
+            DrainStep::Skip => {
+                self.status = format!("Skipped {}", xfer::base_name(&file.remote_path));
+            }
+            DrainStep::RenameAuto => {
+                self.auto_rename(&mut file);
+                self.enqueue_file(file);
+            }
+            DrainStep::Prompt => {
+                self.pending_scan.push_front(file);
+            }
+        }
+        self.drain_scan();
+    }
+
+    fn open_rename(&mut self) {
+        let Some(file) = self.pending_scan.front() else {
+            return;
+        };
+        let name = match file.direction {
+            TransferDirection::Upload => xfer::base_name(&file.remote_path),
+            TransferDirection::Download => xfer::base_name(&file.local_path),
+        };
+        self.rename_field = Some(TextField::from_str(name));
+        self.overwrite = None;
+    }
+
+    fn rename_key(&mut self, key: &str) {
+        match key {
+            "escape" => {
+                self.rename_field = None;
+                if let Some(file) = self.pending_scan.front().cloned() {
+                    self.overwrite = Some(file);
+                }
+            }
+            "enter" => {
+                let name = self
+                    .rename_field
+                    .as_ref()
+                    .map(|field| field.value.trim().to_string())
+                    .unwrap_or_default();
+                self.rename_field = None;
+                if session::join_remote("/", &name).is_err() {
+                    self.status = "path escapes directory".to_string();
+                    if let Some(file) = self.pending_scan.front().cloned() {
+                        self.overwrite = Some(file);
+                    }
+                    return;
+                }
+                if let Some(mut file) = self.pending_scan.pop_front() {
+                    match file.direction {
+                        TransferDirection::Upload => {
+                            file.remote_path = xfer::replace_base(&file.remote_path, &name);
+                        }
+                        TransferDirection::Download => {
+                            file.local_path = xfer::replace_base(&file.local_path, &name);
+                        }
+                    }
+                    self.enqueue_file(file);
+                }
+                self.drain_scan();
+            }
+            "backspace" => {
+                if let Some(field) = self.rename_field.as_mut() {
+                    field.delete();
+                }
+            }
+            _ => {
+                if let Some(ch) = typed_char(key)
+                    && let Some(field) = self.rename_field.as_mut()
+                {
+                    field.insert_char(ch);
+                }
+            }
+        }
+    }
+
+    fn pump_workers(&mut self) {
+        let max = self.session_workers.max(1);
+        let info = self.active_connection.clone();
+        while xfer::should_spawn(
+            self.connected,
+            self.cancel_all,
+            self.active_jobs,
+            max,
+            self.queue.pending.len(),
+        ) {
+            let Some(info) = info.clone() else {
+                break;
+            };
+            let Some(job) = self.queue.start_next() else {
+                break;
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.cancels.insert(job.id, Arc::clone(&cancel));
+            self.active_jobs = self.active_jobs.saturating_add(1);
+            let direction = match job.direction {
+                TransferDirection::Upload => "upload",
+                TransferDirection::Download => "download",
+            };
+            self.status = format!("Processing {direction}: {}", job.remote_path);
+            self.engine.run(self.generation, job, info, cancel, max);
+        }
+        self.sync_transfer_flag();
+    }
+
+    fn apply_xfer(&mut self, event: XferEvent) {
+        match event {
+            XferEvent::Progress {
+                generation,
+                id,
+                transferred,
+                size,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.queue.update_active_progress(id, transferred, size);
+            }
+            XferEvent::Finished {
+                generation,
+                mut job,
+                error,
+                cancelled,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.cancels.remove(&job.id);
+                self.active_jobs = self.active_jobs.saturating_sub(1);
+                if cancelled || self.cancel_all {
+                    job.last_error = Some("Cancelled by user".to_string());
+                    self.queue.mark_cancelled(job);
+                    self.status = "Cancelled by user".to_string();
+                } else if let Some(err) = error {
+                    let message =
+                        session::redact(&format!("Transfer failed: {err}"), self.password_secret());
+                    job.last_error = Some(message.clone());
+                    self.queue.mark_failed(job);
+                    self.status = message.clone();
+                    self.push_toast(message);
+                } else {
+                    let name = match job.direction {
+                        TransferDirection::Upload => "upload",
+                        TransferDirection::Download => "download",
+                    };
+                    self.queue.mark_completed(job);
+                    self.status = format!("{name} complete");
+                    self.push_toast(self.status.clone());
+                    self.reload_local(Reselect::KeepName);
+                    if self.connected && self.inflight.is_none() {
+                        let path = self.remote_cwd.clone();
+                        self.remote_reselect = Reselect::KeepName;
+                        self.busy_reason = Some("busy: listing remote".to_string());
+                        self.inflight = Some(InFlight::List { path: path.clone() });
+                        self.session.list(self.generation, path);
+                    }
+                }
+                self.pump_workers();
+            }
+            XferEvent::Listed {
+                generation,
+                token,
+                entries,
+                error,
+            } => {
+                if generation != self.generation || token != self.stat_token {
+                    return;
+                }
+                self.awaiting_list = false;
+                if let Some(err) = error {
+                    self.pending_scan.pop_front();
+                    let message = session::redact(
+                        &format!("Remote list failed: {err}"),
+                        self.password_secret(),
+                    );
+                    self.status = message.clone();
+                    self.push_toast(message);
+                    self.drain_scan();
+                    return;
+                }
+                let Some(file) = self.pending_scan.front() else {
+                    return;
+                };
+                if file.direction == TransferDirection::Download && file.size_bytes.is_none() {
+                    self.fold_live_listing(entries);
+                    return;
+                }
+                let name = xfer::base_name(&file.remote_path).to_string();
+                let found = entries.iter().find(|entry| entry.name == name);
+                let stat = xfer::DestStat {
+                    exists: found.is_some(),
+                    modified: found.and_then(|entry| entry.modified),
+                    names: entries.into_iter().map(|entry| entry.name).collect(),
+                };
+                if self.apply_dest_stat(stat) {
+                    self.drain_scan();
+                }
+            }
+        }
+    }
+
+    fn fold_live_listing(&mut self, entries: Vec<FileEntry>) {
+        let Some(marker) = self.pending_scan.pop_front() else {
+            return;
+        };
+        let local_root = PathBuf::from(&marker.local_path);
+        let remote_root = marker.remote_path.clone();
+        for entry in entries {
+            if is_dot_or_dotdot(&entry.name) {
+                continue;
+            }
+            let Ok(remote_path) = session::join_remote(&remote_root, &entry.name) else {
+                self.status = "path escapes directory".to_string();
+                continue;
+            };
+            let Ok(local_path) = xfer::safe_local_child(&local_root, &entry.name) else {
+                self.status = "path escapes directory".to_string();
+                continue;
+            };
+            if entry.is_dir() {
+                self.pending_scan.push_back(PendingFile {
+                    local_path: local_path.display().to_string(),
+                    remote_path,
+                    direction: TransferDirection::Download,
+                    size_bytes: None,
+                    source_modified: None,
+                    dest_modified: None,
+                    delete_source: marker.delete_source,
+                });
+            } else {
+                self.pending_scan.push_back(PendingFile {
+                    local_path: local_path.to_string_lossy().into_owned(),
+                    remote_path,
+                    direction: TransferDirection::Download,
+                    size_bytes: Some(entry.size),
+                    source_modified: entry.modified,
+                    dest_modified: None,
+                    delete_source: marker.delete_source,
+                });
+            }
+        }
+        if let Some(next) = self
+            .pending_scan
+            .iter()
+            .find(|file| file.direction == TransferDirection::Download && file.size_bytes.is_none())
+            .cloned()
+        {
+            self.begin_live_walk(
+                next.remote_path.clone(),
+                PathBuf::from(&next.local_path),
+                next.delete_source,
+            );
+            self.pending_scan
+                .retain(|file| file.remote_path != next.remote_path || file.size_bytes.is_some());
+            return;
+        }
+        self.drain_scan();
+    }
+
+    fn queue_rows(&self) -> Vec<TransferJob> {
+        let mut rows = Vec::new();
+        rows.extend(self.queue.active.iter().cloned());
+        rows.extend(self.queue.pending.iter().cloned());
+        rows.extend(self.queue.failed.iter().cloned());
+        rows
+    }
+
+    fn queue_key(&mut self, key: &str) {
+        let len = self.queue_rows().len();
+        match key {
+            "up" | "k" if key != "k" || self.gui.vim_keys => {
+                self.queue_index = self.queue_index.saturating_sub(1);
+            }
+            "down" | "j" if key != "j" || self.gui.vim_keys => {
+                if len > 0 {
+                    self.queue_index = (self.queue_index + 1).min(len - 1);
+                }
+            }
+            "home" => self.queue_index = 0,
+            "end" => self.queue_index = len.saturating_sub(1),
+            "pageup" | "page-up" => {
+                self.queue_index = self.queue_index.saturating_sub(LOCAL_PAGE);
+            }
+            "pagedown" | "page-down" => {
+                if len > 0 {
+                    self.queue_index = (self.queue_index + LOCAL_PAGE).min(len - 1);
+                }
+            }
+            "x" | "delete" => self.cancel_highlighted(),
+            "shift-a" => {
+                let count = self.queue.retry_all_failed();
+                self.cancel_all = false;
+                self.status = format!("Retrying {count} failed");
+                self.pump_workers();
+            }
+            _ => {}
+        }
+    }
+
+    fn cancel_highlighted(&mut self) {
+        let Some(job) = self.queue_rows().get(self.queue_index).cloned() else {
+            return;
+        };
+        match job.status {
+            TransferStatus::Pending => {
+                self.queue.remove_pending(job.id);
+            }
+            TransferStatus::Failed => {
+                self.queue.dismiss_failed(job.id);
+            }
+            TransferStatus::Active => {
+                if let Some(flag) = self.cancels.get(&job.id) {
+                    flag.store(true, Ordering::Relaxed);
+                    self.status = "Cancel requested for highlighted transfer".to_string();
+                }
+            }
+            _ => {}
+        }
+        let len = self.queue_rows().len();
+        if len == 0 {
+            self.queue_index = 0;
+        } else if self.queue_index >= len {
+            self.queue_index = len - 1;
+        }
+    }
+
+    fn clear_pending(&mut self) {
+        let count = self.queue.clear_pending();
+        self.status = format!("Cleared {count} pending");
+        self.sync_transfer_flag();
+    }
+
+    fn retry_failed_jobs(&mut self) {
+        self.cancel_all = false;
+        if self.pane == Pane::Queue
+            && let Some(job) = self.queue_rows().get(self.queue_index)
+            && job.status == TransferStatus::Failed
+        {
+            self.queue.retry_failed(job.id);
+        } else {
+            self.queue.retry_last_failed();
+        }
+        self.pump_workers();
+    }
+
+    fn cancel_transfers(&mut self) {
+        self.cancel_all = true;
+        for flag in self.cancels.values() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        while let Some(file) = self.pending_scan.pop_front() {
+            self.enqueue_file(file);
+        }
+        self.overwrite = None;
+        self.rename_field = None;
+        self.awaiting_list = false;
+        self.status = "Cancel requested for active transfers".to_string();
+        self.sync_transfer_flag();
+    }
+
+    fn stop_transfers(&mut self) {
+        self.cancel_transfers();
+        self.queue.clear_pending();
+        for job in std::mem::take(&mut self.queue.active) {
+            self.queue.mark_cancelled(job);
+        }
+        self.active_jobs = 0;
+        self.sync_transfer_flag();
+    }
+
+    fn sync_transfer_flag(&mut self) {
+        self.transfer_active = self.active_jobs > 0 || !self.queue.active.is_empty();
     }
 
     fn request_quit(&mut self) {
@@ -1145,7 +1954,10 @@ impl Shell {
         }
         if self.confirm_quit {
             match key.as_str() {
-                "enter" | "y" => self.quit = true,
+                "enter" | "y" => {
+                    self.stop_transfers();
+                    self.quit = true;
+                }
                 "escape" | "n" => self.confirm_quit = false,
                 _ => {}
             }
@@ -1161,6 +1973,22 @@ impl Shell {
         }
         if key == "ctrl-q" {
             self.request_quit();
+            return;
+        }
+        if self.overwrite.is_some() {
+            self.overwrite_key(&key);
+            return;
+        }
+        if self.rename_field.is_some() {
+            self.rename_key(&key);
+            return;
+        }
+        if key == "ctrl-c" {
+            let help_open = self.settings_open && self.page == Page::Help;
+            if help_open || self.filter_open || self.host_key.is_some() {
+                return;
+            }
+            self.cancel_transfers();
             return;
         }
         if key == "ctrl-k" {
@@ -1191,6 +2019,9 @@ impl Shell {
             return;
         }
         self.body_key(&key, cx);
+        if self.header_busy() {
+            self.arm_busy(cx);
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -1254,6 +2085,30 @@ impl Shell {
                     self.pane = Pane::Remote;
                     return;
                 }
+                "3" => {
+                    self.pane = Pane::Queue;
+                    return;
+                }
+                "u" => {
+                    self.queue_upload();
+                    return;
+                }
+                "d" if self.pane != Pane::Bookmarks => {
+                    self.queue_download();
+                    return;
+                }
+                "shift-m" => {
+                    self.queue_move();
+                    return;
+                }
+                "shift-x" => {
+                    self.clear_pending();
+                    return;
+                }
+                "shift-r" => {
+                    self.retry_failed_jobs();
+                    return;
+                }
                 "c" => {
                     if self.pane == Pane::Bookmarks {
                         self.connect_bookmark(cx);
@@ -1277,6 +2132,7 @@ impl Shell {
             Pane::Local => self.local_key(key),
             Pane::Remote => self.remote_key(key, cx),
             Pane::Bookmarks => self.bookmark_key(key),
+            Pane::Queue => self.queue_key(key),
             Pane::Name
             | Pane::Host
             | Pane::Port
@@ -1296,6 +2152,7 @@ impl Shell {
             "enter" => self.enter_remote(cx),
             "backspace" | "h" if key != "h" || vim => self.parent_remote(cx),
             "r" => self.refresh_remote(cx),
+            "space" => self.toggle_remote_mark(),
             _ => {}
         }
     }
@@ -1469,6 +2326,9 @@ impl Shell {
             return;
         };
         if !entry.is_dir() || entry.path == self.local_cwd || !entry.path.is_dir() {
+            if !entry.is_dir() {
+                self.queue_upload();
+            }
             return;
         }
         self.local_cwd = entry.path;
@@ -2554,6 +3414,54 @@ impl Shell {
         if let Some(name) = &self.confirm_delete {
             lines.push(format!("confirm:delete {name}"));
         }
+        lines.push(format!(
+            "queue:pending={} active={} failed={} completed={} workers={}",
+            self.queue.pending.len(),
+            self.queue.active.len(),
+            self.queue.failed.len(),
+            self.queue.completed.len(),
+            self.session_workers
+        ));
+        for (index, job) in self.queue_rows().iter().enumerate() {
+            let mark = if index == self.queue_index && self.pane == Pane::Queue {
+                ">"
+            } else {
+                " "
+            };
+            let state = match job.status {
+                TransferStatus::Pending => "pending",
+                TransferStatus::Active => "active",
+                TransferStatus::Failed => "failed",
+                TransferStatus::Completed => "completed",
+                TransferStatus::Cancelled => "cancelled",
+            };
+            let size = job
+                .size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let mut row = format!(
+                "queue-row:{mark} {}  {state}  {}/{size}",
+                xfer::base_name(&job.remote_path),
+                job.transferred_bytes
+            );
+            if let Some((speed, eta)) = self.queue.speed_and_eta(job.id) {
+                let eta = eta
+                    .map(|eta| format!("{}s", eta.as_secs()))
+                    .unwrap_or_else(|| "-".to_string());
+                row.push_str(&format!("  {speed:.0}B/s  eta {eta}"));
+            }
+            lines.push(row);
+        }
+        if let Some(file) = &self.overwrite {
+            let newer = xfer::dest_is_newer(file.source_modified, file.dest_modified);
+            lines.push(format!(
+                "overwrite:{} newer:{newer}",
+                xfer::base_name(&file.remote_path)
+            ));
+        }
+        if let Some(field) = &self.rename_field {
+            lines.push(format!("rename:{}", field.value));
+        }
         if let Some(picker) = &self.key_picker {
             lines.push(format!("key-picker:{}", picker.cwd.display()));
             for (index, entry) in picker.entries.iter().enumerate() {
@@ -2797,6 +3705,45 @@ impl Render for Shell {
             .collect();
         let confirm = self.confirm_quit;
         let delete_name = self.confirm_delete.clone();
+        let queue_label = format!(
+            "Queue  {} pending  {} active  {} failed",
+            self.queue.pending.len(),
+            self.queue.active.len(),
+            self.queue.failed.len()
+        );
+        let queue_jobs: Vec<(usize, String, bool)> = self
+            .queue_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(index, job)| {
+                let state = match job.status {
+                    TransferStatus::Pending => "pending",
+                    TransferStatus::Active => "active",
+                    TransferStatus::Failed => "failed",
+                    TransferStatus::Completed => "completed",
+                    TransferStatus::Cancelled => "cancelled",
+                };
+                (
+                    index,
+                    format!(
+                        "{}  {state}  {}/{}",
+                        xfer::base_name(&job.remote_path),
+                        job.transferred_bytes,
+                        job.size_bytes
+                            .map(|size| size.to_string())
+                            .unwrap_or_else(|| "-".to_string())
+                    ),
+                    index == self.queue_index,
+                )
+            })
+            .collect();
+        let overwrite_label = self.overwrite.as_ref().map(|file| {
+            format!(
+                "Destination exists: {}. s skip, o overwrite, r rename, a overwrite the rest, n skip the rest, A overwrite newer, N skip newer, t rename newer, Esc abort.",
+                xfer::base_name(&file.remote_path)
+            )
+        });
+        let rename_label = self.rename_field.as_ref().map(|field| field.value.clone());
         let picker_rows = self.key_picker.as_ref().map(|picker| {
             let rows = picker
                 .entries
@@ -3007,6 +3954,12 @@ impl Render for Shell {
         if let Some(name) = delete_name {
             column = column.child(delete_box(cx, &name, paint));
         }
+        if let Some(message) = overwrite_label {
+            column = column.child(overwrite_box(cx, &message, paint));
+        }
+        if let Some(name) = rename_label {
+            column = column.child(rename_box(cx, &name, paint));
+        }
         if let Some((cwd, rows)) = picker_rows {
             column = column.child(key_picker_box(cx, &cwd, &rows, paint));
         }
@@ -3019,18 +3972,20 @@ impl Render for Shell {
                 &self.settings_scroll,
             ));
         }
-        column.child(
-            div()
-                .h(px(CHROME_PX))
-                .px(px(8.0))
-                .flex()
-                .items_center()
-                .border_t_1()
-                .border_color(paint.border)
-                .bg(paint.panel)
-                .text_color(paint.secondary)
-                .child(footer),
-        )
+        column
+            .child(queue_strip(cx, &queue_label, &queue_jobs, row, paint, pane))
+            .child(
+                div()
+                    .h(px(CHROME_PX))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(paint.border)
+                    .bg(paint.panel)
+                    .text_color(paint.secondary)
+                    .child(footer),
+            )
     }
 }
 
@@ -3485,6 +4440,103 @@ fn host_key_box(cx: &mut Context<Shell>, message: &str, paint: Paint) -> gpui::S
         }))
         .child(message.to_string())
         .child("y accepts and appends known_hosts. n or Esc rejects.")
+}
+
+fn queue_strip(
+    cx: &mut Context<Shell>,
+    title: &str,
+    rows: &[(usize, String, bool)],
+    row_h: f32,
+    paint: Paint,
+    pane: Pane,
+) -> gpui::Stateful<gpui::Div> {
+    let mut list = div().id("queue").flex().flex_col().max_h(px(row_h * 4.0));
+    for (index, label, on) in rows {
+        let index = *index;
+        list = list.child(
+            div()
+                .id(("queue-row", index))
+                .h(px(row_h))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .when(*on && pane == Pane::Queue, |row| row.bg(paint.selected))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |shell, _: &gpui::MouseDownEvent, _, cx| {
+                        shell.pane = Pane::Queue;
+                        shell.queue_index = index;
+                        cx.notify();
+                    }),
+                )
+                .child(label.clone()),
+        );
+    }
+    div()
+        .id("queue-strip")
+        .flex()
+        .flex_col()
+        .border_t_1()
+        .border_color(paint.border)
+        .bg(paint.panel)
+        .child(
+            div()
+                .h(px(row_h))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .font_weight(FontWeight::BOLD)
+                .child(title.to_string()),
+        )
+        .child(list)
+}
+
+fn overwrite_box(
+    cx: &mut Context<Shell>,
+    message: &str,
+    paint: Paint,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("overwrite")
+        .absolute()
+        .top(px(80.0))
+        .left(px(80.0))
+        .w(px(520.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .bg(paint.raised)
+        .border_1()
+        .border_color(paint.border)
+        .occlude()
+        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+        }))
+        .child(message.to_string())
+}
+
+fn rename_box(cx: &mut Context<Shell>, name: &str, paint: Paint) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("overwrite-rename")
+        .absolute()
+        .top(px(120.0))
+        .left(px(80.0))
+        .w(px(420.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .bg(paint.raised)
+        .border_1()
+        .border_color(paint.border)
+        .occlude()
+        .on_click(cx.listener(|_shell, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+        }))
+        .child(format!("Rename to {name}"))
+        .child("Enter saves the name. Esc returns to the overwrite prompt.")
 }
 
 fn delete_box(cx: &mut Context<Shell>, name: &str, paint: Paint) -> gpui::Stateful<gpui::Div> {

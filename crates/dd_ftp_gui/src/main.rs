@@ -10,6 +10,7 @@ mod shortcuts;
 mod theme_load;
 mod vault;
 mod windows;
+mod xfer;
 
 #[cfg(test)]
 mod tests;
@@ -57,13 +58,16 @@ Open the dd_ftp window (1280×800).
   F1          Settings (Themes, Window, Session, Help)
   F3          Settings, Session page
   Ctrl+Q      Quit (confirms while a transfer is active)
-  1 / 2       Local pane / remote pane
+  1 / 2 / 3   Local pane / remote pane / queue
   c           Connect, or disconnect when a session is open
+  u / d       Upload the local selection / download the remote selection
+  M           Move the focused pane's selection
   B           Save the form as a bookmark
   Ctrl+K      Check the keyring
   Ctrl+P      Choose a private key while the key field is focused
+  Ctrl+C      Cancel in-flight transfers
   Up/Down     Move the focused listing
-  Enter       Open a directory
+  Enter       Open a directory, or queue a file
 
 Wayland or X11, and Vulkan (libvulkan1 and a driver)."
     );

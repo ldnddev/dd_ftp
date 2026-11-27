@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- The window queues uploads, downloads, and moves. Directories are walked. The queue shows pending, active, and failed jobs, with retry, cancel, a worker cap, and the overwrite prompt.
 - The window loads and saves bookmarks in `sites.toml` with no password field. Passwords stay in the OS keyring. A bookmark can connect, edit, delete, or become the default. `B` saves the form. Auto-connect uses the Session flag. Ctrl+P opens the SSH key picker. Ctrl+K reports keyring health.
 
 ## [1.9.0] - 2026-11-26

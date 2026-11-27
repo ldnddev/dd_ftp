@@ -4,11 +4,11 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
-#[cfg(test)]
-use dd_ftp_core::EntryKind;
-use dd_ftp_core::{ConnectionInfo, FileEntry, Protocol, RemoteSession};
+use chrono::Utc;
+use dd_ftp_core::{ConnectionInfo, EntryKind, FileEntry, Protocol, RemoteSession};
 use dd_ftp_ftp::UnifiedFtpSession;
 use dd_ftp_protocols::{HostKeyOffer, SftpSession};
 
@@ -22,9 +22,13 @@ pub enum FakeHostKey {
 #[derive(Clone, Debug)]
 pub struct FakeTree {
     pub dirs: HashMap<String, Vec<FileEntry>>,
+    /// File bytes keyed by the full remote path. Listings stay in `dirs`.
+    pub files: HashMap<String, Vec<u8>>,
     pub host_key: FakeHostKey,
     /// Appended the second time a path is listed. Connect is the first list.
     pub extra_on_refresh: Option<FileEntry>,
+    /// Transfer workers wait here until a test clears the flag or cancels.
+    pub hold_transfers: bool,
 }
 
 impl FakeTree {
@@ -34,8 +38,101 @@ impl FakeTree {
         dirs.insert("/".to_string(), Vec::new());
         Self {
             dirs,
+            files: HashMap::new(),
             host_key: FakeHostKey::Trusted,
             extra_on_refresh: None,
+            hold_transfers: false,
+        }
+    }
+
+    pub fn dir_entry(&self, parent: &str, name: &str) -> Option<&FileEntry> {
+        self.dirs
+            .get(parent)
+            .and_then(|rows| rows.iter().find(|entry| entry.name == name))
+    }
+
+    pub fn dir_names(&self, parent: &str) -> Vec<String> {
+        self.dirs
+            .get(parent)
+            .map(|rows| rows.iter().map(|entry| entry.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn bytes(&self, path: &str) -> Option<&[u8]> {
+        self.files.get(path).map(Vec::as_slice)
+    }
+
+    pub fn put_bytes(&mut self, path: &str, bytes: &[u8]) {
+        let parent = parent_remote(path);
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if name.is_empty() || name == "/" {
+            return;
+        }
+        self.ensure_dir_chain(&parent);
+        self.files.insert(path.to_string(), bytes.to_vec());
+        let rows = self.dirs.entry(parent).or_default();
+        if let Some(row) = rows.iter_mut().find(|entry| entry.name == name) {
+            row.kind = EntryKind::File;
+            row.size = bytes.len() as u64;
+            row.path = path.to_string();
+            row.modified = Some(Utc::now());
+        } else {
+            rows.push(FileEntry {
+                name: name.to_string(),
+                path: path.to_string(),
+                kind: EntryKind::File,
+                size: bytes.len() as u64,
+                modified: Some(Utc::now()),
+                permissions: None,
+            });
+        }
+    }
+
+    pub fn remove_bytes(&mut self, path: &str) {
+        self.files.remove(path);
+        let parent = parent_remote(path);
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if let Some(rows) = self.dirs.get_mut(&parent) {
+            rows.retain(|entry| entry.name != name);
+        }
+    }
+
+    fn ensure_dir_chain(&mut self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        self.dirs.entry("/".to_string()).or_default();
+        if path == "/" {
+            return;
+        }
+        let mut acc = String::new();
+        for part in path.trim_matches('/').split('/') {
+            if part.is_empty() {
+                continue;
+            }
+            let parent = if acc.is_empty() {
+                "/".to_string()
+            } else {
+                acc.clone()
+            };
+            acc = if parent == "/" {
+                format!("/{part}")
+            } else {
+                format!("{parent}/{part}")
+            };
+            let rows = self.dirs.entry(parent).or_default();
+            if !rows.iter().any(|entry| entry.name == part) {
+                rows.push(FileEntry {
+                    name: part.to_string(),
+                    path: acc.clone(),
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    modified: Some(Utc::now()),
+                    permissions: None,
+                });
+            }
+            self.dirs.entry(acc.clone()).or_default();
         }
     }
 }
@@ -44,7 +141,14 @@ impl FakeTree {
 #[cfg_attr(not(test), allow(dead_code))]
 pub enum Backend {
     Live,
-    Fake(FakeTree),
+    Fake(Arc<Mutex<FakeTree>>),
+}
+
+impl Backend {
+    #[cfg(test)]
+    pub fn fake(tree: FakeTree) -> Self {
+        Self::Fake(Arc::new(Mutex::new(tree)))
+    }
 }
 
 enum LiveSession {
@@ -69,23 +173,26 @@ impl LiveSession {
 }
 
 struct FakeState {
-    tree: FakeTree,
+    tree: Arc<Mutex<FakeTree>>,
     lists: HashMap<String, usize>,
     connected: bool,
 }
 
 impl FakeState {
     fn list(&mut self, path: &str) -> Result<Vec<FileEntry>> {
-        let mut rows = self
-            .tree
-            .dirs
-            .get(path)
-            .cloned()
-            .with_context(|| format!("failed reading remote path: {path}"))?;
+        let (mut rows, extra) = {
+            let tree = self.tree.lock().unwrap_or_else(|err| err.into_inner());
+            let rows = tree
+                .dirs
+                .get(path)
+                .cloned()
+                .with_context(|| format!("failed reading remote path: {path}"))?;
+            (rows, tree.extra_on_refresh.clone())
+        };
         let count = self.lists.entry(path.to_string()).or_insert(0);
         *count += 1;
         if *count == 2
-            && let Some(extra) = self.tree.extra_on_refresh.clone()
+            && let Some(extra) = extra
         {
             rows.push(extra);
         }
@@ -322,10 +429,16 @@ fn fake_connect(
     generation: u64,
     evt_tx: &Sender<SessionEvent>,
 ) -> Result<Vec<FileEntry>> {
+    let host_key = fake
+        .tree
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .host_key
+        .clone();
     if let FakeHostKey::Ask {
         fingerprint,
         changed,
-    } = &fake.tree.host_key
+    } = host_key
     {
         let (reply_tx, reply_rx) = mpsc::channel();
         evt_tx
@@ -333,8 +446,8 @@ fn fake_connect(
                 generation,
                 host: info.host.clone(),
                 port: info.port,
-                fingerprint: fingerprint.clone(),
-                changed: *changed,
+                fingerprint,
+                changed,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("host key prompt closed"))?;

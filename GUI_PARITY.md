@@ -13,7 +13,7 @@ The terminal in [`README.md`](README.md) is the feature contract. `dd_ftp-gui` i
 
 ## What the window does today
 
-Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks, secrets, and the transfer queue are unreleased:
+Shell from 1.8.4. Local browser and session from 1.9.0. Bookmarks through the Help key sheet shipped in 1.10.0:
 
 - 1280×800 window, app id `dev.ldnddev.dd_ftp`, title `dd_ftp`.
 - Settings: Themes, Window, Session, Help. F1 and F2 open Themes and the second press reverts the palette. F3 opens Session. Esc steps back from the color editor, then closes.

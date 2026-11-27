@@ -16,7 +16,7 @@ Downloads the prebuilt package for your OS and CPU (Linux, macOS, or Windows). I
 curl -fsSL https://raw.githubusercontent.com/ldnddev/dd_ftp/master/install.sh | bash
 ```
 
-Pin a release: `bash -s -- --version v1.9.0`.
+Pin a release: `bash -s -- --version v1.10.0`.
 
 | Flag | Installs |
 |---|---|
